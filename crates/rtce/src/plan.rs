@@ -1,7 +1,7 @@
 //! GameDef → Plan (compile once) and Plan × BuildState × Scenario →
 //! objectives (hot path, borrowed from scratch — no allocation). One
 //! unified slot array is shared by every compiled expression:
-//! [stats | buckets | stages | event_factors].
+//! [stats | conditions | buckets | stages | event_factors].
 
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
@@ -42,6 +42,7 @@ pub struct Plan {
     objective_stages: Vec<usize>,
     /// Slot layout offsets.
     n_stats: usize,
+    n_conditions: usize,
     n_buckets: usize,
     n_stages: usize,
 }
@@ -63,6 +64,7 @@ struct CompiledStage {
 /// resolves only when `branched` is set (the engine's per-branch slot).
 struct StageSymbols<'a> {
     stats: &'a [String],
+    conditions: &'a [String],
     buckets: &'a [String],
     prior_stages: &'a [String],
 }
@@ -70,15 +72,19 @@ struct StageSymbols<'a> {
 impl Symbols for StageSymbols<'_> {
     fn slot(&self, name: &str) -> Option<u16> {
         let n_stats = self.stats.len();
+        let n_conditions = self.conditions.len();
         let n_buckets = self.buckets.len();
         if let Some(i) = self.stats.iter().position(|s| s == name) {
             return Some(i as u16);
         }
-        if let Some(i) = self.buckets.iter().position(|b| b == name) {
+        if let Some(i) = self.conditions.iter().position(|c| c == name) {
             return Some((n_stats + i) as u16);
         }
+        if let Some(i) = self.buckets.iter().position(|b| b == name) {
+            return Some((n_stats + n_conditions + i) as u16);
+        }
         if let Some(i) = self.prior_stages.iter().position(|s| s == name) {
-            return Some((n_stats + n_buckets + i) as u16);
+            return Some((n_stats + n_conditions + n_buckets + i) as u16);
         }
         // event_factors lives after ALL stages; prior_stages grows per
         // stage but the slot is fixed using the FULL stage count, patched
@@ -121,9 +127,9 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         }
     }
 
-    // One flat namespace: stats, buckets, stages must not collide.
+    // One flat namespace: stats, conditions, buckets, stages must not collide.
     let mut seen = std::collections::BTreeSet::new();
-    for name in def.stats.iter().chain(&bucket_names).chain(&stage_names) {
+    for name in def.stats.iter().chain(&def.conditions).chain(&bucket_names).chain(&stage_names) {
         if !seen.insert(name.clone()) {
             return Err(PlanError { what: format!("duplicate name `{name}`") });
         }
@@ -135,11 +141,17 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     }
 
     let n_stats = def.stats.len();
+    let n_conditions = def.conditions.len();
     let n_buckets = bucket_names.len();
     let n_stages = stage_names.len();
-    let event_factors_slot = (n_stats + n_buckets + n_stages) as u16;
+    let event_factors_slot = (n_stats + n_conditions + n_buckets + n_stages) as u16;
 
-    let event_syms = StageSymbols { stats: &def.stats, buckets: &bucket_names, prior_stages: &[] };
+    let event_syms = StageSymbols {
+        stats: &def.stats,
+        conditions: &def.conditions,
+        buckets: &bucket_names,
+        prior_stages: &[],
+    };
     let mut events = Vec::new();
     let mut event_names = Vec::new();
     for (name, ev) in &def.events {
@@ -157,6 +169,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         let syms = WithEventFactors {
             inner: StageSymbols {
                 stats: &def.stats,
+                conditions: &def.conditions,
                 buckets: &bucket_names,
                 prior_stages: &stage_names[..i],
             },
@@ -190,6 +203,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         stages,
         objective_stages,
         n_stats,
+        n_conditions,
         n_buckets,
         n_stages,
     })
@@ -222,7 +236,7 @@ impl Plan {
     /// result must only be passed to `evaluate` on this same `Plan` —
     /// `evaluate` debug-asserts the buffer lengths match.
     pub fn scratch(&self) -> EvalScratch {
-        let n = self.n_stats + self.n_buckets + self.n_stages + 1;
+        let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
         EvalScratch {
             slots: vec![0.0; n],
             branch_slots: vec![0.0; n],
@@ -239,7 +253,7 @@ impl Plan {
         scenario: &Scenario,
         scratch: &'s mut EvalScratch,
     ) -> Result<&'s [f64], PlanError> {
-        let n = self.n_stats + self.n_buckets + self.n_stages + 1;
+        let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
         debug_assert_eq!(scratch.slots.len(), n, "scratch must come from this plan");
         debug_assert_eq!(scratch.branch_slots.len(), n, "scratch must come from this plan");
         debug_assert_eq!(
@@ -333,14 +347,22 @@ impl Plan {
                 scratch.slots[i] = *v;
             }
 
+            // Conditions: expression-readable uptime slots, fail-closed
+            // (missing uptime = 0.0), clamped into [0, 1].
+            for (ci, name) in self.condition_names.iter().enumerate() {
+                scratch.slots[n_stats + ci] =
+                    phase.uptimes.get(name).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            }
+            let bucket_base = n_stats + self.n_conditions;
+
             // Base bucket raw sums/products: event-gated contribs EXCLUDED,
             // condition-tagged scaled by uptime (missing = 0 — fail-closed).
             self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
-            self.write_bucket_slots(&scratch.base_bucket_raw, n_stats, &mut scratch.slots);
+            self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
 
             // Stages in order.
             for (si, stage) in self.stages.iter().enumerate() {
-                let out_slot = n_stats + self.n_buckets + si;
+                let out_slot = bucket_base + self.n_buckets + si;
                 if !stage.branched {
                     scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
                     continue;
@@ -369,7 +391,7 @@ impl Plan {
                     self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
                     self.write_bucket_slots(
                         &scratch.branch_bucket_raw,
-                        n_stats,
+                        bucket_base,
                         &mut scratch.branch_slots,
                     );
                     let mut factors = 1.0;
@@ -378,7 +400,7 @@ impl Plan {
                             factors *= ev.factor.eval(&scratch.branch_slots);
                         }
                     }
-                    let ef_slot = n_stats + self.n_buckets + self.n_stages;
+                    let ef_slot = bucket_base + self.n_buckets + self.n_stages;
                     scratch.branch_slots[ef_slot] = factors;
                     ev_acc += weight * stage.program.eval(&scratch.branch_slots);
                 }
@@ -386,7 +408,7 @@ impl Plan {
             }
 
             for (oi, &si) in self.objective_stages.iter().enumerate() {
-                scratch.objectives[oi] += w * scratch.slots[n_stats + self.n_buckets + si];
+                scratch.objectives[oi] += w * scratch.slots[bucket_base + self.n_buckets + si];
             }
         }
 
@@ -432,9 +454,10 @@ impl Plan {
     }
 
     /// Write raw folds into slots, applying the SummedGroup wrap 1+Σ/100.
-    fn write_bucket_slots(&self, raw: &[f64], n_stats: usize, slots: &mut [f64]) {
+    /// `base` is the bucket segment's offset (n_stats + n_conditions).
+    fn write_bucket_slots(&self, raw: &[f64], base: usize, slots: &mut [f64]) {
         for (bi, fold) in self.bucket_folds.iter().enumerate() {
-            slots[n_stats + bi] = match fold {
+            slots[base + bi] = match fold {
                 FoldKind::SummedGroup => 1.0 + raw[bi] / 100.0,
                 _ => raw[bi],
             };
@@ -761,5 +784,39 @@ mod tests {
         let mut scratch = plan.scratch();
         let obj = plan.evaluate(&build, &scenario, &mut scratch).unwrap();
         assert!((obj[0] - 100.0).abs() < 1e-9, "got {}", obj[0]);
+    }
+
+    #[test]
+    fn conditions_are_readable_in_expressions() {
+        // Uptime is an expression value: 1 + enraged*2 at uptime 0.5 → 2.0.
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["base_v"], "conditions": ["enraged"],
+                 "pipeline": [ { "name": "out", "expr": "base_v * (1 + enraged * 2)" } ],
+                 "objectives": ["out"] }"#,
+        )
+        .unwrap();
+        let build: BuildState = serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
+        let plan = compile(&def).unwrap();
+        let mut scratch = plan.scratch();
+
+        let s: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "p", "weight": 1, "uptimes": { "enraged": 0.5 } } ] }"#,
+        )
+        .unwrap();
+        let obj = plan.evaluate(&build, &s, &mut scratch).unwrap();
+        assert!((obj[0] - 200.0).abs() < 1e-9, "got {}", obj[0]);
+
+        // Missing uptime = 0 (fail-closed): factor collapses to 1.
+        let s: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let obj = plan.evaluate(&build, &s, &mut scratch).unwrap();
+        assert!((obj[0] - 100.0).abs() < 1e-9, "got {}", obj[0]);
+    }
+
+    #[test]
+    fn condition_names_join_the_flat_namespace() {
+        let mut def = toy_def();
+        def.conditions.push("weapon".into()); // collides with a stat
+        assert!(compile(&def).unwrap_err().what.contains("duplicate"));
     }
 }
