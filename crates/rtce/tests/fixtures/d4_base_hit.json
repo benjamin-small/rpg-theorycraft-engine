@@ -1,0 +1,8 @@
+{
+  "name": "d4_base_hit_handshake",
+  "source": "hand-worked 2026-07-21, mirrors diablo4-calc parity suite: 1728 × (314.5/100) × (1 + 462/800) = 8573.0184 (fireball_rank9 base_hit)",
+  "expr": "weapon_avg * coeff / 100 * (1 + mainstat / 800)",
+  "slots": { "weapon_avg": 1728.0, "coeff": 314.5, "mainstat": 462.0 },
+  "expect": 8573.0184,
+  "rel_tolerance": 1e-9
+}
