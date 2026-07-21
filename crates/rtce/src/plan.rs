@@ -2,14 +2,9 @@
 //! EvalResult (hot path). One unified slot array is shared by every
 //! compiled expression: [stats | buckets | stages | event_factors].
 
-// BuildState/Scenario are consumed by `evaluate()` (Task 3, not yet
-// implemented); the imports are wired up now since they're part of this
-// module's declared surface.
-#[allow(unused_imports)]
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
 use crate::gamedef::{FoldKind, GameDef};
-#[allow(unused_imports)]
 use crate::scenario::Scenario;
 
 /// Hard cap on events: 2^8 = 256 branches per branched stage.
@@ -33,10 +28,7 @@ impl From<ExprError> for PlanError {
     }
 }
 
-// Several fields below are read only by `evaluate()` (Task 3, not yet
-// implemented) — compile() populates them now so Task 3 needs no rework.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Plan {
     stat_names: Vec<String>,
     condition_names: Vec<String>,
@@ -54,14 +46,12 @@ pub struct Plan {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct CompiledEvent {
     chance: Program,
     factor: Program,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct CompiledStage {
     name: String,
     program: Program,
@@ -199,6 +189,201 @@ impl Plan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalResult {
+    /// One value per Plan objective, in objective order.
+    pub objectives: Vec<f64>,
+}
+
+/// Preallocated evaluation buffers — `evaluate` never allocates.
+pub struct EvalScratch {
+    slots: Vec<f64>,
+    branch_slots: Vec<f64>,
+    base_bucket_raw: Vec<f64>,
+    branch_bucket_raw: Vec<f64>,
+    objectives: Vec<f64>,
+    stat_base: Vec<f64>,
+}
+
+impl Plan {
+    pub fn scratch(&self) -> EvalScratch {
+        let n = self.n_stats + self.n_buckets + self.n_stages + 1;
+        EvalScratch {
+            slots: vec![0.0; n],
+            branch_slots: vec![0.0; n],
+            base_bucket_raw: vec![0.0; self.n_buckets],
+            branch_bucket_raw: vec![0.0; self.n_buckets],
+            objectives: vec![0.0; self.objective_stages.len()],
+            stat_base: vec![0.0; self.n_stats],
+        }
+    }
+
+    pub fn evaluate(
+        &self,
+        build: &BuildState,
+        scenario: &Scenario,
+        scratch: &mut EvalScratch,
+    ) -> Result<EvalResult, PlanError> {
+        if scenario.phases.is_empty() {
+            return Err(PlanError { what: "scenario has no phases".into() });
+        }
+        let weight_sum: f64 = scenario.phases.iter().map(|p| p.weight).sum();
+        // Fail-closed on NaN too: `weight_sum > 0.0` is false for NaN, so
+        // negating it would accept NaN; check both sides explicitly instead
+        // (clippy::neg_cmp_op_on_partial_ord).
+        if weight_sum.is_nan() || weight_sum <= 0.0 {
+            return Err(PlanError { what: "phase weights must sum > 0".into() });
+        }
+
+        // Resolve + validate build ONCE: stats and contribution tags.
+        for slot in scratch.stat_base.iter_mut() {
+            *slot = 0.0;
+        }
+        for (name, v) in &build.stats {
+            let i = self
+                .stat_id(name)
+                .ok_or_else(|| PlanError { what: format!("unknown stat `{name}`") })?;
+            scratch.stat_base[i] = *v;
+        }
+        // Contribution tags validate per call (cheap linear scans over
+        // small registries; index resolution caches are a P5 concern).
+        for c in &build.contributions {
+            if !self.bucket_names.iter().any(|b| b == &c.bucket) {
+                return Err(PlanError { what: format!("unknown bucket `{}`", c.bucket) });
+            }
+            if let Some(e) = &c.event {
+                if !self.event_names.iter().any(|n| n == e) {
+                    return Err(PlanError { what: format!("unknown event `{e}`") });
+                }
+            }
+            if let Some(cd) = &c.condition {
+                if !self.condition_names.iter().any(|n| n == cd) {
+                    return Err(PlanError { what: format!("unknown condition `{cd}`") });
+                }
+            }
+        }
+
+        for o in scratch.objectives.iter_mut() {
+            *o = 0.0;
+        }
+
+        for phase in &scenario.phases {
+            let w = phase.weight / weight_sum;
+
+            // Stats: build values + phase overrides.
+            let n_stats = self.n_stats;
+            scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
+            for (name, v) in &phase.stats {
+                let i = self
+                    .stat_id(name)
+                    .ok_or_else(|| PlanError { what: format!("unknown stat `{name}`") })?;
+                scratch.slots[i] = *v;
+            }
+
+            // Base bucket raw sums/products: event-gated contribs EXCLUDED,
+            // condition-tagged scaled by uptime (missing = 0 — fail-closed).
+            self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
+            self.write_bucket_slots(&scratch.base_bucket_raw, n_stats, &mut scratch.slots);
+
+            // Stages in order.
+            for (si, stage) in self.stages.iter().enumerate() {
+                let out_slot = n_stats + self.n_buckets + si;
+                if !stage.branched {
+                    scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
+                    continue;
+                }
+                // Branch enumeration over 2^n events.
+                let n_ev = self.events.len();
+                let mut ev_acc = 0.0;
+                for mask in 0u32..(1 << n_ev) {
+                    // Weight = Π fired ? p : 1-p (chances from PHASE slots).
+                    let mut weight = 1.0;
+                    for (ei, ev) in self.events.iter().enumerate() {
+                        let p = ev.chance.eval(&scratch.slots).clamp(0.0, 1.0);
+                        weight *= if mask & (1 << ei) != 0 { p } else { 1.0 - p };
+                    }
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    // Branch slots: buckets recomputed with fired-event
+                    // contributions included; event_factors = Π factors.
+                    scratch.branch_slots.copy_from_slice(&scratch.slots);
+                    self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
+                    self.write_bucket_slots(
+                        &scratch.branch_bucket_raw,
+                        n_stats,
+                        &mut scratch.branch_slots,
+                    );
+                    let mut factors = 1.0;
+                    for (ei, ev) in self.events.iter().enumerate() {
+                        if mask & (1 << ei) != 0 {
+                            factors *= ev.factor.eval(&scratch.branch_slots);
+                        }
+                    }
+                    let ef_slot = n_stats + self.n_buckets + self.n_stages;
+                    scratch.branch_slots[ef_slot] = factors;
+                    ev_acc += weight * stage.program.eval(&scratch.branch_slots);
+                }
+                scratch.slots[out_slot] = ev_acc;
+            }
+
+            for (oi, &si) in self.objective_stages.iter().enumerate() {
+                scratch.objectives[oi] += w * scratch.slots[n_stats + self.n_buckets + si];
+            }
+        }
+
+        Ok(EvalResult { objectives: scratch.objectives.clone() })
+    }
+
+    /// Raw fold per bucket: Sum→Σ; SummedGroup→Σ (wrapped on write);
+    /// Product→Π(1+v/100). `fired_mask: None` = base (no event contribs);
+    /// Some(mask) = include contribs whose event bit is set.
+    fn fold_buckets(
+        &self,
+        build: &BuildState,
+        phase: &crate::scenario::Phase,
+        fired_mask: Option<u32>,
+        out: &mut [f64],
+    ) -> Result<(), PlanError> {
+        for (bi, fold) in self.bucket_folds.iter().enumerate() {
+            out[bi] = match fold {
+                FoldKind::Product => 1.0,
+                _ => 0.0,
+            };
+        }
+        for c in &build.contributions {
+            let bi = self.bucket_names.iter().position(|b| b == &c.bucket).unwrap();
+            if let Some(e) = &c.event {
+                let ei = self.event_names.iter().position(|n| n == e).unwrap();
+                match fired_mask {
+                    Some(mask) if mask & (1 << ei) != 0 => {}
+                    _ => continue,
+                }
+            }
+            let mut v = c.value;
+            if let Some(cond) = &c.condition {
+                let uptime = phase.uptimes.get(cond).copied().unwrap_or(0.0);
+                v *= uptime.clamp(0.0, 1.0);
+            }
+            match self.bucket_folds[bi] {
+                FoldKind::Sum | FoldKind::SummedGroup => out[bi] += v,
+                FoldKind::Product => out[bi] *= 1.0 + v / 100.0,
+            }
+        }
+        Ok(())
+    }
+
+    /// Write raw folds into slots, applying the SummedGroup wrap 1+Σ/100.
+    fn write_bucket_slots(&self, raw: &[f64], n_stats: usize, slots: &mut [f64]) {
+        for (bi, fold) in self.bucket_folds.iter().enumerate() {
+            slots[n_stats + bi] = match fold {
+                FoldKind::SummedGroup => 1.0 + raw[bi] / 100.0,
+                _ => raw[bi],
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +458,105 @@ mod tests {
             );
         }
         assert!(compile(&def).unwrap_err().what.contains("events"));
+    }
+
+    fn toy_build() -> BuildState {
+        serde_json::from_str(
+            r#"{ "stats": { "weapon": 100.0, "power": 50.0, "crit_chance": 25.0 },
+                 "contributions": [
+                   { "bucket": "additive", "value": 40.0 },
+                   { "bucket": "additive", "value": 30.0, "event": "crit" },
+                   { "bucket": "additive", "value": 20.0, "condition": "enraged" },
+                   { "bucket": "crit_group", "value": 50.0 },
+                   { "bucket": "indep", "value": 10.0 } ] }"#,
+        )
+        .unwrap()
+    }
+
+    fn arena() -> Scenario {
+        serde_json::from_str(
+            r#"{ "phases": [ { "name": "arena", "weight": 1,
+                   "uptimes": { "enraged": 0.5 },
+                   "stats": { "enemy_dr": 20.0 } } ] }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn toy_game_hand_worked_single_phase() {
+        // base    = 100 × 1.5                       = 150
+        // additive (no-crit) = 40 + 20×0.5          = 50   → ×1.5
+        // indep   = 1.10 ; crit_group = 1.5
+        // crit branch additive = 50 + 30 = 80       → ×1.8
+        // event_factors (crit) = 1.5 × 1.5          = 2.25
+        // no-crit hit = 150 × 1.5  × 1    × 1.1     = 247.5
+        // crit hit    = 150 × 1.8  × 2.25 × 1.1     = 668.25
+        // EV = 0.75×247.5 + 0.25×668.25             = 352.6875
+        // dps = 352.6875 × (1 − 0.20)               = 282.15
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let r = plan.evaluate(&toy_build(), &arena(), &mut scratch).unwrap();
+        assert!((r.objectives[0] - 282.15).abs() < 1e-9, "got {}", r.objectives[0]);
+    }
+
+    #[test]
+    fn phase_blending_weights_normalize() {
+        // Phase A = arena above (dps 282.15).
+        // Phase B: enraged 1.0, dr 0:
+        //   additive nc = 60 → ×1.6 ; crit = 90 → ×1.9
+        //   nc  = 150×1.6×1.1        = 264
+        //   crit= 150×1.9×2.25×1.1   = 705.375
+        //   EV  = .75×264 + .25×705.375 = 374.34375 ; dps = 374.34375
+        // Weights 60/40 → 0.6×282.15 + 0.4×374.34375 = 319.0275
+        let scenario: Scenario = serde_json::from_str(
+            r#"{ "phases": [
+                  { "name": "a", "weight": 60, "uptimes": { "enraged": 0.5 },
+                    "stats": { "enemy_dr": 20.0 } },
+                  { "name": "b", "weight": 40, "uptimes": { "enraged": 1.0 } } ] }"#,
+        )
+        .unwrap();
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let r = plan.evaluate(&toy_build(), &scenario, &mut scratch).unwrap();
+        assert!((r.objectives[0] - 319.0275).abs() < 1e-9, "got {}", r.objectives[0]);
+    }
+
+    #[test]
+    fn unknown_refs_in_build_and_scenario_are_eval_errors() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+
+        let mut b = toy_build();
+        b.contributions[0].bucket = "nope".into();
+        assert!(plan.evaluate(&b, &arena(), &mut scratch).unwrap_err().what.contains("nope"));
+
+        let mut b = toy_build();
+        b.stats.insert("mystery".into(), 1.0);
+        assert!(plan.evaluate(&b, &arena(), &mut scratch).unwrap_err().what.contains("mystery"));
+
+        let bad: Scenario =
+            serde_json::from_str(r#"{ "phases": [] }"#).unwrap();
+        assert!(plan
+            .evaluate(&toy_build(), &bad, &mut scratch)
+            .unwrap_err()
+            .what
+            .contains("phase"));
+    }
+
+    #[test]
+    fn chance_clamps_and_zero_uptime_is_fail_closed() {
+        // crit_chance 400 → clamp to 1.0: EV = crit branch only.
+        let mut b = toy_build();
+        b.stats.insert("crit_chance".into(), 400.0);
+        // no-uptime phase: enraged contribution contributes 0.
+        let s: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#,
+        )
+        .unwrap();
+        // additive crit = 40 + 30 = 70 → 1.7 ; hit = 150×1.7×2.25×1.1 = 631.125
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let r = plan.evaluate(&b, &s, &mut scratch).unwrap();
+        assert!((r.objectives[0] - 631.125).abs() < 1e-9, "got {}", r.objectives[0]);
     }
 }
