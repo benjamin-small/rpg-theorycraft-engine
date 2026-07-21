@@ -1,1 +1,23 @@
-//! Expression language (built in P1 Tasks 2–4).
+//! The expression language: pipeline stages, event chances, and scenario
+//! weights are written in it; `compile` turns source into a flat postfix
+//! `Program` evaluated over a slot array. Fail-closed: unknown identifiers
+//! and syntax errors carry a byte position and never guess.
+
+mod lexer;
+// mod parser;      // Task 3
+// mod compiler;    // Task 4
+// pub use compiler::{compile, Op, Program, Symbols};   // Task 4
+
+/// Position-carrying error for every stage (lex/parse/compile).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExprError {
+    /// Byte offset into the source string.
+    pub pos: usize,
+    pub msg: String,
+}
+
+impl std::fmt::Display for ExprError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "at byte {}: {}", self.pos, self.msg)
+    }
+}
