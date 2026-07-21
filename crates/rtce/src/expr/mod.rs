@@ -5,8 +5,8 @@
 
 mod lexer;
 mod parser;      // Task 3
-// mod compiler;    // Task 4
-// pub use compiler::{compile, Op, Program, Symbols};   // Task 4
+mod compiler;    // Task 4
+pub use compiler::{compile, Op, Program, Symbols};   // Task 4
 
 /// Position-carrying error for every stage (lex/parse/compile).
 #[derive(Debug, Clone, PartialEq)]
