@@ -22,10 +22,10 @@ fn toy_game_two_playbooks_pinned() {
     let mut scratch = plan.scratch();
 
     let arena: Scenario = load("scenario_arena.json");
-    let r = plan.evaluate(&build, &arena, &mut scratch).unwrap();
-    assert_close(r.objectives[0], 282.15, 1e-9, "arena dps");
+    let objectives = plan.evaluate(&build, &arena, &mut scratch).unwrap();
+    assert_close(objectives[0], 282.15, 1e-9, "arena dps");
 
     let dummy: Scenario = load("scenario_dummy.json");
-    let r = plan.evaluate(&build, &dummy, &mut scratch).unwrap();
-    assert_close(r.objectives[0], 374.34375, 1e-9, "dummy dps");
+    let objectives = plan.evaluate(&build, &dummy, &mut scratch).unwrap();
+    assert_close(objectives[0], 374.34375, 1e-9, "dummy dps");
 }
