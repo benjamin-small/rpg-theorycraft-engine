@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn empty_fixture_dir_panics() {
-        let dir = std::env::temp_dir().join("rtce-testkit-empty");
+        let dir = std::env::temp_dir().join(format!("rtce-testkit-empty-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let r = std::panic::catch_unwind(|| for_each_fixture(&dir, |_, _| {}));
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn fixtures_iterate_sorted_and_demand_provenance() {
-        let dir = std::env::temp_dir().join("rtce-testkit-two");
+        let dir = std::env::temp_dir().join(format!("rtce-testkit-two-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("b.json"), r#"{"name":"b","source":"t","v":2}"#).unwrap();

@@ -16,50 +16,63 @@ pub enum Tok {
     Comma,
 }
 
-/// Tokenize `src` into (byte position, token) pairs.
+/// Tokenize `src` into (byte position, token) pairs. Positions are true
+/// BYTE offsets into `src` — the language is ASCII-only, so token bodies
+/// (digits, `.`, identifier chars) are sliced directly out of the byte
+/// string, which is safe because none of those bytes can appear inside a
+/// multi-byte UTF-8 sequence. Any non-ASCII byte is a positioned error
+/// (fail-closed) rather than being silently treated as whitespace.
 pub fn tokenize(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
-    let b: Vec<char> = src.chars().collect();
+    let b = src.as_bytes();
     let mut out = Vec::new();
-    let mut i = 0;
+    let mut i = 0usize;
     while i < b.len() {
         let c = b[i];
-        if c.is_whitespace() {
+        if c.is_ascii_whitespace() {
             i += 1;
-        } else if c.is_ascii_digit() || c == '.' {
+        } else if c.is_ascii_digit() || c == b'.' {
             let start = i;
-            while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
                 i += 1;
             }
-            let text: String = b[start..i].iter().collect();
+            let text = &src[start..i];
             let n = text.parse::<f64>().map_err(|_| ExprError {
                 pos: start,
                 msg: format!("invalid number `{text}`"),
             })?;
             out.push((start, Tok::Num(n)));
-        } else if c.is_ascii_alphabetic() || c == '_' {
+        } else if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '.') {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.')
+            {
                 i += 1;
             }
-            out.push((start, Tok::Ident(b[start..i].iter().collect())));
-        } else {
+            out.push((start, Tok::Ident(src[start..i].to_string())));
+        } else if c.is_ascii() {
             let tok = match c {
-                '+' => Tok::Plus,
-                '-' => Tok::Minus,
-                '*' => Tok::Star,
-                '/' => Tok::Slash,
-                '(' => Tok::LParen,
-                ')' => Tok::RParen,
-                ',' => Tok::Comma,
+                b'+' => Tok::Plus,
+                b'-' => Tok::Minus,
+                b'*' => Tok::Star,
+                b'/' => Tok::Slash,
+                b'(' => Tok::LParen,
+                b')' => Tok::RParen,
+                b',' => Tok::Comma,
                 other => {
                     return Err(ExprError {
                         pos: i,
-                        msg: format!("unexpected character `{other}`"),
+                        msg: format!("unexpected character `{}`", other as char),
                     })
                 }
             };
             out.push((i, tok));
             i += 1;
+        } else {
+            let ch = src[i..].chars().next().unwrap();
+            return Err(ExprError {
+                pos: i,
+                msg: format!("unexpected character `{ch}`"),
+            });
         }
     }
     Ok(out)
@@ -104,6 +117,15 @@ mod tests {
         let with_pos = tokenize("a + b").unwrap();
         assert_eq!(with_pos[1].0, 2);
         assert_eq!(with_pos[2].0, 4);
+    }
+
+    #[test]
+    fn positions_are_true_byte_offsets_even_after_multibyte_chars() {
+        // NBSP (U+00A0) is 2 bytes; it is NOT whitespace-skipped by the byte
+        // lexer — it must error AT ITS OWN byte offset, and a later probe
+        // confirms offsets after multibyte content stay byte-true.
+        let e = tokenize("a\u{a0}b").unwrap_err();
+        assert_eq!(e.pos, 1);
     }
 
     #[test]

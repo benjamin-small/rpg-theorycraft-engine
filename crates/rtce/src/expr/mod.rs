@@ -21,3 +21,5 @@ impl std::fmt::Display for ExprError {
         write!(f, "at byte {}: {}", self.pos, self.msg)
     }
 }
+
+impl std::error::Error for ExprError {}

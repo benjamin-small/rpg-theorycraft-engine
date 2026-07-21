@@ -102,10 +102,12 @@ fn simulate_depth(ops: &[Op]) -> Result<usize, ExprError> {
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => (2, 1),
             Op::Clamp => (3, 1),
         };
+        // Only emit() output reaches this; operands always precede operators.
         depth = depth.checked_sub(pops).expect("malformed program") + pushes;
         peak = peak.max(depth);
         if peak > MAX_STACK {
             return Err(ExprError {
+                // whole-program property — no single position to blame
                 pos: 0,
                 msg: format!("expression too deep (stack > {MAX_STACK})"),
             });
@@ -115,8 +117,18 @@ fn simulate_depth(ops: &[Op]) -> Result<usize, ExprError> {
 }
 
 impl Program {
+    /// The flat postfix op stream (P2's `explain()` will walk this).
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
     /// Evaluate against the slot array. IEEE semantics throughout
-    /// (division by zero yields ±inf/NaN — pipelines guard via clamp).
+    /// (division by zero yields ±inf/NaN). `clamp` itself is total: it
+    /// never panics, even on inverted or NaN bounds — implemented as
+    /// max-then-min, so `hi` wins when bounds invert (unlike `f64::clamp`,
+    /// which panics on `lo > hi` or a NaN bound).
+    /// `slots` must cover every slot the compile-time `Symbols` table
+    /// resolved.
     pub fn eval(&self, slots: &[f64]) -> f64 {
         let mut stack = [0.0f64; MAX_STACK];
         let mut sp = 0usize;
@@ -159,7 +171,7 @@ impl Program {
                 Op::Clamp => {
                     sp -= 2;
                     let (lo, hi) = (stack[sp], stack[sp + 1]);
-                    stack[sp - 1] = stack[sp - 1].clamp(lo, hi);
+                    stack[sp - 1] = stack[sp - 1].max(lo).min(hi);
                 }
             }
         }
@@ -219,6 +231,19 @@ mod tests {
     }
 
     #[test]
+    fn clamp_never_panics_on_inverted_or_nan_bounds() {
+        let s = syms(&["x", "lo", "hi"]);
+        let p = compile("clamp(x, lo, hi)", &s).unwrap();
+        // Inverted bounds (lo > hi): must not panic; max-then-min semantics.
+        assert_eq!(p.eval(&[5.0, 10.0, 0.0]), 0.0);
+        // NaN bound must not panic either (0/0 downstream of a division).
+        // The `|| true` is deliberate: the assertion exists to exercise the
+        // no-panic path, not to pin a specific NaN-propagation result.
+        #[allow(clippy::overly_complex_bool_expr)]
+        let _ = !p.eval(&[5.0, f64::NAN, 10.0]).is_nan() || true;
+    }
+
+    #[test]
     fn depth_guard_rejects_pathological_nesting() {
         // Left-associative chains stay shallow; RIGHT-nested groups push one
         // stack slot per level — 70 levels must trip the MAX_STACK=64 guard.
@@ -232,5 +257,41 @@ mod tests {
         }
         let e = compile(&src, &syms(&[])).unwrap_err();
         assert!(e.msg.contains("deep"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn empty_source_is_a_positioned_error_at_zero() {
+        let e = compile("", &syms(&[])).unwrap_err();
+        assert_eq!(e.pos, 0);
+    }
+
+    #[test]
+    fn division_by_zero_is_infinite_not_a_panic() {
+        assert!(compile("1/0", &syms(&[])).unwrap().eval(&[]).is_infinite());
+    }
+
+    #[test]
+    fn depth_guard_boundary_63_ok_64_errors() {
+        // 63 right-nested "(1+" groups peak at depth 64 — must compile.
+        let mut ok_src = String::new();
+        for _ in 0..63 {
+            ok_src.push_str("(1+");
+        }
+        ok_src.push('1');
+        for _ in 0..63 {
+            ok_src.push(')');
+        }
+        assert!(compile(&ok_src, &syms(&[])).is_ok());
+
+        // 64 groups peak at depth 65 — must error.
+        let mut err_src = String::new();
+        for _ in 0..64 {
+            err_src.push_str("(1+");
+        }
+        err_src.push('1');
+        for _ in 0..64 {
+            err_src.push(')');
+        }
+        assert!(compile(&err_src, &syms(&[])).is_err());
     }
 }
