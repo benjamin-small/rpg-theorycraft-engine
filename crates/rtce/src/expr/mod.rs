@@ -4,7 +4,7 @@
 //! and syntax errors carry a byte position and never guess.
 
 mod lexer;
-// mod parser;      // Task 3
+mod parser;      // Task 3
 // mod compiler;    // Task 4
 // pub use compiler::{compile, Op, Program, Symbols};   // Task 4
 
