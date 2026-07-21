@@ -9,4 +9,5 @@
 pub mod expr;
 pub mod build;
 pub mod gamedef;
+pub mod plan;
 pub mod scenario;
