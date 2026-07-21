@@ -1,0 +1,10 @@
+{
+  "phases": [
+    {
+      "name": "arena",
+      "weight": 1,
+      "uptimes": { "enraged": 0.5 },
+      "stats": { "enemy_dr": 20.0 }
+    }
+  ]
+}

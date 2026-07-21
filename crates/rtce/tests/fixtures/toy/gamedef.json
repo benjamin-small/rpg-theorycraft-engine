@@ -1,0 +1,23 @@
+{
+  "_source": "hand-authored toy game 2026-07-21 — P2 gate",
+  "stats": ["weapon", "power", "crit_chance", "enemy_dr"],
+  "conditions": ["enraged"],
+  "buckets": {
+    "additive": { "fold": "sum" },
+    "crit_group": { "fold": "summed_group" },
+    "indep": { "fold": "product" }
+  },
+  "events": {
+    "crit": { "chance": "crit_chance / 100", "factor": "1.5 * crit_group" }
+  },
+  "pipeline": [
+    { "name": "base", "expr": "weapon * (1 + power / 100)" },
+    {
+      "name": "hit",
+      "expr": "base * (1 + additive / 100) * event_factors * indep",
+      "branched": true
+    },
+    { "name": "dps", "expr": "hit * (1 - enemy_dr / 100)" }
+  ],
+  "objectives": ["dps"]
+}

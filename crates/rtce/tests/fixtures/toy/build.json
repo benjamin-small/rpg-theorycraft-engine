@@ -1,0 +1,10 @@
+{
+  "stats": { "weapon": 100.0, "power": 50.0, "crit_chance": 25.0 },
+  "contributions": [
+    { "bucket": "additive", "value": 40.0 },
+    { "bucket": "additive", "value": 30.0, "event": "crit" },
+    { "bucket": "additive", "value": 20.0, "condition": "enraged" },
+    { "bucket": "crit_group", "value": 50.0 },
+    { "bucket": "indep", "value": 10.0 }
+  ]
+}
