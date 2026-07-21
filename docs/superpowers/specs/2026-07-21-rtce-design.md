@@ -160,3 +160,12 @@ optional later (names reserved by checking availability, not squatting).
 - poe2-calcs migration (second-consumer proof, later project).
 - Dirty-flag incremental evaluation (hook recorded, build on evidence).
 - JIT/codegen (rejected: complexity + WASM-hostile; IR is fast enough).
+
+## Done since
+
+- 2026-07-21 — P1 complete: workspace (rtce + rtce-testkit), expression
+  language end-to-end (lexer → parser → postfix Program → stack evaluator;
+  min/max/clamp/floor; positioned fail-closed errors; compile-time symbol
+  resolution and depth guard, zero-alloc eval). Testkit enforces the
+  empty-glob and provenance rules. Pinned handshake: d4 base_hit
+  8,573.0184 via golden fixture, mutation-proven.
