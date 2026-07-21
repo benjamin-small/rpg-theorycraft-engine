@@ -169,3 +169,11 @@ optional later (names reserved by checking availability, not squatting).
   resolution and depth guard, zero-alloc eval). Testkit enforces the
   empty-glob and provenance rules. Pinned handshake: d4 base_hit
   8,573.0184 via golden fixture, mutation-proven.
+- 2026-07-21 — P2 complete: GameDef/BuildState/Scenario serde tiers; Plan
+  compilation (unified slot layout [stats|buckets|stages|event_factors],
+  staged symbol scoping, flat-namespace + MAX_EVENTS=8 fail-closed checks);
+  evaluate() — three fold kinds, 2ⁿ event-branch EV with branch-recomputed
+  buckets, condition-uptime scaling (missing uptime = 0, fail-closed),
+  normalized phase blending, scratch-buffer zero-alloc hot path. Toy game
+  gate: two playbooks pinned end-to-end from JSON (arena 282.15 / dummy
+  374.34375), mutation-proven on both the build and scenario axes.
