@@ -1,0 +1,8 @@
+[package]
+name = "rtce-testkit"
+version = "0.1.0"
+edition = "2021"
+description = "Testing harness for rtce consumers: golden-fixture runner and assertion helpers."
+
+[dependencies]
+serde_json = "1"

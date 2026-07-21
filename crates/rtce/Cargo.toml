@@ -1,0 +1,11 @@
+[package]
+name = "rtce"
+version = "0.1.0"
+edition = "2021"
+description = "RPG theorycraft engine: game algorithms as configuration, compiled once into fast evaluation plans."
+
+[dependencies]
+
+[dev-dependencies]
+rtce-testkit = { path = "../rtce-testkit" }
+serde_json = "1"
