@@ -177,3 +177,12 @@ optional later (names reserved by checking availability, not squatting).
   normalized phase blending, scratch-buffer zero-alloc hot path. Toy game
   gate: two playbooks pinned end-to-end from JSON (arena 282.15 / dummy
   374.34375), mutation-proven on both the build and scenario axes.
+- 2026-07-21 — P3 complete: conditions are expression-readable slots
+  (layout [stats|conditions|buckets|stages|event_factors]); the D4
+  algorithm is a committed GameDef fixture — crit/OP as events, vulnerable
+  as a condition-slot baseline expression, DoT as a scalar chain (crit-
+  immune by construction), AS cap in-config. Deliberately resolver-side:
+  mod→bucket routing (element/tag) and breakpoint quantization. All of
+  diablo4-calc's T1–T10 reproduce through the generic engine, incl. the
+  pinned 17,574.30 and variance bounds — mutation-proven on both the case
+  and gamedef axes.
