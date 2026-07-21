@@ -1,0 +1,35 @@
+{
+  "name": "t10_full_stack",
+  "source": "T10 pinned golden: EV 16980 × 1.15 × 0.75 = 14645.25; ×1.2 APS = 17574.30; the diablo4-calc CLI default number.",
+  "build": {
+    "stats": {
+      "weapon_avg": 1000,
+      "coeff_pct": 200,
+      "mainstat": 1200,
+      "mainstat_divisor": 800,
+      "crit_chance": 50,
+      "op_chance": 0,
+      "op_baseline": 1.5,
+      "base_aps": 1.0,
+      "hits_per_use": 1,
+      "enemy_dr": 25,
+      "dot_coeff_pct": 0
+    },
+    "contributions": [
+      { "bucket": "additive", "value": 30 },
+      { "bucket": "additive", "value": 20 },
+      { "bucket": "additive", "value": 20, "condition": "vulnerable" },
+      { "bucket": "additive", "value": 50, "event": "crit" },
+      { "bucket": "crit_group", "value": 20 },
+      { "bucket": "indep", "value": 15 },
+      { "bucket": "as_sum", "value": 20 }
+    ]
+  },
+  "uptimes": { "vulnerable": 1 },
+  "expect": {
+    "hit_after_dr": 14645.25,
+    "total_dps": 17574.30,
+    "hit_min": 10544.58,
+    "hit_max": 19331.73
+  }
+}

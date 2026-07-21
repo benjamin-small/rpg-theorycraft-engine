@@ -1,0 +1,27 @@
+{
+  "name": "t03_one_additive_bucket_close",
+  "source": "T3: A = 1.4 → 2400 (routing pre-applied — resolver's job)",
+  "build": {
+    "stats": {
+      "weapon_avg": 1000,
+      "coeff_pct": 100,
+      "mainstat": 0,
+      "mainstat_divisor": 800,
+      "crit_chance": 0,
+      "op_chance": 0,
+      "op_baseline": 1.5,
+      "base_aps": 1.0,
+      "hits_per_use": 1,
+      "enemy_dr": 0,
+      "dot_coeff_pct": 0
+    },
+    "contributions": [
+      { "bucket": "additive", "value": 30 },
+      { "bucket": "additive", "value": 20 },
+      { "bucket": "additive", "value": 50 },
+      { "bucket": "additive", "value": 40, "condition": "close" }
+    ]
+  },
+  "uptimes": { "close": 1 },
+  "expect": { "hit_after_dr": 2400.0 }
+}

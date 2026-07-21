@@ -1,0 +1,43 @@
+{
+  "_source": "Diablo 4 S13/S14 damage algorithm as rtce config, transcribed from diablo4-calc engine/core (2026-07-21). Routing (element/tag matching) and breakpoint quantization are resolver-side by design.",
+  "stats": ["weapon_avg", "coeff_pct", "mainstat", "mainstat_divisor",
+             "crit_chance", "op_chance", "op_baseline",
+             "base_aps", "hits_per_use", "enemy_dr", "dot_coeff_pct"],
+  "conditions": ["vulnerable", "close"],
+  "buckets": {
+    "additive":     { "fold": "sum" },
+    "dot_additive": { "fold": "sum" },
+    "as_sum":       { "fold": "sum" },
+    "crit_group":   { "fold": "summed_group" },
+    "op_group":     { "fold": "summed_group" },
+    "vuln_group":   { "fold": "summed_group" },
+    "gen_group":    { "fold": "summed_group" },
+    "elem_group":   { "fold": "summed_group" },
+    "tag_group":    { "fold": "summed_group" },
+    "dot_group":    { "fold": "summed_group" },
+    "indep":        { "fold": "product" }
+  },
+  "events": {
+    "crit":      { "chance": "crit_chance / 100", "factor": "1.5 * crit_group" },
+    "overpower": { "chance": "op_chance / 100",   "factor": "op_baseline * op_group" }
+  },
+  "pipeline": [
+    { "name": "mainstat_mult", "expr": "1 + mainstat / mainstat_divisor" },
+    { "name": "base", "expr": "weapon_avg * coeff_pct / 100 * mainstat_mult" },
+    { "name": "vuln_factor", "expr": "1 + vulnerable * (1.2 * vuln_group - 1)" },
+    { "name": "hit",
+      "expr": "base * (1 + additive / 100) * event_factors * gen_group * elem_group * tag_group * vuln_factor * indep",
+      "branched": true },
+    { "name": "hit_after_dr", "expr": "hit * (1 - enemy_dr / 100)" },
+    { "name": "hit_min", "expr": "hit_after_dr * 0.72" },
+    { "name": "hit_max", "expr": "hit_after_dr * 1.32" },
+    { "name": "raw_aps", "expr": "base_aps * (1 + min(as_sum, 100) / 100)" },
+    { "name": "hit_dps", "expr": "hit_after_dr * hits_per_use * raw_aps" },
+    { "name": "dot_base", "expr": "weapon_avg * dot_coeff_pct / 100 * mainstat_mult" },
+    { "name": "dot_dps",
+      "expr": "dot_base * (1 + dot_additive / 100) * dot_group * vuln_factor * (1 - enemy_dr / 100)" },
+    { "name": "total_dps", "expr": "hit_dps + dot_dps" }
+  ],
+  "objectives": ["total_dps", "hit_after_dr", "hit_min", "hit_max",
+                  "hit_dps", "dot_dps", "raw_aps"]
+}

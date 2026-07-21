@@ -1,0 +1,25 @@
+{
+  "name": "t07_vulnerable",
+  "source": "T7: 1000 × 1.2 × (1.2 × 1.2)",
+  "build": {
+    "stats": {
+      "weapon_avg": 1000,
+      "coeff_pct": 100,
+      "mainstat": 0,
+      "mainstat_divisor": 800,
+      "crit_chance": 0,
+      "op_chance": 0,
+      "op_baseline": 1.5,
+      "base_aps": 1.0,
+      "hits_per_use": 1,
+      "enemy_dr": 0,
+      "dot_coeff_pct": 0
+    },
+    "contributions": [
+      { "bucket": "additive", "value": 20, "condition": "vulnerable" },
+      { "bucket": "vuln_group", "value": 20 }
+    ]
+  },
+  "uptimes": { "vulnerable": 1 },
+  "expect": { "hit_after_dr": 1728.0 }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "t04_s13_crit_sums",
+  "source": "T4: 1.5 × (1+1.05) = 3.075, NOT the naive 3.645 product",
+  "build": {
+    "stats": {
+      "weapon_avg": 1000,
+      "coeff_pct": 100,
+      "mainstat": 0,
+      "mainstat_divisor": 800,
+      "crit_chance": 100,
+      "op_chance": 0,
+      "op_baseline": 1.5,
+      "base_aps": 1.0,
+      "hits_per_use": 1,
+      "enemy_dr": 0,
+      "dot_coeff_pct": 0
+    },
+    "contributions": [
+      { "bucket": "crit_group", "value": 35 },
+      { "bucket": "crit_group", "value": 20 },
+      { "bucket": "crit_group", "value": 50 }
+    ]
+  },
+  "uptimes": {},
+  "expect": { "hit_after_dr": 3075.0 }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "t08_attack_speed_cap",
+  "source": "T8 (cap half): 130 caps at 100 → APS 2.0. Breakpoint quantization is resolver-side by design — see gamedef _source.",
+  "build": {
+    "stats": {
+      "weapon_avg": 1000,
+      "coeff_pct": 100,
+      "mainstat": 0,
+      "mainstat_divisor": 800,
+      "crit_chance": 0,
+      "op_chance": 0,
+      "op_baseline": 1.5,
+      "base_aps": 1.0,
+      "hits_per_use": 1,
+      "enemy_dr": 0,
+      "dot_coeff_pct": 0
+    },
+    "contributions": [
+      { "bucket": "as_sum", "value": 60 },
+      { "bucket": "as_sum", "value": 70 }
+    ]
+  },
+  "uptimes": {},
+  "expect": { "raw_aps": 2.0, "total_dps": 2000.0 }
+}
