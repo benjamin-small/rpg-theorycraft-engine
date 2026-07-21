@@ -23,11 +23,12 @@ Decisions locked with the user (2026-07-21):
 ## Architecture
 
 ```
-GameDef (config: stats, buckets, events, pipeline)   ── compile once ──► Plan (IR)
+GameDef  (config: stats, buckets, events, pipeline)  ── compile once ───► Plan (IR)
+Scenario (config: phases, targets, uptimes)          ── compile once ───► phase table
 BuildState (one candidate's mods/stats)              ── per candidate ──► f64 arrays
-Plan.evaluate(&BuildState)        → EvalResult       (named objective values, e.g. total_dps; hot path: no alloc/parse/hash)
-Plan.explain(&BuildState)         → Breakdown        (per-stage traces, teaching path)
-search::price(plan, base, moves)  → results          (apply → eval → revert, collectors)
+Plan.evaluate(&BuildState, &Scenario)  → EvalResult  (per-scenario objectives; hot path: no alloc/parse/hash)
+Plan.explain(&BuildState, &Scenario)   → Breakdown   (per-stage traces, teaching path)
+search::price(plan, base, moves, scenarios) → results (apply → eval → revert; top-K / Pareto)
 ```
 
 ### GameDef — the algorithm as configuration
@@ -60,6 +61,27 @@ Four schema-validated domains:
   million-candidate sweeps remain feasible.
 - The recorded stage dependency graph is the hook for dirty-flag partial
   re-evaluation later. NOT built until search profiling proves the need.
+
+### Scenarios (playbooks) — the encounter as configuration
+
+The third config tier alongside GameDef and BuildState: a Scenario models
+THE FIGHT being asked about — "1-minute single boss" vs "3-minute pack
+clear" are different scenario files, not different engines.
+
+- **Level 1 (ships with the core): weighted-phase blending.** A scenario =
+  named phases with durations/weights and per-phase overrides: target
+  profile (count, DR, elite), and CONDITION UPTIME FRACTIONS replacing
+  today's booleans (vulnerable 0.65 of the time, not on/off). Evaluation =
+  K phase-evals of the same Plan, blended — cost stays microseconds, so
+  the search budget is untouched. `EvalResult` carries per-scenario
+  objectives (`boss_dps`, `clear_dps`, …); collectors can Pareto across
+  scenarios ("best boss build" vs "best clear build" falls out).
+- **Level 2 (deferred, P6): timeline simulation.** Rotation/priority
+  scripts, cooldowns, resource, procs, buff stacking computing its own
+  uptimes over the scenario's duration — also config (the "emulation
+  sequence"), sharing the SAME Scenario schema so fidelity upgrades don't
+  change the interface. Cost moves to milliseconds/candidate; search still
+  works with an adjusted budget. Not built until Level 1 proves the shape.
 
 ### Search module (pricing only — no generation)
 
@@ -114,12 +136,17 @@ TO THE DIGIT through rtce before the old math is deleted.
 - **P1** — repo scaffold, `rtce` + `rtce-testkit` crates, expression
   language + compiler (parse → IR → eval), TDD'd like diablo4-calc M1/M2.
 - **P2** — stat registry, bucket combinators, event enumeration, pipeline
-  stages; the toy game evaluates end-to-end with a pinned number.
+  stages, and the Scenario schema with Level-1 phase blending; the toy game
+  evaluates end-to-end against two scenarios with pinned numbers.
 - **P3** — D4 GameDef: T1–T10 reproduce through rtce.
 - **P4** — full parity (7 builds) + diablo4-calc switchover to the path
   dependency; delete the duplicated math.
-- **P5** — search module (Move, batch pricing, collectors) + out-of-process
-  driver interface; subsumes diablo4-calc's M9 optimizer.
+- **P5** — search module (Move, batch pricing, collectors, multi-scenario
+  Pareto) + out-of-process driver interface; subsumes diablo4-calc's M9
+  optimizer.
+- **P6** — Level-2 timeline simulation (rotation scripts, cooldowns,
+  resource, procs) behind the same Scenario schema; built only after
+  Level-1 blending has proven the shape on real questions.
 
 ## Dependency mechanics (no submodules)
 
