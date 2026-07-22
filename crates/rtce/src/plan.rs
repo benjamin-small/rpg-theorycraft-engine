@@ -209,6 +209,33 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     })
 }
 
+/// Per-phase teaching trace — the "show your work" path. Allocates freely;
+/// tracing is OFF on the evaluate() hot path.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Explanation {
+    pub objectives: Vec<f64>,
+    pub phases: Vec<PhaseTrace>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhaseTrace {
+    pub name: String,
+    pub weight: f64,
+    pub conditions: Vec<(String, f64)>,
+    pub buckets: Vec<(String, f64)>,
+    pub stages: Vec<(String, f64)>,
+    pub branches: Vec<BranchTrace>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchTrace {
+    pub stage: String,
+    pub fired: Vec<String>,
+    pub weight: f64,
+    pub event_factors: f64,
+    pub value: f64,
+}
+
 impl Plan {
     pub fn stat_id(&self, name: &str) -> Option<usize> {
         self.stat_names.iter().position(|s| s == name)
@@ -247,12 +274,45 @@ impl Plan {
         }
     }
 
+    /// Hot path: no allocation, no tracing. Returns the objective slice
+    /// borrowed from `scratch`.
     pub fn evaluate<'s>(
         &self,
         build: &BuildState,
         scenario: &Scenario,
         scratch: &'s mut EvalScratch,
     ) -> Result<&'s [f64], PlanError> {
+        self.run(build, scenario, scratch, None)?;
+        Ok(&scratch.objectives)
+    }
+
+    /// Teaching path: runs the SAME engine as `evaluate` with per-phase,
+    /// per-stage, per-branch tracing turned on. Allocates freely (one
+    /// `Explanation` tree); the hot `evaluate` path never takes this branch.
+    pub fn explain(
+        &self,
+        build: &BuildState,
+        scenario: &Scenario,
+        scratch: &mut EvalScratch,
+    ) -> Result<Explanation, PlanError> {
+        let mut explanation = Explanation { objectives: Vec::new(), phases: Vec::new() };
+        self.run(build, scenario, scratch, Some(&mut explanation))?;
+        explanation.objectives = scratch.objectives.clone();
+        Ok(explanation)
+    }
+
+    /// The single evaluation engine. `trace: None` is the hot path (no
+    /// allocation beyond what the caller already provided via `scratch`);
+    /// `trace: Some(_)` pushes a `PhaseTrace`/`BranchTrace` per phase/branch
+    /// as it goes — all of that bookkeeping is gated behind `if let
+    /// Some(..)` so it costs nothing when tracing is off.
+    fn run(
+        &self,
+        build: &BuildState,
+        scenario: &Scenario,
+        scratch: &mut EvalScratch,
+        mut trace: Option<&mut Explanation>,
+    ) -> Result<(), PlanError> {
         let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
         debug_assert_eq!(scratch.slots.len(), n, "scratch must come from this plan");
         debug_assert_eq!(scratch.branch_slots.len(), n, "scratch must come from this plan");
@@ -345,6 +405,19 @@ impl Plan {
         for phase in &scenario.phases {
             let w = phase.weight / weight_sum;
 
+            // Trace-only: one PhaseTrace built up as this phase evaluates,
+            // pushed into `trace` at the end of the iteration. `None` on
+            // the evaluate() hot path — no allocation, this is just an
+            // `Option` staying `None`.
+            let mut phase_trace: Option<PhaseTrace> = trace.is_some().then(|| PhaseTrace {
+                name: phase.name.clone(),
+                weight: w,
+                conditions: Vec::new(),
+                buckets: Vec::new(),
+                stages: Vec::new(),
+                branches: Vec::new(),
+            });
+
             // Stats: build values + phase overrides.
             let n_stats = self.n_stats;
             scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
@@ -362,11 +435,21 @@ impl Plan {
                     phase.uptimes.get(name).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             }
             let bucket_base = n_stats + self.n_conditions;
+            if let Some(pt) = phase_trace.as_mut() {
+                for (ci, name) in self.condition_names.iter().enumerate() {
+                    pt.conditions.push((name.clone(), scratch.slots[n_stats + ci]));
+                }
+            }
 
             // Base bucket raw sums/products: event-gated contribs EXCLUDED,
             // condition-tagged scaled by uptime (missing = 0 — fail-closed).
             self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
             self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
+            if let Some(pt) = phase_trace.as_mut() {
+                for (bi, name) in self.bucket_names.iter().enumerate() {
+                    pt.buckets.push((name.clone(), scratch.slots[bucket_base + bi]));
+                }
+            }
 
             // Stages in order.
             for (si, stage) in self.stages.iter().enumerate() {
@@ -410,17 +493,40 @@ impl Plan {
                     }
                     let ef_slot = bucket_base + self.n_buckets + self.n_stages;
                     scratch.branch_slots[ef_slot] = factors;
-                    ev_acc += weight * stage.program.eval(&scratch.branch_slots);
+                    let branch_value = stage.program.eval(&scratch.branch_slots);
+                    ev_acc += weight * branch_value;
+                    if let Some(pt) = phase_trace.as_mut() {
+                        let fired: Vec<String> = (0..n_ev)
+                            .filter(|&ei| mask & (1 << ei) != 0)
+                            .map(|ei| self.event_names[ei].clone())
+                            .collect();
+                        pt.branches.push(BranchTrace {
+                            stage: stage.name.clone(),
+                            fired,
+                            weight,
+                            event_factors: factors,
+                            value: branch_value,
+                        });
+                    }
                 }
                 scratch.slots[out_slot] = ev_acc;
+            }
+            if let Some(pt) = phase_trace.as_mut() {
+                for (si, stage) in self.stages.iter().enumerate() {
+                    pt.stages.push((stage.name.clone(), scratch.slots[bucket_base + self.n_buckets + si]));
+                }
             }
 
             for (oi, &si) in self.objective_stages.iter().enumerate() {
                 scratch.objectives[oi] += w * scratch.slots[bucket_base + self.n_buckets + si];
             }
+
+            if let Some(pt) = phase_trace {
+                trace.as_mut().expect("phase_trace is Some only when trace is Some").phases.push(pt);
+            }
         }
 
-        Ok(&scratch.objectives)
+        Ok(())
     }
 
     /// Raw fold per bucket: Sum→Σ; SummedGroup→Σ (wrapped on write);
@@ -838,5 +944,103 @@ mod tests {
         .unwrap();
         let e = plan.evaluate(&toy_build(), &s, &mut scratch).unwrap_err();
         assert!(e.what.contains("enrged"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn explain_matches_evaluate_and_traces_the_hand_worked_numbers() {
+        // Same fixtures/hand numbers as toy_game_hand_worked_single_phase.
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let objectives = plan.evaluate(&toy_build(), &arena(), &mut scratch).unwrap().to_vec();
+
+        let mut scratch = plan.scratch();
+        let ex = plan.explain(&toy_build(), &arena(), &mut scratch).unwrap();
+
+        assert_eq!(ex.objectives, objectives);
+        assert!((ex.objectives[0] - 282.15).abs() < 1e-9, "got {:?}", ex.objectives);
+
+        assert_eq!(ex.phases.len(), 1);
+        let p = &ex.phases[0];
+        assert!((p.weight - 1.0).abs() < 1e-9);
+        assert!(
+            p.conditions.iter().any(|(n, v)| n == "enraged" && (v - 0.5).abs() < 1e-9),
+            "got {:?}",
+            p.conditions
+        );
+        assert!(
+            p.buckets.iter().any(|(n, v)| n == "additive" && (v - 50.0).abs() < 1e-9),
+            "got {:?}",
+            p.buckets
+        );
+        assert!(
+            p.stages.iter().any(|(n, v)| n == "base" && (v - 150.0).abs() < 1e-9),
+            "got {:?}",
+            p.stages
+        );
+
+        let hit_branches: Vec<&BranchTrace> =
+            p.branches.iter().filter(|b| b.stage == "hit").collect();
+        assert_eq!(hit_branches.len(), 2);
+        let weight_sum: f64 = hit_branches.iter().map(|b| b.weight).sum();
+        assert!((weight_sum - 1.0).abs() < 1e-9, "got {weight_sum}");
+
+        let unfired = hit_branches.iter().find(|b| b.fired.is_empty()).unwrap();
+        assert!((unfired.weight - 0.75).abs() < 1e-9, "got {}", unfired.weight);
+        assert!((unfired.value - 247.5).abs() < 1e-9, "got {}", unfired.value);
+        assert!((unfired.event_factors - 1.0).abs() < 1e-9);
+
+        let fired = hit_branches.iter().find(|b| !b.fired.is_empty()).unwrap();
+        assert_eq!(fired.fired, vec!["crit".to_string()]);
+        assert!((fired.weight - 0.25).abs() < 1e-9, "got {}", fired.weight);
+        assert!((fired.value - 668.25).abs() < 1e-9, "got {}", fired.value);
+        assert!((fired.event_factors - 2.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn explain_with_zero_events_has_a_single_all_unfired_branch_entry() {
+        let def: GameDef = serde_json::from_str(
+            r#"{
+              "stats": ["base_v"],
+              "pipeline": [ { "name": "hit", "expr": "base_v * event_factors", "branched": true } ],
+              "objectives": ["hit"]
+            }"#,
+        )
+        .unwrap();
+        let build: BuildState =
+            serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let plan = compile(&def).unwrap();
+        let mut scratch = plan.scratch();
+        let ex = plan.explain(&build, &scenario, &mut scratch).unwrap();
+        assert!((ex.objectives[0] - 100.0).abs() < 1e-9);
+
+        let branches = &ex.phases[0].branches;
+        assert_eq!(branches.len(), 1, "got {:?}", branches);
+        assert!(branches[0].fired.is_empty());
+        assert!((branches[0].weight - 1.0).abs() < 1e-9);
+        assert!((branches[0].event_factors - 1.0).abs() < 1e-9);
+        assert!((branches[0].value - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn explain_scalar_only_pipeline_has_no_branches() {
+        // conditions_are_readable_in_expressions' def has no branched stage.
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["base_v"], "conditions": ["enraged"],
+                 "pipeline": [ { "name": "out", "expr": "base_v * (1 + enraged * 2)" } ],
+                 "objectives": ["out"] }"#,
+        )
+        .unwrap();
+        let build: BuildState = serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
+        let scenario: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "p", "weight": 1, "uptimes": { "enraged": 0.5 } } ] }"#,
+        )
+        .unwrap();
+        let plan = compile(&def).unwrap();
+        let mut scratch = plan.scratch();
+        let ex = plan.explain(&build, &scenario, &mut scratch).unwrap();
+        assert!((ex.objectives[0] - 200.0).abs() < 1e-9);
+        assert!(ex.phases[0].branches.is_empty(), "got {:?}", ex.phases[0].branches);
     }
 }
