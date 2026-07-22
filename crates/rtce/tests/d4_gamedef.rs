@@ -38,12 +38,13 @@ fn t_cases_reproduce_diablo4_calc_numbers() {
         let objectives = plan.evaluate(&build, &scenario, &mut scratch).unwrap();
         let expect = v["expect"].as_object().unwrap();
         assert!(!expect.is_empty(), "{case}: empty expect");
+        let tol = v["rel_tolerance"].as_f64().unwrap_or(1e-9);
         for (key, want) in expect {
             let i = names
                 .iter()
                 .position(|n| n == key)
                 .unwrap_or_else(|| panic!("{case}: unknown objective `{key}`"));
-            assert_close(objectives[i], want.as_f64().unwrap(), 1e-9, &format!("{case}.{key}"));
+            assert_close(objectives[i], want.as_f64().unwrap(), tol, &format!("{case}.{key}"));
         }
     });
 }

@@ -17,6 +17,11 @@ pub struct Phase {
     /// Relative weight (e.g. seconds); normalized over the scenario's sum.
     pub weight: f64,
     /// Condition → uptime fraction in [0,1]. Missing condition = 0.0.
+    /// Fractional uptimes blend condition effects INDEPENDENTLY (each
+    /// effect scales by u; correlations between effects of the same
+    /// condition are dropped) — exact at 0 and 1, the Level-1
+    /// approximation between; Level-2 timeline simulation is the fidelity
+    /// path.
     #[serde(default)]
     pub uptimes: BTreeMap<String, f64>,
     /// Stat overrides for this phase (enemy DR, target count, …).

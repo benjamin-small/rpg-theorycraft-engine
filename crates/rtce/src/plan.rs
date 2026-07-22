@@ -284,6 +284,14 @@ impl Plan {
                 });
             }
             for (cond, v) in &phase.uptimes {
+                if !self.condition_names.iter().any(|n| n == cond) {
+                    return Err(PlanError {
+                        what: format!(
+                            "phase `{}`: unknown condition `{cond}` in phase uptimes",
+                            phase.name
+                        ),
+                    });
+                }
                 if !v.is_finite() {
                     return Err(PlanError {
                         what: format!(
@@ -818,5 +826,17 @@ mod tests {
         let mut def = toy_def();
         def.conditions.push("weapon".into()); // collides with a stat
         assert!(compile(&def).unwrap_err().what.contains("duplicate"));
+    }
+
+    #[test]
+    fn unknown_uptime_keys_are_rejected() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let s: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "p", "weight": 1, "uptimes": { "enrged": 0.5 } } ] }"#,
+        )
+        .unwrap();
+        let e = plan.evaluate(&toy_build(), &s, &mut scratch).unwrap_err();
+        assert!(e.what.contains("enrged"), "got: {}", e.what);
     }
 }
