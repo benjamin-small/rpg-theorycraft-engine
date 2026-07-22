@@ -56,11 +56,14 @@ cargo run -p rtce --example your_own_game
 ## Status
 
 Parity-proven against its first consumer, `diablo4-calc`: all 7 of its
-archetype builds are bit-identical through `rtce` (the standing numbers
-8,096.02 … 6,769.10). `diablo4-calc` runs solely on `rtce` in production,
-including in the browser via WASM.
+archetype builds reproduced to <1e-9 relative during the P4 cross-engine
+proof through `rtce` (the standing numbers 8,096.02 … 6,769.10).
+`diablo4-calc` runs solely on `rtce` in production, including in the
+browser via WASM.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE)
-or [MIT license](../../LICENSE-MIT) at your option.
+Licensed under either of MIT OR Apache-2.0 at your option. License texts
+ship with this crate (`LICENSE-MIT`, `LICENSE-APACHE`); canonical copies
+are in the repository root at
+https://github.com/benjamin-small/rpg-theorycraft-engine.

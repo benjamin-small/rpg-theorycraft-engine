@@ -122,7 +122,11 @@ pub fn price(
 }
 
 /// Indices of the k best results by (scenario_idx, objective_idx),
-/// descending. Ties are broken by ascending index (stable sort).
+/// descending. Ties are broken by ascending index (stable sort). NaN
+/// objectives (IEEE division, e.g. a zero-weight scenario or a 0/0 stage,
+/// can produce one) compare as equal to everything and so rank
+/// arbitrarily among themselves; drivers should validate objectives
+/// before ranking if that matters to them.
 pub fn top_k(
     results: &[CandidateResult],
     scenario: usize,

@@ -108,6 +108,15 @@ fn main() {
     println!("{:<12} {:>10.2}", "burst", burst_objectives[0]);
     println!("{:<12} {:>10.2}", "sustained", sustained_objectives[0]);
 
+    // Hand-worked pins: burst = 120 * (0.7*1 + 0.3*2) * (1 - 5/100) = 148.20;
+    // sustained = 120 * (0.8*1 + 0.2*2) * (1 - 20/100) = 113.28. These are
+    // computed by hand from the JSON above, not copied from the program's
+    // own output, so they catch a regression in the engine itself.
+    let burst_dps = burst_objectives[0];
+    let sustained_dps = sustained_objectives[0];
+    assert!((burst_dps - 148.20).abs() < 1e-9);
+    assert!((sustained_dps - 113.28).abs() < 1e-9);
+
     // ---------------------------------------------------------------
     // explain() runs the IDENTICAL engine with per-phase/per-stage/
     // per-branch tracing turned on — the "show your work" path. It

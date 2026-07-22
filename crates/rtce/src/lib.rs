@@ -47,7 +47,8 @@
 //!
 //! See `examples/your_own_game.rs` for a full walkthrough (a ~40-line JSON
 //! game, two scenarios, an objectives table, and `explain()` output), and
-//! `docs/superpowers/specs/2026-07-21-rtce-design.md` for the design log.
+//! <https://github.com/benjamin-small/rpg-theorycraft-engine/blob/main/docs/superpowers/specs/2026-07-21-rtce-design.md>
+//! for the design log.
 //!
 //! # Example
 //!
