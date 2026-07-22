@@ -136,7 +136,12 @@ produce?
 One config family, three fidelity levels, all built on the same `Plan` —
 where they overlap they're required to agree (`sim::exec`'s keystone test
 reproduces `Plan::evaluate`'s number EXACTLY on a degenerate config with
-nothing for the timeline to add).
+nothing for the timeline to add). EV mode and MC mode agree on procs too,
+in BOTH regimes: an internal cooldown is a hard gate in EV mode exactly as
+it is in MC mode, so the two modes' long-run fire rates converge whether a
+proc's ICD never binds or routinely gates hits — EV's accumulator fires
+deterministically at the expected interval, MC's rolls add sampling
+variance around that same mean.
 
 To be clear about scope, same as the D4 slice above: `examples/diablo4_rotation.rs`'s
 `SimDef` is a DEMONSTRATION slice, not Diablo 4's real cadence data —

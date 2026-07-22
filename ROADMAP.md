@@ -35,6 +35,22 @@
       dev-dependency so `cargo test` also builds from the published
       tarball (path-only today because that version pin can't resolve
       against the registry before the first real publish).
+- [ ] `ActionDef.apply_buff` (or an action-scoped proc) — 0.3.0. Today the
+      only way to apply a buff from a specific action is the "icd equals
+      the gating action's cooldown" trick `examples/diablo4_rotation.rs`'s
+      `nova_pulse` relies on (a proc rolls on EVERY action's on-cast event;
+      matching its icd to one action's cooldown is how the config coerces
+      "only Frost Nova drives this buff" out of a trigger that's really
+      global). That trick is load-bearing for the current example and
+      correct for it, but it's a config-author trap for any other
+      cadence — a first-class per-action buff application removes the
+      need for it entirely.
+- [ ] Sim per-cast allocation trims (P6 review, non-functional). An
+      overlay-build cache for actions whose `damage.stats` is empty (no
+      overlay to build — `overlay_build_for_action` still clones the full
+      effective build today); folding the EV `on_crit` crit-chance query
+      (`eval_action_crit_chance`) into the same `Plan` call
+      `eval_action_damage` already makes, instead of a second pass.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

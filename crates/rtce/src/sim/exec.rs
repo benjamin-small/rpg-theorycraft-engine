@@ -64,23 +64,37 @@
 //!   not ask for — the duration check gets the identical result with one
 //!   fewer moving part.
 //!
-//! # Procs and Monte Carlo (P6d)
+//! # Procs and Monte Carlo (P6d, re-pinned P6 review/I1)
 //!
 //! [`Mode::Expected`] procs fire via the EV ACCUMULATOR method (see
-//! [`Sim::roll_procs_ev`]'s doc comment for the full semantics, including
-//! this task's documented choice for how an ICD interacts with an
-//! in-flight crossing — accumulation continues, one deferred fire max,
-//! pinned in `ev_accumulator_deferred_fire_during_icd_is_hand_worked`) and
-//! `on_crit` procs by weighting each hit's contribution by that hit's
-//! `"crit"` EVENT probability rather than firing outright (see
-//! [`Plan::crit_chance`] and `ev_on_crit_weights_by_crit_probability`) —
-//! the EV-consistent choice that makes the accumulator's long-run fire
-//! rate agree with `Mode::MonteCarlo`'s.
+//! [`Sim::roll_procs_ev`]'s doc comment for the full semantics — an ICD is
+//! a HARD GATE, matching [`Mode::MonteCarlo`]'s: while a proc is on ICD, a
+//! qualifying roll contributes NOTHING to the accumulator and no crossing
+//! can occur, exactly the discarded mass MC's hard gate throws away; see
+//! `ev_accumulator_icd_gate_discards_hits_during_icd_is_hand_worked` and
+//! the ICD-bound convergence regression
+//! `ev_procs_match_mc_in_icd_bound_regime_regression`) and `on_crit` procs
+//! by weighting each hit's contribution by that hit's `"crit"` EVENT
+//! probability rather than firing outright (see [`Plan::crit_chance`] and
+//! `ev_on_crit_weights_by_crit_probability`) — the EV-consistent choice
+//! that makes the accumulator's long-run fire rate agree with
+//! `Mode::MonteCarlo`'s.
+//!
+//! Earlier (pre-review) revisions of this executor let accumulation
+//! CONTINUE through an ICD and queued one deferred fire for a crossing that
+//! happened mid-ICD — plausible-looking, but WRONG: it let the accumulator
+//! keep banking qualifying-hit mass that MC's hard gate discards outright,
+//! measurably inflating the EV fire rate in any ICD-BOUND regime (the
+//! reviewer's probe: chance 0.3/hit, 1s cadence, icd 5.0, 200s — EV 40 vs
+//! MC mean 27, +48%). The hard-gate semantics above are what actually makes
+//! the two modes agree, in BOTH the open regime (icd short enough to never
+//! bind) and the ICD-bound regime (icd long enough to routinely gate hits)
+//! — see the regression test for the hand-worked trace.
 //!
 //! [`Mode::MonteCarlo`] procs instead ROLL exactly ([`Sim::roll_procs_mc`]:
-//! `rng.next_f64() < chance`, ICD a hard gate, no accumulator/deferral —
-//! MC mode has no analogue of the EV accumulator's carry-over by design),
-//! and `on_crit` fires only on hits whose SAMPLED branch (via
+//! `rng.next_f64() < chance`, ICD a hard gate, no accumulator — MC mode has
+//! no analogue of the EV accumulator's carry-over by design), and
+//! `on_crit` fires only on hits whose SAMPLED branch (via
 //! [`Plan::evaluate_phase_sampled`]) actually rolled a crit (see
 //! [`Sim::eval_action_damage_sampled`]) — exact, not probabilistic.
 //!
@@ -139,8 +153,20 @@ pub enum Mode {
 /// Floating-point tolerance for the EV accumulator's `acc >= 1.0` crossing
 /// check (see [`Sim::roll_procs_ev`]) — a mathematically-exact crossing can
 /// land a hair below `1.0` in `f64` after repeated `+=` of a value with no
-/// exact binary representation (`0.3`, notably).
+/// exact binary representation (`0.3`, notably). Absolute, not relative:
+/// this makes the tolerance itself capable of a SPURIOUS early fire only
+/// for a `chance` scale down around `~1e-10` (an `acc` that would need on
+/// the order of `1e9` qualifying rolls to legitimately reach `1.0` could
+/// instead cross the `1.0 - 1e-9` line one roll early) — harmless at every
+/// `chance` scale this engine actually models (percent-ish proc rates).
 const PROC_FIRE_EPSILON: f64 = 1e-9;
+
+/// Hard bound on consecutive zero-time (`cast_time == 0.0`, `cooldown ==
+/// 0.0`, cost payable) casts chained within ONE decision instant before
+/// [`Sim::attempt_decision`] fails closed rather than hang (P6 review/C1)
+/// — see that method's doc comment for why such a config has no finite
+/// answer to compute in the first place.
+const INSTANT_CHAIN_LIMIT: u32 = 10_000;
 
 /// Preallocated executor buffers: a [`Plan`] [`EvalScratch`] (for every
 /// `Plan::evaluate_phase` call the sim makes) plus the sim's own extended
@@ -186,6 +212,15 @@ impl SimScratch {
 /// pooled into a single number) is reported separately via
 /// [`SimReport::distribution`] — `Mode::Expected` leaves that `None` (a
 /// single deterministic run has no distribution to report).
+///
+/// A config with UNBOUNDED zero-time casting — some action whose
+/// `cast_time` evaluates to `0`, whose `cooldown` is `0.0`, and whose cost
+/// stays payable forever — has no finite `dps` to compute: the rotation
+/// would legitimately recast it infinitely many times without time ever
+/// advancing. This function does not hang on such a config; it fails
+/// closed with a [`PlanError`] naming the offending action and instant
+/// once [`Sim::attempt_decision`]'s per-instant chain bound is exceeded
+/// (P6 review/C1 — see that method's doc comment).
 pub fn run(
     plan: &Plan,
     sim_plan: &SimPlan,
@@ -481,20 +516,18 @@ struct BuffRt {
     tick_rate: f64,
 }
 
-/// Per-proc runtime state. `acc`/`deferred` are EV-accumulator-only
-/// (untouched in MC mode, which rolls exactly instead — see
-/// [`Sim::roll_procs_mc`]); `icd_ready_at`/`fire_count` are shared by both
-/// modes.
+/// Per-proc runtime state. `acc` is EV-accumulator-only (untouched in MC
+/// mode, which rolls exactly instead — see [`Sim::roll_procs_mc`]);
+/// `icd_ready_at`/`fire_count` are shared by both modes.
 struct ProcRt {
-    /// EV mode only: the accumulator (`+= chance` per qualifying roll,
-    /// `-= 1.0` on a fire — see [`Sim::roll_procs_ev`]).
+    /// EV mode only: the accumulator (`+= chance` per qualifying roll NOT
+    /// gated by ICD, `-= 1.0` on a fire — see [`Sim::roll_procs_ev`]). A
+    /// roll made while `now < icd_ready_at` skips this entirely (ICD is a
+    /// hard gate in EV mode too, since P6 review/I1) — `acc` only ever
+    /// holds LEFTOVER mass from a previous fire (`< 1.0`, since `>= 1.0`
+    /// always fires immediately) plus whatever's accumulated since the ICD
+    /// most recently cleared.
     acc: f64,
-    /// EV mode only: set when `acc` has crossed `1.0` while still inside
-    /// this proc's ICD — exactly ONE fire is queued regardless of how far
-    /// `acc` overshoots `1.0` before the ICD clears (see
-    /// [`Sim::roll_procs_ev`]'s doc comment for the full semantics this
-    /// pins).
-    deferred: bool,
     icd_ready_at: f64,
     fire_count: u64,
 }
@@ -634,7 +667,6 @@ impl<'a> Sim<'a> {
             procs: (0..n_procs)
                 .map(|_| ProcRt {
                     acc: 0.0,
-                    deferred: false,
                     icd_ready_at: 0.0,
                     fire_count: 0,
                 })
@@ -993,7 +1025,20 @@ impl<'a> Sim<'a> {
     /// Walk the rotation, chaining instant (`cast_time == 0`) casts, until
     /// the character is mid-cast, nothing is eligible, or a wake has been
     /// scheduled for the earliest moment something WILL become eligible.
+    ///
+    /// A config where some action's `cast_time` evaluates to `0`, whose
+    /// `cooldown` is `0.0`, and whose cost is (and stays) payable has NO
+    /// FINITE ANSWER — the rotation would legitimately cast that action
+    /// infinitely many times at the same instant, so its true `dps` is
+    /// unbounded/undefined, not some number this executor merely failed to
+    /// compute. Rather than hang (P6 review/C1), this loop counts
+    /// consecutive zero-time completions chained at THIS decision instant
+    /// (never across a real time advance — a fresh call to
+    /// `attempt_decision` gets a fresh counter) and, past
+    /// [`INSTANT_CHAIN_LIMIT`], fails closed with a [`PlanError`] naming the
+    /// offending action and instant rather than spinning forever.
     fn attempt_decision(&mut self) -> Result<(), PlanError> {
+        let mut instant_chain: u32 = 0;
         loop {
             if self.mid_cast {
                 return Ok(());
@@ -1035,6 +1080,19 @@ impl<'a> Sim<'a> {
                 self.begin_cast(action)?;
                 if self.mid_cast {
                     return Ok(());
+                }
+                instant_chain += 1;
+                if instant_chain > INSTANT_CHAIN_LIMIT {
+                    return Err(PlanError {
+                        what: format!(
+                            "instant-cast livelock: action `{}` at t={now} — zero \
+                             cast time, zero cooldown, payable cost — {INSTANT_CHAIN_LIMIT} \
+                             consecutive zero-time completions without time advancing; \
+                             this config has no finite dps (see `Sim::attempt_decision`'s \
+                             doc comment)",
+                            self.sim_plan.actions[action].name
+                        ),
+                    });
                 }
                 continue; // instant cast — chain, retry at the same `now`.
             }
@@ -1210,23 +1268,22 @@ impl<'a> Sim<'a> {
     /// with MC mode's (which only rolls `on_crit` procs on hits that
     /// actually sampled a crit).
     ///
-    /// ICD semantics (the design spec says only "fires when the
-    /// accumulator crosses 1 (respecting ICD)" — this task's documented
-    /// choice for what "respecting" means): accumulation CONTINUES even
-    /// while a proc is on ICD (a crossing is never lost). A crossing that
-    /// happens OFF ICD fires immediately. A crossing that happens WHILE ON
-    /// ICD queues exactly ONE deferred fire (`ProcRt::deferred`) — `acc`
-    /// is NOT decremented at the crossing, only at the ACTUAL fire, which
-    /// happens the next time this trigger rolls at/after the ICD clears
-    /// (there is no dedicated "ICD cleared" event in this executor — see
-    /// module docs on why `ProcIcdClear` needs none — so "immediately when
-    /// ICD ends" means "at the earliest qualifying trigger at/after the
-    /// ICD clears", which is the only point in time this discrete-event
-    /// simulator can observe anyway). Further crossings while still
-    /// deferred don't queue a second fire — `acc` can overshoot `1.0`
-    /// arbitrarily far during a long ICD, but only one `1.0` is ever
-    /// consumed at the eventual fire, exactly matching "acc still
-    /// decremented at actual fire" (a single `-= 1.0`, not `-= floor(acc)`).
+    /// ICD semantics (P6 review/I1 — supersedes the original P6d choice of
+    /// "accumulate through ICD, defer one fire": that let the accumulator
+    /// keep banking qualifying-hit mass while gated, which MC's hard gate
+    /// discards outright, and measurably over-fired in any ICD-bound
+    /// regime — see module docs). An ICD is now a HARD GATE, exactly
+    /// mirroring [`Sim::roll_procs_mc`]: while `now < icd_ready_at`, this
+    /// roll contributes NOTHING to `acc` and is skipped outright — no
+    /// accumulation, no crossing, no deferred fire (a crossing simply
+    /// CANNOT occur mid-ICD anymore, so there is nothing to defer). Once
+    /// the ICD clears, accumulation resumes from wherever `acc` was left
+    /// by the last fire (`acc -= 1.0`, never reset to `0.0`, so a fire
+    /// that overshot `1.0` keeps its leftover fraction) and a crossing
+    /// fires immediately — there's never a case where `now >= icd_ready_at`
+    /// and `acc` has crossed `1.0` without firing on the spot, so "queue
+    /// and resolve at the next qualifying roll" from the old design is
+    /// gone along with the deferred flag.
     fn roll_procs_ev(&mut self, trigger: Trigger, weight: f64) -> Result<(), PlanError> {
         let now = self.time;
         self.refresh_time_varying_slots();
@@ -1234,14 +1291,13 @@ impl<'a> Sim<'a> {
             if self.sim_plan.procs[pi].trigger != trigger {
                 continue;
             }
-            // Resolve a queued deferred fire once its ICD has cleared.
-            if self.procs[pi].deferred && now >= self.procs[pi].icd_ready_at {
-                self.fire_proc(pi, now)?;
+            if now < self.procs[pi].icd_ready_at {
+                // ICD hard gate (I1): this roll's mass is discarded, not
+                // banked — matches `roll_procs_mc`'s "skip outright".
+                continue;
             }
-            // Accumulate this roll's chance — unconditionally, even mid-ICD.
             let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots) * weight;
             self.procs[pi].acc += chance;
-            // A fresh crossing either fires now (ICD clear) or queues.
             // `PROC_FIRE_EPSILON` tolerance: a mathematically-exact
             // crossing (e.g. 10 additions of 0.3, which sums to exactly
             // 3.0 in decimal) can land a hair BELOW 1.0 in `f64` (`0.3`
@@ -1251,12 +1307,8 @@ impl<'a> Sim<'a> {
             // pin `ev_accumulator_fractional_chance_fires_at_hand_worked_hit_indices`
             // documents (10th hit lands at `0.9999999999999998`, not
             // `1.0`, without this).
-            if !self.procs[pi].deferred && self.procs[pi].acc >= 1.0 - PROC_FIRE_EPSILON {
-                if now >= self.procs[pi].icd_ready_at {
-                    self.fire_proc(pi, now)?;
-                } else {
-                    self.procs[pi].deferred = true;
-                }
+            if self.procs[pi].acc >= 1.0 - PROC_FIRE_EPSILON {
+                self.fire_proc(pi, now)?;
             }
         }
         Ok(())
@@ -1310,10 +1362,9 @@ impl<'a> Sim<'a> {
 
     /// Fire proc `pi` at `now`: consume the accumulator (EV mode only —
     /// MC mode's `roll_procs_mc` never calls this, it applies the effect
-    /// inline), clear any deferred flag, start the ICD, apply the effect.
+    /// inline), start the ICD, apply the effect.
     fn fire_proc(&mut self, pi: usize, now: f64) -> Result<(), PlanError> {
         self.procs[pi].acc -= 1.0;
-        self.procs[pi].deferred = false;
         self.procs[pi].fire_count += 1;
         self.procs[pi].icd_ready_at = now + self.sim_plan.procs[pi].icd;
         match self.sim_plan.procs[pi].effect {
@@ -1899,6 +1950,67 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // C1 (P6 review): an action with `cast_time` 0, `cooldown` 0.0, and no
+    // cost at all (permanently payable) is chosen, completes instantly,
+    // and is immediately eligible again — nothing in this config ever
+    // advances `self.time`, so `attempt_decision`'s instant-chain loop
+    // (see its doc comment) would spin forever pre-fix. This config has NO
+    // FINITE dps to compute (the rotation legitimately wants to cast
+    // `instant_nop` infinitely many times at t=0), so the correct/only
+    // sound behavior is failing closed, not returning any number.
+    //
+    // RED evidence (recorded, not merely asserted): with the
+    // `instant_chain`/`INSTANT_CHAIN_LIMIT` guard in `attempt_decision`
+    // temporarily reverted to the pre-fix `continue`-only loop, `timeout
+    // 30 cargo test -p rtce instant_cast_livelock_fails_closed` TIMES OUT
+    // (exit 124, no test output — the process is still spinning inside
+    // `attempt_decision` after 30s) rather than the test completing either
+    // way; restoring the guard makes it pass in well under a second. See
+    // this task's commit message for the literal transcript.
+    // ------------------------------------------------------------------
+    #[test]
+    fn instant_cast_livelock_fails_closed() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "instant_nop".to_string(),
+            ActionDef {
+                cast_time: "0".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: None,
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "hit".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "instant_nop".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+        let err = run(&plan, &sim_plan, &build, &scenario, Mode::Expected)
+            .expect_err("zero cast_time + zero cooldown + free cost must fail closed, not hang");
+        assert!(
+            err.what.contains("instant_nop"),
+            "error must name the offending action, got: {}",
+            err.what
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Condition precedence: a buff drives `enraged=1.0` while active,
     // winning over the scenario's static `enraged=0.4` (spec precedence
     // rule). Same empower/filler/icd-10 cadence as the buff-uptime test
@@ -2203,43 +2315,44 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // EV accumulator, ICD gating with a DEFERRED fire: same chance
-    // (0.3/hit) and cadence (1 hit/s) as above, icd = 4.0 (the task's
-    // illustrative 2.5 turns out to never actually bind at this cadence —
-    // the natural gap between consecutive crossings here is 3.0s, and
-    // 2.5 < 3.0 lets every crossing fire immediately, which is a no-op
-    // test of ICD gating; 4.0 is chosen specifically because it's large
-    // enough to force exactly one deferred fire, which is the behavior
-    // this pin exists to prove). Hand-worked with THIS module's documented
-    // semantics (accumulation continues through an ICD; a crossing during
-    // ICD queues ONE deferred fire, resolved — and `acc` decremented —
-    // at the next qualifying roll at/after the ICD clears):
-    //   hit1 .3  hit2 .6  hit3 .9
-    //   hit4 1.2 → FIRE now=4>=icd_ready(0) → acc=.2, icd_ready=8
-    //   hit5 .5  hit6 .8
-    //   hit7 1.1 → CROSSES but now=7<icd_ready(8) → DEFERRED (acc stays 1.1)
-    //   hit8: first resolve the deferred fire (now=8>=icd_ready(8)) →
-    //         FIRE, acc=1.1−1.0=.1, icd_ready=12 ; then accumulate hit8's
-    //         own .3 → acc=.4 (no new crossing)
-    //   hit9 .7
-    //   hit10 1.0 → CROSSES but now=10<icd_ready(12) → deferred again,
-    //         never resolved (sim ends at duration=10, no hit after it)
-    // Exactly 2 REALIZED fires (hit4, hit8's resolution of hit7's cross).
+    // EV accumulator, ICD as a HARD GATE (P6 review/I1 — re-derived from
+    // the pre-fix `ev_accumulator_deferred_fire_during_icd_is_hand_worked`,
+    // same chance (0.3/hit), cadence (1 hit/s), and icd (4.0), NEW
+    // semantics: while `now < icd_ready_at`, a qualifying hit contributes
+    // NOTHING to `acc` — no accumulation, no crossing, no deferred fire.
+    // Hand-worked:
+    //   hit1 t=1: now(1)>=icd_ready(0) → acc=.3
+    //   hit2 t=2: acc=.6
+    //   hit3 t=3: acc=.9
+    //   hit4 t=4: acc=1.2 → FIRE (now=4>=icd_ready=0) → acc=.2, icd_ready=8
+    //   hit5 t=5: now(5)<icd_ready(8) → GATED, acc untouched (.2)
+    //   hit6 t=6: GATED (.2)
+    //   hit7 t=7: GATED (.2)
+    //   hit8 t=8: now(8)>=icd_ready(8) → acc=.2+.3=.5
+    //   hit9 t=9: acc=.5+.3=.8
+    //   hit10 t=10: acc=.8+.3=1.1 → FIRE (now=10>=icd_ready=8) → acc=.1,
+    //         icd_ready=14
+    // Exactly 2 fires — AT t=4 and t=10 (not t=8, as the pre-fix
+    // accumulate-through-ICD-plus-deferral semantics landed the second
+    // fire; the count alone (2) doesn't distinguish the two semantics,
+    // only the TIMING does — see the `proc_buff` uptime assertion below).
     //
-    // The fire COUNT alone (2) is not enough to pin "fires exactly at
-    // hit8, not hit10" — a WRONG semantic that instead "pauses
-    // accumulation during ICD" (rather than continuing it) also happens
-    // to land 2 fires here, just at hits 4 and 10 instead of 4 and 8
-    // (mutation-verified — see this task's commit). `proc_buff`'s
-    // duration (0.5s) makes the TIMING observable: applied at t=8, its
-    // active window [8, 8.5) is entirely inside `duration=10` and counts
-    // in full; applied at t=10 (== `duration`) instead, its window
-    // [10, 10.5) is entirely AFTER the sim ends, so `finalize` credits it
-    // ZERO active seconds. Two full 0.5s windows (t=4, t=8) → uptime
-    // (0.5+0.5)/10 = 0.1; the wrong-timing variant would read 0.05.
+    // Mutation-check (recorded, not just asserted): restoring the old
+    // accumulate-through/deferred-fire branch in `roll_procs_ev` while
+    // keeping this test's NEW expectations makes `buff_uptime["proc_buff"]`
+    // read `0.1` (old semantics' fire lands at t=8, a full window inside
+    // `duration=10`) instead of the `0.05` this test now pins — i.e. this
+    // test FAILS under the old semantics, proving it still distinguishes
+    // them post-re-derivation.
+    //
+    // `proc_buff`'s duration (0.5s) makes the TIMING observable: the t=4
+    // fire's window [4, 4.5) is entirely inside `duration=10` and counts
+    // in full (0.5s); the t=10 fire's window [10, 10.5) is entirely AFTER
+    // the sim ends (fires exactly AT `duration`), so `finalize` credits it
+    // ZERO active seconds. One full 0.5s window → uptime 0.5/10 = 0.05.
     // ------------------------------------------------------------------
     #[test]
-    fn ev_accumulator_deferred_fire_during_icd_is_hand_worked() {
+    fn ev_accumulator_icd_gate_discards_hits_during_icd_is_hand_worked() {
         let plan = minimal_plan();
         let build = minimal_build();
         let scenario: Scenario =
@@ -2258,15 +2371,91 @@ mod tests {
         assert_eq!(report.actions["filler"].casts, 10);
         assert_eq!(
             report.proc_counts["spark"], 2,
-            "got {:?} — icd must defer, not drop, the hit-7 crossing",
+            "got {:?} — hits at t=4 and t=10 fire; hits gated by ICD (t=5..7) \
+             must contribute nothing",
             report.proc_counts
         );
         assert!(
-            close(report.buff_uptime["proc_buff"], 0.1),
-            "got {} — the deferred fire must land at hit8 (t=8), not hit10 \
-             (t=10, which would truncate its 0.5s window to zero inside \
-             `duration=10`)",
+            close(report.buff_uptime["proc_buff"], 0.05),
+            "got {} — the second fire must land at hit10 (t=10, == duration, \
+             truncating its 0.5s window to zero), not hit8 (t=8, which would \
+             read 0.1 — that's the pre-fix accumulate-through-ICD behavior)",
             report.buff_uptime["proc_buff"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // I1 regression: EV vs MC agreement in the ICD-BOUND regime (chance
+    // 0.3/hit, 1 hit/s cadence, icd 5.0, 200s) — the exact case the
+    // pre-publish review flagged: the pre-fix "accumulate through ICD,
+    // defer one fire" semantics measured EV=40 vs MC mean≈27 here (+48%),
+    // because it kept banking qualifying-hit mass through the whole ICD
+    // window instead of discarding it the way MC's hard gate does.
+    //
+    // Hand-worked EV count under the NEW (hard-gate) semantics: after a
+    // fire at `t_fire`, `icd_ready_at = t_fire + 5`, so hits at
+    // `t_fire+1..+4` are gated out (4 gated hits — the gate reopens
+    // exactly ON the hit at `t_fire+5`, where `now < icd_ready_at` is
+    // false), and accumulation resumes from the LEFTOVER `acc` the
+    // previous fire left behind (`acc -= 1.0`, never reset to `0.0`).
+    // Tracking that leftover `L` across fires (`k` = hits needed past the
+    // gate to reach `1.0` = `ceil((1-L)/0.3)`, next leftover
+    // `L' = L + 0.3k - 1.0`, gap from one fire to the next = `4 + k`):
+    //   L=0.0 (start)  k=4  gap=4  → fire1 @ t=4,  L'=0.2
+    //   L=0.2          k=3  gap=7  → fire2 @ t=11, L'=0.1
+    //   L=0.1          k=3  gap=7  → fire3 @ t=18, L'=0.0
+    //   L=0.0          k=4  gap=8  → fire4 @ t=26, L'=0.2   (cycle repeats:
+    //     L walks 0.0→0.2→0.1→0.0 every 3 fires / 22s, average interval
+    //     22/3 ≈ 7.333s/fire, i.e. ≈0.1364 fires/s)
+    // 200s × 3/22 ≈ 27.27 expected fires; walking the exact recurrence out
+    // to `duration=200` (fire1 @ t=4 through the 27th fire @ t=194, with
+    // no 28th fire landing before t=200 — the next would be at t=201 or
+    // t=202) lands EXACTLY 27, matching the reviewer's independently
+    // measured MC mean (≈27) almost exactly — this is what "the two modes
+    // now agree, including where the old ones didn't" looks like
+    // numerically.
+    // ------------------------------------------------------------------
+    #[test]
+    fn ev_procs_match_mc_in_icd_bound_regime_regression() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 200 } ] }"#).unwrap();
+        let simdef = filler_simdef(ProcDef {
+            trigger: Trigger::OnHit,
+            chance: "0.3".into(),
+            icd: 5.0,
+            apply_buff: Some("proc_buff".into()),
+            cast_action: None,
+        });
+        let sim_plan = sim_compile(&plan, &simdef, &filler_rotation()).unwrap();
+
+        let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        assert_eq!(ev.actions["filler"].casts, 200);
+        assert_eq!(
+            ev.proc_counts["spark"], 27,
+            "got {:?} — hand-worked recurrence above says 27 (pre-fix semantics \
+             gave 40, +48% vs MC's ≈27)",
+            ev.proc_counts
+        );
+
+        let mc = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            Mode::MonteCarlo {
+                iterations: 2_000,
+                seed: 20260722,
+            },
+        )
+        .unwrap();
+        let mc_count = mc.proc_counts["spark"] as f64;
+        let rel_err = (mc_count - 27.0).abs() / 27.0;
+        assert!(
+            rel_err < 0.15,
+            "mc mean proc count {mc_count} vs ev count 27, relative error {rel_err} \
+             — pre-fix this regime measured EV=40 vs MC≈27 (+48%)"
         );
     }
 
