@@ -70,7 +70,7 @@ the action's overrides).
 
 ```jsonc
 { "rules": [
-  { "action": "frost_nova", "when": "cooldown.frost_nova == 0 and buff.vuln_window == 0" },
+  { "action": "frost_nova", "when": "and(cooldown.frost_nova == 0, buff.vuln_window == 0)" },
   { "action": "fireball",   "when": "mana >= 40" },
   { "action": "basic_bolt" }                         // no `when` = always willing
 ]}
