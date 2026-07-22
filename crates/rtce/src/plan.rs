@@ -6,7 +6,7 @@
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
 use crate::gamedef::{FoldKind, GameDef};
-use crate::scenario::Scenario;
+use crate::scenario::{Phase, Scenario};
 
 /// Hard cap on events: 2^8 = 256 branches per branched stage.
 pub const MAX_EVENTS: usize = 8;
@@ -516,133 +516,7 @@ impl Plan {
 
         for phase in &scenario.phases {
             let w = phase.weight / weight_sum;
-
-            // Trace-only: one PhaseTrace built up as this phase evaluates,
-            // pushed into `trace` at the end of the iteration. `None` on
-            // the evaluate() hot path — no allocation, this is just an
-            // `Option` staying `None`.
-            let mut phase_trace: Option<PhaseTrace> = trace.is_some().then(|| PhaseTrace {
-                name: phase.name.clone(),
-                weight: w,
-                conditions: Vec::new(),
-                buckets: Vec::new(),
-                stages: Vec::new(),
-                branches: Vec::new(),
-            });
-
-            // Stats: build values + phase overrides.
-            let n_stats = self.n_stats;
-            scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
-            for (name, v) in &phase.stats {
-                let i = self.stat_id(name).ok_or_else(|| PlanError {
-                    what: format!("unknown stat `{name}`"),
-                })?;
-                scratch.slots[i] = *v;
-            }
-
-            // Conditions: expression-readable uptime slots, fail-closed
-            // (missing uptime = 0.0), clamped into [0, 1].
-            for (ci, name) in self.condition_names.iter().enumerate() {
-                scratch.slots[n_stats + ci] = phase
-                    .uptimes
-                    .get(name)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-            }
-            let bucket_base = n_stats + self.n_conditions;
-            if let Some(pt) = phase_trace.as_mut() {
-                for (ci, name) in self.condition_names.iter().enumerate() {
-                    pt.conditions
-                        .push((name.clone(), scratch.slots[n_stats + ci]));
-                }
-            }
-
-            // Base bucket raw sums/products: event-gated contribs EXCLUDED,
-            // condition-tagged scaled by uptime (missing = 0 — fail-closed).
-            self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
-            self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
-            if let Some(pt) = phase_trace.as_mut() {
-                for (bi, name) in self.bucket_names.iter().enumerate() {
-                    pt.buckets
-                        .push((name.clone(), scratch.slots[bucket_base + bi]));
-                }
-            }
-
-            // Stages in order.
-            for (si, stage) in self.stages.iter().enumerate() {
-                let out_slot = bucket_base + self.n_buckets + si;
-                if !stage.branched {
-                    scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
-                    continue;
-                }
-                // Branch enumeration over 2^n events. Chances depend only on
-                // PHASE slots (not on the branch), so evaluate each event's
-                // chance once per stage rather than once per mask.
-                let n_ev = self.events.len();
-                let mut chances = [0.0f64; MAX_EVENTS];
-                for (ei, ev) in self.events.iter().enumerate() {
-                    chances[ei] = ev.chance.eval(&scratch.slots).clamp(0.0, 1.0);
-                }
-                let mut ev_acc = 0.0;
-                for mask in 0u32..(1 << n_ev) {
-                    // Weight = Π fired ? p : 1-p.
-                    let mut weight = 1.0;
-                    for (ei, &p) in chances.iter().enumerate().take(n_ev) {
-                        weight *= if mask & (1 << ei) != 0 { p } else { 1.0 - p };
-                    }
-                    if weight == 0.0 {
-                        continue;
-                    }
-                    // Branch slots: buckets recomputed with fired-event
-                    // contributions included; event_factors = Π factors.
-                    scratch.branch_slots.copy_from_slice(&scratch.slots);
-                    self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
-                    self.write_bucket_slots(
-                        &scratch.branch_bucket_raw,
-                        bucket_base,
-                        &mut scratch.branch_slots,
-                    );
-                    let mut factors = 1.0;
-                    for (ei, ev) in self.events.iter().enumerate() {
-                        if mask & (1 << ei) != 0 {
-                            factors *= ev.factor.eval(&scratch.branch_slots);
-                        }
-                    }
-                    let ef_slot = bucket_base + self.n_buckets + self.n_stages;
-                    scratch.branch_slots[ef_slot] = factors;
-                    let branch_value = stage.program.eval(&scratch.branch_slots);
-                    ev_acc += weight * branch_value;
-                    if let Some(pt) = phase_trace.as_mut() {
-                        let fired: Vec<String> = (0..n_ev)
-                            .filter(|&ei| mask & (1 << ei) != 0)
-                            .map(|ei| self.event_names[ei].clone())
-                            .collect();
-                        pt.branches.push(BranchTrace {
-                            stage: stage.name.clone(),
-                            fired,
-                            weight,
-                            event_factors: factors,
-                            value: branch_value,
-                        });
-                    }
-                }
-                scratch.slots[out_slot] = ev_acc;
-            }
-            if let Some(pt) = phase_trace.as_mut() {
-                for (si, stage) in self.stages.iter().enumerate() {
-                    pt.stages.push((
-                        stage.name.clone(),
-                        scratch.slots[bucket_base + self.n_buckets + si],
-                    ));
-                }
-            }
-
-            for (oi, &si) in self.objective_stages.iter().enumerate() {
-                scratch.objectives[oi] += w * scratch.slots[bucket_base + self.n_buckets + si];
-            }
-
-            if let Some(pt) = phase_trace {
+            if let Some(pt) = self.eval_phase(build, phase, w, scratch, trace.is_some())? {
                 trace
                     .as_mut()
                     .expect("phase_trace is Some only when trace is Some")
@@ -651,6 +525,267 @@ impl Plan {
             }
         }
 
+        Ok(())
+    }
+
+    /// Evaluate ONE phase, accumulating `w * stage_value` into
+    /// `scratch.objectives` per objective — the per-phase body shared by
+    /// `run`'s scenario loop (`w` = that phase's normalized weight,
+    /// `stat_base`/contributions resolved ONCE by the caller for the whole
+    /// scenario) and [`Plan::evaluate_phase`] (`w = 1.0`, resolved fresh
+    /// per call — see that method's docs). Returns the built `PhaseTrace`
+    /// when `want_trace` is set, else `None` (no allocation).
+    fn eval_phase(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        w: f64,
+        scratch: &mut EvalScratch,
+        want_trace: bool,
+    ) -> Result<Option<PhaseTrace>, PlanError> {
+        let mut phase_trace: Option<PhaseTrace> = want_trace.then(|| PhaseTrace {
+            name: phase.name.clone(),
+            weight: w,
+            conditions: Vec::new(),
+            buckets: Vec::new(),
+            stages: Vec::new(),
+            branches: Vec::new(),
+        });
+
+        // Stats: build values + phase overrides.
+        let n_stats = self.n_stats;
+        scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
+        for (name, v) in &phase.stats {
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
+            scratch.slots[i] = *v;
+        }
+
+        // Conditions: expression-readable uptime slots, fail-closed
+        // (missing uptime = 0.0), clamped into [0, 1].
+        for (ci, name) in self.condition_names.iter().enumerate() {
+            scratch.slots[n_stats + ci] = phase
+                .uptimes
+                .get(name)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+        }
+        let bucket_base = n_stats + self.n_conditions;
+        if let Some(pt) = phase_trace.as_mut() {
+            for (ci, name) in self.condition_names.iter().enumerate() {
+                pt.conditions
+                    .push((name.clone(), scratch.slots[n_stats + ci]));
+            }
+        }
+
+        // Base bucket raw sums/products: event-gated contribs EXCLUDED,
+        // condition-tagged scaled by uptime (missing = 0 — fail-closed).
+        self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
+        self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
+        if let Some(pt) = phase_trace.as_mut() {
+            for (bi, name) in self.bucket_names.iter().enumerate() {
+                pt.buckets
+                    .push((name.clone(), scratch.slots[bucket_base + bi]));
+            }
+        }
+
+        // Stages in order.
+        for (si, stage) in self.stages.iter().enumerate() {
+            let out_slot = bucket_base + self.n_buckets + si;
+            if !stage.branched {
+                scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
+                continue;
+            }
+            // Branch enumeration over 2^n events. Chances depend only on
+            // PHASE slots (not on the branch), so evaluate each event's
+            // chance once per stage rather than once per mask.
+            let n_ev = self.events.len();
+            let mut chances = [0.0f64; MAX_EVENTS];
+            for (ei, ev) in self.events.iter().enumerate() {
+                chances[ei] = ev.chance.eval(&scratch.slots).clamp(0.0, 1.0);
+            }
+            let mut ev_acc = 0.0;
+            for mask in 0u32..(1 << n_ev) {
+                // Weight = Π fired ? p : 1-p.
+                let mut weight = 1.0;
+                for (ei, &p) in chances.iter().enumerate().take(n_ev) {
+                    weight *= if mask & (1 << ei) != 0 { p } else { 1.0 - p };
+                }
+                if weight == 0.0 {
+                    continue;
+                }
+                // Branch slots: buckets recomputed with fired-event
+                // contributions included; event_factors = Π factors.
+                scratch.branch_slots.copy_from_slice(&scratch.slots);
+                self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
+                self.write_bucket_slots(
+                    &scratch.branch_bucket_raw,
+                    bucket_base,
+                    &mut scratch.branch_slots,
+                );
+                let mut factors = 1.0;
+                for (ei, ev) in self.events.iter().enumerate() {
+                    if mask & (1 << ei) != 0 {
+                        factors *= ev.factor.eval(&scratch.branch_slots);
+                    }
+                }
+                let ef_slot = bucket_base + self.n_buckets + self.n_stages;
+                scratch.branch_slots[ef_slot] = factors;
+                let branch_value = stage.program.eval(&scratch.branch_slots);
+                ev_acc += weight * branch_value;
+                if let Some(pt) = phase_trace.as_mut() {
+                    let fired: Vec<String> = (0..n_ev)
+                        .filter(|&ei| mask & (1 << ei) != 0)
+                        .map(|ei| self.event_names[ei].clone())
+                        .collect();
+                    pt.branches.push(BranchTrace {
+                        stage: stage.name.clone(),
+                        fired,
+                        weight,
+                        event_factors: factors,
+                        value: branch_value,
+                    });
+                }
+            }
+            scratch.slots[out_slot] = ev_acc;
+        }
+        if let Some(pt) = phase_trace.as_mut() {
+            for (si, stage) in self.stages.iter().enumerate() {
+                pt.stages.push((
+                    stage.name.clone(),
+                    scratch.slots[bucket_base + self.n_buckets + si],
+                ));
+            }
+        }
+
+        for (oi, &si) in self.objective_stages.iter().enumerate() {
+            scratch.objectives[oi] += w * scratch.slots[bucket_base + self.n_buckets + si];
+        }
+
+        Ok(phase_trace)
+    }
+
+    /// pub(crate): evaluate a SINGLE phase directly, weight `1.0`, no
+    /// scenario-level blending — for `sim::exec`'s per-cast/per-tick
+    /// evaluations, which construct a synthetic one-phase view of the
+    /// CURRENT sim phase (current phase's stats/uptimes, with buff-driven
+    /// condition overrides folded in — see `sim::exec` module docs) and
+    /// would otherwise need to allocate a throwaway single-phase
+    /// `Scenario` on every cast just to reuse `evaluate`. Unlike
+    /// `evaluate`, there is no scenario to validate (non-empty phases,
+    /// weight-sum > 0) — only this one phase's own uptime keys/finiteness
+    /// are checked (its `weight` field is ignored; `w` is fixed at `1.0`).
+    /// Resolves `build`'s stat base and validates its contributions fresh
+    /// on every call (unlike `evaluate`, which does this once for a whole
+    /// multi-phase scenario) — the sim passes a DIFFERENT build each call
+    /// (base + active buffs' contributions + this cast's stat overrides),
+    /// so there is nothing to cache across calls in v1.
+    pub(crate) fn evaluate_phase<'s>(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        scratch: &'s mut EvalScratch,
+    ) -> Result<&'s [f64], PlanError> {
+        for (cond, v) in &phase.uptimes {
+            if !self.condition_names.iter().any(|n| n == cond) {
+                return Err(PlanError {
+                    what: format!(
+                        "phase `{}`: unknown condition `{cond}` in phase uptimes",
+                        phase.name
+                    ),
+                });
+            }
+            if !v.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "phase `{}` uptime `{cond}` must be finite, got {v}",
+                        phase.name
+                    ),
+                });
+            }
+        }
+
+        for slot in scratch.stat_base.iter_mut() {
+            *slot = 0.0;
+        }
+        for (name, v) in &build.stats {
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
+            scratch.stat_base[i] = *v;
+        }
+        for c in &build.contributions {
+            if !self.bucket_names.iter().any(|b| b == &c.bucket) {
+                return Err(PlanError {
+                    what: format!("unknown bucket `{}`", c.bucket),
+                });
+            }
+            if let Some(e) = &c.event {
+                if !self.event_names.iter().any(|n| n == e) {
+                    return Err(PlanError {
+                        what: format!("unknown event `{e}`"),
+                    });
+                }
+            }
+            if let Some(cd) = &c.condition {
+                if !self.condition_names.iter().any(|n| n == cd) {
+                    return Err(PlanError {
+                        what: format!("unknown condition `{cd}`"),
+                    });
+                }
+            }
+        }
+
+        for o in scratch.objectives.iter_mut() {
+            *o = 0.0;
+        }
+
+        self.eval_phase(build, phase, 1.0, scratch, false)?;
+        Ok(&scratch.objectives)
+    }
+
+    /// pub(crate): fill `out[0 .. n_stats + n_conditions]` with this
+    /// build's stat values (overridden by `phase.stats`) and this phase's
+    /// condition uptimes (clamped to `[0, 1]`) — the SAME prefix
+    /// `evaluate`/`evaluate_phase` build internally, exposed standalone
+    /// for `sim::exec`'s own extended slot array (see `sim` module docs:
+    /// sim expressions load plan stats/conditions from exactly the indices
+    /// `stat_id`/`condition_id` resolve, below `SimPlan::sim_base`). Never
+    /// touches buckets/stages/`event_factors` — sim expressions can never
+    /// reference them (rejected at `sim::compile` time) — so `out` may be
+    /// sized to `SimPlan::slot_width` and left untouched past this prefix.
+    pub(crate) fn write_stat_condition_slots(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        out: &mut [f64],
+    ) -> Result<(), PlanError> {
+        let n_stats = self.n_stats;
+        for slot in out[..n_stats].iter_mut() {
+            *slot = 0.0;
+        }
+        for (name, v) in &build.stats {
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
+            out[i] = *v;
+        }
+        for (name, v) in &phase.stats {
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
+            out[i] = *v;
+        }
+        for (ci, name) in self.condition_names.iter().enumerate() {
+            out[n_stats + ci] = phase
+                .uptimes
+                .get(name)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+        }
         Ok(())
     }
 

@@ -43,7 +43,11 @@
 //! ```
 
 mod compile;
+mod exec;
+mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledProc, CompiledResource, CompiledRule,
     ProcEffect, SimPlan,
 };
+pub use exec::{run, Mode, SimScratch};
+pub use report::{ActionReport, PhaseReport, ResourceReport, SimReport, Totals};
