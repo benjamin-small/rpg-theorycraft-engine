@@ -7,8 +7,9 @@
 //! # The extended sim symbol space
 //!
 //! Sim expressions (resource `max`/`regen_per_sec`, action `cast_time`,
-//! proc `chance`, rule `when`) compile against the underlying [`Plan`]'s
-//! own flat namespace (every stat and condition), EXTENDED with sim-state
+//! proc `chance`, rule `when`) compile against the underlying
+//! [`crate::plan::Plan`]'s own flat namespace (every stat and condition),
+//! EXTENDED with sim-state
 //! names (see the design spec's "Expression language v2" section):
 //!
 //! - `time`, `duration` — reserved words; the current sim clock and the

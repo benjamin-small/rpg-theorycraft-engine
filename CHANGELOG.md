@@ -5,6 +5,57 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/) once published (0.x
 until then, per semver's "anything goes" pre-1.0 clause).
 
+## [0.2.0] — 2026-07-22
+
+**P6 — sequencing: the timeline simulator.** A second way to answer "what
+is this build worth?" alongside `Plan::evaluate`'s closed-form average: a
+discrete-event executor over a priority-list rotation, ending in a
+runnable Diablo 4 slice and computed (not asserted) uptimes.
+
+- **Expression predicates.** `> < >= <= == !=` (returning exactly `0`/`1`)
+  and `and(a,b)` / `or(a,b)` / `not(a)` functions, available everywhere
+  the expression language already was — a comparison level sits between
+  arithmetic and the top of the grammar, single-comparison only (no
+  chaining), fail-closed positioned errors throughout.
+- **`SimDef` + `Rotation`.** Two new config artifacts sitting beside
+  `GameDef`: resources (capped pools with regen), actions (cast time,
+  cooldown, resource cost/gain, an optional damage effect overriding
+  `Plan` stats per cast), buffs (timed contribution/condition windows,
+  optional DoT-tick objectives), and procs (chance-triggered, on an
+  internal cooldown, applying a buff or casting a free action) — plus a
+  SimC-style priority-list `Rotation`. `sim::compile` builds the extended
+  sim symbol space (`time`, `duration`, resources, `cooldown.<action>`,
+  `buff.<buff>`, `buff_remaining.<buff>`, `casts.<action>`, layered over
+  the `Plan`'s own stats/conditions) and validates every cross-reference
+  fail-closed (unknown actions/buffs/resources, proc effect arity,
+  `damage_objective`/`tick_objective` objective membership, reserved
+  words, flat-namespace collisions).
+- **`sim::run` — one stepper, two modes.** A discrete-event queue
+  (`CastComplete`, `BuffExpire`, `PhaseBoundary`, a unified `Wake` for
+  cooldown/resource-affordability waits) drives the SAME decision loop
+  under both `Mode::Expected` (deterministic, branch-blended exactly like
+  `evaluate` — proven to agree with it EXACTLY on a degenerate config) and
+  `Mode::MonteCarlo { iterations, seed }` (seeded independent timeline
+  runs via a new zero-dependency in-crate PCG32 and `Plan::evaluate_sampled`,
+  pooled into mean-field reports plus a `dps` `Distribution`). Only
+  per-cast damage/proc OUTCOMES differ by mode; rotation timing never
+  does. Procs fire via a deterministic accumulator in EV mode
+  (`acc += chance`, fires at `acc >= 1`, ICD-gated) and by exact roll in
+  MC mode.
+- **`SimReport` — computed, not asserted.** Per-phase and total
+  damage/dps, per-action casts/damage/share, COMPUTED buff and condition
+  uptimes (an active buff's condition value wins over a scenario's static
+  uptime while up, per the documented precedence rule), per-resource
+  `time_starved`/`time_capped`, and proc fire counts — `Mode::MonteCarlo`
+  adds a `Distribution` (mean/population-std/p10/p50/p90, nearest-rank
+  percentiles) over the `iterations` per-iteration `dps` values.
+- **`examples/diablo4_rotation.rs`.** A runnable Diablo 4 slice on top of
+  the same committed gamedef `diablo4_basics` uses: mana, a Fireball
+  spender / Firebolt generator pair, and a Frost Nova whose proc opens a
+  computed `vulnerable` window — 60s EV run plus a 1000-iteration Monte
+  Carlo run, hand-worked pins on both the cast cadence and the computed
+  uptime (documented as a demonstration slice, not real game data).
+
 ## [0.1.0] — 2026-07-22
 
 Initial release. Extracted from the proven patterns of `diablo4-calc`
@@ -49,4 +100,5 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
+[0.2.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.2.0
 [0.1.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.1.0

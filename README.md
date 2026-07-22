@@ -117,6 +117,95 @@ driver (an optimizer, a knowledge-graph explorer) calls
 Pareto front across fights. For the smallest-possible starting point, see
 `cargo run -p rtce --example your_own_game`.
 
+## Sequencing: from average to timeline
+
+Everything above answers "what does this build average, given ASSERTED
+uptimes?" — fast, but every buff window, resource squeeze, and proc has to
+be flattened into a `Scenario`'s static numbers by hand. `SimDef` +
+`Rotation` + `sim::run` answer a related question over an actual TIMELINE:
+given a priority-list rotation, resources, cooldowns, buff windows, and
+procs, what really happens over N seconds — and what uptimes does that
+produce?
+
+| | What | Uptimes | Cost |
+|---|---|---|---|
+| `Plan::evaluate` | closed-form average | inputs (asserted) | ~µs |
+| `sim::run` EV mode | deterministic timeline | **computed** | ~ms |
+| `sim::run` MC mode | sampled timelines ×N | computed + distributions | ~ms×N |
+
+One config family, three fidelity levels, all built on the same `Plan` —
+where they overlap they're required to agree (`sim::exec`'s keystone test
+reproduces `Plan::evaluate`'s number EXACTLY on a degenerate config with
+nothing for the timeline to add).
+
+To be clear about scope, same as the D4 slice above: `examples/diablo4_rotation.rs`'s
+`SimDef` is a DEMONSTRATION slice, not Diablo 4's real cadence data —
+mana regen is zeroed and Firebolt's mana gain is set equal to Fireball's
+cost purely so the cast sequence hand-verifies cleanly (see the pin
+comments in the example itself). A production rotation would tune these
+from real skill data the same way `diablo4_basics`'s `GameDef` slice was
+transcribed from `diablo4-calc`.
+
+**SimDef** (trimmed — the full version adds Firebolt and a proc wiring
+Frost Nova to the buff; see the example):
+
+```jsonc
+{
+  "resources": { "mana": { "max": "100", "regen_per_sec": "0" } },
+  "actions": {
+    "frost_nova": { "cast_time": "0", "cooldown": 10.0, "cost": {}, "gain": {} },
+    "fireball": {
+      "cast_time": "1", "cooldown": 0.0,
+      "cost": { "mana": 40.0 }, "gain": {},
+      "damage": { "stats": { "coeff_pct": 200.0 } }
+    }
+  },
+  "buffs": {
+    "vuln_window": { "duration": 4.0, "conditions": { "vulnerable": 1.0 } }
+  },
+  "procs": {
+    "nova_pulse": { "trigger": "on_cast", "chance": "1", "icd": 10.0,
+                    "apply_buff": "vuln_window" }
+  },
+  "damage_objective": "hit_after_dr"
+}
+```
+
+**Rotation** — priority list, first eligible rule wins (hard gates like
+"off cooldown"/"cost payable" are automatic; `when` adds strategy on top):
+
+```json
+{ "rules": [
+  { "action": "frost_nova" },
+  { "action": "fireball", "when": "mana >= 40" },
+  { "action": "firebolt" }
+]}
+```
+
+Run it (EV mode's `SimReport`, then a 1000-iteration Monte Carlo run):
+
+```
+$ cargo run -p rtce --example diablo4_rotation
+Diablo 4 rotation (P6 sequencing) — 60s training dummy, EV mode
+  action        casts         damage    share
+  fireball         31    187886.4480   83.43%
+  firebolt         29     37312.6608   16.57%
+  frost_nova        6         0.0000    0.00%
+  total: 225199.1088 damage over 60s = 3753.31848 dps
+  vuln_window buff uptime: 0.4000   vulnerable condition uptime: 0.4000
+  mana: 0.0000s starved, 0.0000s capped
+
+  EV pins hold: 225199.1088 total / 3753.31848 dps / 0.4 vuln uptime ✓
+
+Diablo 4 rotation — 60s training dummy, Monte Carlo mode (N=1000, seed=42)
+  mean 3743.0759   std 210.1306   p10 3475.5944   p50 3733.9902   p90 4016.3750
+  MC sanity holds: mean within 2% of the EV pin, p10 ≤ p50 ≤ p90 ✓
+```
+
+The `vulnerable` uptime (0.4) was never asserted anywhere in the
+config — it FALLS OUT of Frost Nova's 4-second buff window recast every
+10 seconds. That's Level-2's whole point.
+
 ## Status
 
 Parity-proven against its first consumer, `../diablo4-calc`: all 7 of its

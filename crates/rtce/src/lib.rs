@@ -50,6 +50,24 @@
 //! <https://github.com/benjamin-small/rpg-theorycraft-engine/blob/main/docs/superpowers/specs/2026-07-21-rtce-design.md>
 //! for the design log.
 //!
+//! # Sequencing: from average to timeline
+//!
+//! [`plan::Plan::evaluate`] above answers "what does this build average,
+//! given ASSERTED uptimes?" — fast, but every buff window, resource
+//! squeeze, and proc has to be flattened into a `Scenario`'s static
+//! numbers by hand. [`simdef::SimDef`] + [`simdef::Rotation`] + [`sim::run`]
+//! answer a related question over an actual TIMELINE instead: given a
+//! priority-list rotation, resources, cooldowns, buff windows, and procs,
+//! what really happens over N seconds, and what uptimes does that produce?
+//! [`sim::Mode::Expected`] walks one deterministic branch-blended timeline
+//! (agrees with `evaluate` EXACTLY when there's nothing for the timeline
+//! to add — see `sim::exec`'s keystone test); [`sim::Mode::MonteCarlo`]
+//! runs many seeded timelines and reports the `dps` distribution. See
+//! `examples/diablo4_rotation.rs` for a full walkthrough (mana, a
+//! spender/generator pair, a cooldown-gated buff, computed uptimes, both
+//! modes, hand-worked pins) — run it with
+//! `cargo run -p rtce --example diablo4_rotation`.
+//!
 //! # Example
 //!
 //! ```
