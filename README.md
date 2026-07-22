@@ -15,10 +15,19 @@ the proven patterns of `diablo4-calc` and `poe2-calcs`.
 
 Crates: `rtce` (engine), `rtce-testkit` (fixture harness, dev-dependency).
 
-## A complete game in config: Diablo 4
+## A real game's damage model in config: a Diablo 4 slice
+
+To be clear about scope: this is a **thin slice** of Diablo 4 — the core
+damage formula (crit/overpower branching, the shared additive pool, summed
+multiplier groups, vulnerable, DoT, attack speed) — not the game. There is
+no resource model, no proc system, no defenses, no buff timelines here;
+those are future config tiers (see the design spec's Level-2 scenarios) or
+resolver-side concerns in the consumer. What the slice demonstrates is the
+*shape*: a real game's damage algorithm expressed entirely as data, exact
+enough that a production calculator runs on it.
 
 Three tiers of configuration, nothing else. **Tier 1 — the GameDef** is the
-game's algorithm. This is the (abridged) real one from
+slice's algorithm. This is the (abridged) real one from
 [`crates/rtce/tests/fixtures/d4/gamedef.json`](crates/rtce/tests/fixtures/d4/gamedef.json),
 the same file the test suite pins against the `diablo4-calc` production
 calculator:

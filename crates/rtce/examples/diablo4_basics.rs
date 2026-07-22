@@ -1,7 +1,11 @@
-//! A COMPLETE real-game config set: Diablo 4's damage algorithm (the same
-//! committed GameDef the test suite pins against diablo4-calc), a basic
-//! Sorcerer build, and two playbooks — a training dummy and a high-DR boss
-//! with partial Vulnerable uptime.
+//! A working config set for a THIN SLICE of a real game: Diablo 4's core
+//! damage formula (the same committed GameDef the test suite pins against
+//! diablo4-calc — crit/OP branching, additive pool, summed groups, vuln),
+//! a basic Sorcerer build, and two playbooks — a training dummy and a
+//! high-DR boss with partial Vulnerable uptime. Not the whole game: no
+//! resource, procs, defenses, or buff timelines — this demonstrates the
+//! SHAPE of game-as-config, exact enough that a production calculator
+//! runs on this gamedef.
 //!
 //! Run: `cargo run -p rtce --example diablo4_basics`
 //!
