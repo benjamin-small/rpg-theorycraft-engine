@@ -1,6 +1,8 @@
-//! Recursive-descent parser. Precedence: unary minus > * / > + -.
-//! Functions are a closed set (min/max/clamp/floor) with arity checked at
-//! parse time — an unknown function name is an error, never a guess.
+//! Recursive-descent parser. Precedence, loosest to tightest:
+//! comparison (`pred`, at most ONE per level — chaining is a positioned
+//! error) > + - > * / > unary minus. Functions are a closed set
+//! (min/max/clamp/floor/and/or/not) with arity checked at parse time — an
+//! unknown function name is an error, never a guess.
 
 use super::lexer::{tokenize, Tok};
 use super::ExprError;
@@ -21,6 +23,12 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Eq,
+    Ne,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,14 +37,17 @@ pub enum Func {
     Max,
     Clamp,
     Floor,
+    And,
+    Or,
+    Not,
 }
 
 impl Func {
     pub fn arity(self) -> usize {
         match self {
-            Func::Min | Func::Max => 2,
+            Func::Min | Func::Max | Func::And | Func::Or => 2,
             Func::Clamp => 3,
-            Func::Floor => 1,
+            Func::Floor | Func::Not => 1,
         }
     }
 }
@@ -48,7 +59,7 @@ pub fn parse(src: &str) -> Result<Ast, ExprError> {
         pos: 0,
         src_len: src.len(),
     };
-    let ast = p.expr()?;
+    let ast = p.pred()?;
     if p.pos != p.toks.len() {
         return Err(ExprError {
             pos: p.peek_pos(),
@@ -74,6 +85,45 @@ impl Parser {
             .map(|(p, _)| *p)
             .unwrap_or(self.src_len)
     }
+
+    /// `cmpop` if the next token is one of `> < >= <= == !=`.
+    fn peek_cmpop(&self) -> Option<BinOp> {
+        match self.peek() {
+            Some(Tok::Gt) => Some(BinOp::Gt),
+            Some(Tok::Lt) => Some(BinOp::Lt),
+            Some(Tok::Ge) => Some(BinOp::Ge),
+            Some(Tok::Le) => Some(BinOp::Le),
+            Some(Tok::EqEq) => Some(BinOp::Eq),
+            Some(Tok::Ne) => Some(BinOp::Ne),
+            _ => None,
+        }
+    }
+
+    /// `pred := add (cmpop add)?` — at most ONE comparison per level. A
+    /// second cmpop immediately following the first comparison (e.g.
+    /// `1 < 2 < 3`) is a positioned "chained comparison" error rather than
+    /// silently associating left-to-right, since `(1 < 2) < 3` would
+    /// otherwise compare a 0/1 result against `3` without the author
+    /// meaning to.
+    fn pred(&mut self) -> Result<Ast, ExprError> {
+        let lhs = self.expr()?;
+        let Some(op) = self.peek_cmpop() else {
+            return Ok(lhs);
+        };
+        self.pos += 1;
+        let rhs = self.expr()?;
+        let node = Ast::Bin(op, Box::new(lhs), Box::new(rhs));
+        if let Some(second_pos) = self.peek_cmpop().map(|_| self.peek_pos()) {
+            return Err(ExprError {
+                pos: second_pos,
+                msg: "chained comparison (e.g. `1 < 2 < 3`) is not allowed — \
+                      use `and(1 < 2, 2 < 3)`"
+                    .into(),
+            });
+        }
+        Ok(node)
+    }
+
     fn expr(&mut self) -> Result<Ast, ExprError> {
         let mut lhs = self.term()?;
         while let Some(op) = match self.peek() {
@@ -125,6 +175,9 @@ impl Parser {
                         "max" => Func::Max,
                         "clamp" => Func::Clamp,
                         "floor" => Func::Floor,
+                        "and" => Func::And,
+                        "or" => Func::Or,
+                        "not" => Func::Not,
                         other => {
                             return Err(ExprError {
                                 pos: p,
@@ -136,7 +189,9 @@ impl Parser {
                     let mut args = Vec::new();
                     if !matches!(self.peek(), Some(Tok::RParen)) {
                         loop {
-                            args.push(self.expr()?);
+                            // Arguments may themselves be comparisons/booleans
+                            // (`and(a >= 40, not(b))`), so parse at `pred`.
+                            args.push(self.pred()?);
                             match self.peek() {
                                 Some(Tok::Comma) => self.pos += 1,
                                 _ => break,
@@ -167,7 +222,7 @@ impl Parser {
             }
             Some((_, Tok::LParen)) => {
                 self.pos += 1;
-                let inner = self.expr()?;
+                let inner = self.pred()?;
                 if !matches!(self.peek(), Some(Tok::RParen)) {
                     return Err(ExprError {
                         pos: self.peek_pos(),

@@ -47,6 +47,24 @@ pub enum Op {
     Clamp,
     /// Pop one, push its floor.
     Floor,
+    /// Pop two (b, a), push `(a > b) as u8 as f64` — strictly 0.0/1.0.
+    Gt,
+    /// Pop two (b, a), push `(a < b) as u8 as f64`.
+    Lt,
+    /// Pop two (b, a), push `(a >= b) as u8 as f64`.
+    Ge,
+    /// Pop two (b, a), push `(a <= b) as u8 as f64`.
+    Le,
+    /// Pop two, push `(a == b) as u8 as f64`.
+    Eq,
+    /// Pop two, push `(a != b) as u8 as f64`.
+    Ne,
+    /// Pop two, push `1.0` iff both operands are nonzero (truthy), else `0.0`.
+    And,
+    /// Pop two, push `1.0` iff either operand is nonzero (truthy), else `0.0`.
+    Or,
+    /// Pop one, push `1.0` iff the operand is zero, else `0.0`.
+    Not,
 }
 
 /// Maximum evaluation stack depth; checked at compile, never at eval.
@@ -94,6 +112,12 @@ fn emit(ast: &Ast, syms: &dyn Symbols, out: &mut Vec<Op>) -> Result<(), ExprErro
                 BinOp::Sub => Op::Sub,
                 BinOp::Mul => Op::Mul,
                 BinOp::Div => Op::Div,
+                BinOp::Gt => Op::Gt,
+                BinOp::Lt => Op::Lt,
+                BinOp::Ge => Op::Ge,
+                BinOp::Le => Op::Le,
+                BinOp::Eq => Op::Eq,
+                BinOp::Ne => Op::Ne,
             });
         }
         Ast::Call(func, args) => {
@@ -105,6 +129,9 @@ fn emit(ast: &Ast, syms: &dyn Symbols, out: &mut Vec<Op>) -> Result<(), ExprErro
                 Func::Max => Op::Max,
                 Func::Clamp => Op::Clamp,
                 Func::Floor => Op::Floor,
+                Func::And => Op::And,
+                Func::Or => Op::Or,
+                Func::Not => Op::Not,
             });
         }
     }
@@ -117,8 +144,9 @@ fn simulate_depth(ops: &[Op]) -> Result<usize, ExprError> {
     for op in ops {
         let (pops, pushes) = match op {
             Op::Const(_) | Op::Load(_) => (0, 1),
-            Op::Neg | Op::Floor => (1, 1),
+            Op::Neg | Op::Floor | Op::Not => (1, 1),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => (2, 1),
+            Op::Gt | Op::Lt | Op::Ge | Op::Le | Op::Eq | Op::Ne | Op::And | Op::Or => (2, 1),
             Op::Clamp => (3, 1),
         };
         // Only emit() output reaches this; operands always precede operators.
@@ -191,6 +219,41 @@ impl Program {
                     sp -= 2;
                     let (lo, hi) = (stack[sp], stack[sp + 1]);
                     stack[sp - 1] = stack[sp - 1].max(lo).min(hi);
+                }
+                Op::Gt => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] > stack[sp]) as u8 as f64;
+                }
+                Op::Lt => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] < stack[sp]) as u8 as f64;
+                }
+                Op::Ge => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] >= stack[sp]) as u8 as f64;
+                }
+                Op::Le => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] <= stack[sp]) as u8 as f64;
+                }
+                Op::Eq => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] == stack[sp]) as u8 as f64;
+                }
+                Op::Ne => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] != stack[sp]) as u8 as f64;
+                }
+                Op::And => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] != 0.0 && stack[sp] != 0.0) as u8 as f64;
+                }
+                Op::Or => {
+                    sp -= 1;
+                    stack[sp - 1] = (stack[sp - 1] != 0.0 || stack[sp] != 0.0) as u8 as f64;
+                }
+                Op::Not => {
+                    stack[sp - 1] = (stack[sp - 1] == 0.0) as u8 as f64;
                 }
             }
         }
@@ -294,6 +357,41 @@ mod tests {
     #[test]
     fn division_by_zero_is_infinite_not_a_panic() {
         assert!(compile("1/0", &syms(&[])).unwrap().eval(&[]).is_infinite());
+    }
+
+    #[test]
+    fn comparisons_and_boolean_functions() {
+        let s = syms(&["a", "b"]);
+        let e = |src: &str, slots: &[f64]| compile(src, &s).unwrap().eval(slots);
+        // Comparisons return exactly 0/1.
+        assert_eq!(e("a > b", &[3.0, 2.0]), 1.0);
+        assert_eq!(e("a > b", &[2.0, 3.0]), 0.0);
+        assert_eq!(e("a >= b", &[2.0, 2.0]), 1.0);
+        assert_eq!(e("a < b", &[2.0, 3.0]), 1.0);
+        assert_eq!(e("a <= b", &[3.0, 2.0]), 0.0);
+        assert_eq!(e("a == b", &[2.0, 2.0]), 1.0);
+        assert_eq!(e("a != b", &[2.0, 2.0]), 0.0);
+        // Precedence: arithmetic binds tighter than comparison.
+        assert_eq!(e("a + 1 > b * 2", &[3.0, 2.0]), 0.0); // 4 > 4 → 0
+                                                          // Boolean functions: strict 0/1 out, nonzero-truthy in.
+        assert_eq!(e("and(a, b)", &[1.0, 0.0]), 0.0);
+        assert_eq!(e("and(a, b)", &[2.0, -1.0]), 1.0);
+        assert_eq!(e("or(a, b)", &[0.0, 2.0]), 1.0);
+        assert_eq!(e("or(a, b)", &[0.0, 0.0]), 0.0);
+        assert_eq!(e("not(a)", &[0.0]), 1.0);
+        assert_eq!(e("not(a)", &[3.0]), 0.0);
+        // Composability: the P6 rotation shape.
+        assert_eq!(e("and(a >= 40, not(b))", &[40.0, 0.0]), 1.0);
+    }
+
+    #[test]
+    fn chained_comparison_is_a_positioned_error() {
+        // `1 < 2 < 3` would silently mean `(1 < 2) < 3` — banned outright;
+        // the error names the byte position of the SECOND cmpop and says
+        // "chained" so the author knows to use `and(...)` instead.
+        let e = compile("1 < 2 < 3", &syms(&[])).unwrap_err();
+        assert!(e.msg.contains("chained"), "got: {}", e.msg);
+        assert_eq!(e.pos, 6);
     }
 
     #[test]

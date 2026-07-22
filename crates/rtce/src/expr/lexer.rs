@@ -1,5 +1,6 @@
 //! Tokenizer: numbers, identifiers (snake_case dotted names allowed),
-//! + - * / ( ) , — everything else is a positioned error.
+//! arithmetic (`+ - * / ( ) ,`) and comparison operators
+//! (`> < >= <= == !=`) — everything else is a positioned error.
 
 use super::ExprError;
 
@@ -14,6 +15,12 @@ pub enum Tok {
     LParen,
     RParen,
     Comma,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    EqEq,
+    Ne,
 }
 
 /// Tokenize `src` into (byte position, token) pairs. Positions are true
@@ -47,6 +54,34 @@ pub fn tokenize(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
                 i += 1;
             }
             out.push((start, Tok::Ident(src[start..i].to_string())));
+        } else if c == b'>' || c == b'<' || c == b'=' || c == b'!' {
+            // Two-char lookahead: `>= <= == !=` before the one-char forms;
+            // a bare `=` or `!` (no following `=`) is a positioned error —
+            // neither stands alone in this grammar.
+            let next_eq = b.get(i + 1) == Some(&b'=');
+            let (tok, len) = match (c, next_eq) {
+                (b'>', true) => (Tok::Ge, 2),
+                (b'>', false) => (Tok::Gt, 1),
+                (b'<', true) => (Tok::Le, 2),
+                (b'<', false) => (Tok::Lt, 1),
+                (b'=', true) => (Tok::EqEq, 2),
+                (b'!', true) => (Tok::Ne, 2),
+                (b'=', false) => {
+                    return Err(ExprError {
+                        pos: i,
+                        msg: "unexpected character `=` (did you mean `==`?)".into(),
+                    })
+                }
+                (b'!', false) => {
+                    return Err(ExprError {
+                        pos: i,
+                        msg: "unexpected character `!` (did you mean `!=`?)".into(),
+                    })
+                }
+                _ => unreachable!(),
+            };
+            out.push((i, tok));
+            i += len;
         } else if c.is_ascii() {
             let tok = match c {
                 b'+' => Tok::Plus,
@@ -115,6 +150,38 @@ mod tests {
         let with_pos = tokenize("a + b").unwrap();
         assert_eq!(with_pos[1].0, 2);
         assert_eq!(with_pos[2].0, 4);
+    }
+
+    #[test]
+    fn comparison_tokens_lex_two_char_before_one_char() {
+        assert_eq!(
+            toks("a >= b < c <= d == e != f > g"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Ge,
+                Tok::Ident("b".into()),
+                Tok::Lt,
+                Tok::Ident("c".into()),
+                Tok::Le,
+                Tok::Ident("d".into()),
+                Tok::EqEq,
+                Tok::Ident("e".into()),
+                Tok::Ne,
+                Tok::Ident("f".into()),
+                Tok::Gt,
+                Tok::Ident("g".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_bang_or_equals_errors_cleanly() {
+        let e = tokenize("a ! b").unwrap_err();
+        assert_eq!(e.pos, 2);
+        assert!(e.msg.contains('!'), "got: {}", e.msg);
+        let e = tokenize("a = b").unwrap_err();
+        assert_eq!(e.pos, 2);
+        assert!(e.msg.contains('='), "got: {}", e.msg);
     }
 
     #[test]
