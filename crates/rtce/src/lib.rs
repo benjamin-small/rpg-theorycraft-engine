@@ -90,6 +90,11 @@ pub mod build;
 pub mod expr;
 pub mod gamedef;
 pub mod plan;
+/// A tiny in-crate seeded PCG32 — internal to `plan`'s sampled evaluation
+/// and `sim`'s Monte Carlo mode. Deliberately NOT `pub`: the
+/// zero-dependency RNG is an implementation detail, never part of this
+/// crate's public API (see `rng` module docs).
+mod rng;
 pub mod scenario;
 pub mod search;
 pub mod sim;

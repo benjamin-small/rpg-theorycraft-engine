@@ -1,9 +1,12 @@
-//! The EV timeline executor: a discrete-event stepper over a compiled
+//! The timeline executor: a discrete-event stepper over a compiled
 //! [`SimPlan`], producing a [`SimReport`] of COMPUTED uptimes/dps in place
 //! of `Scenario`'s asserted ones (see the design spec's "Executor" and
 //! "Scenarios — Level-2 reading" sections). One decision loop drives
 //! everything: walk the rotation's rules, begin the first eligible cast,
-//! and let time advance to whatever happens next.
+//! and let time advance to whatever happens next — [`Mode::Expected`] and
+//! [`Mode::MonteCarlo`] share this ENTIRE loop (rotation logic is never
+//! randomized; only damage/proc OUTCOMES differ by mode — see [`Sim::rng`]'s
+//! doc comment and the "Procs and Monte Carlo (P6d)" section below).
 //!
 //! # Effective build fold
 //!
@@ -61,42 +64,83 @@
 //!   not ask for — the duration check gets the identical result with one
 //!   fewer moving part.
 //!
-//! Procs fire via the EV ACCUMULATOR method described in the design spec
-//! (`acc += chance` per qualifying roll, subject to ICD; fires and resets
-//! `acc -= 1.0` on crossing `1.0`) — with `chance == 1.0` this degenerates
-//! to "fires every unblocked roll", which is all `Mode::Expected`
-//! exercises today; `SimReport::proc_counts` already reports each proc's
-//! fire count, but the accumulator's own DEDICATED pins (fractional
-//! chances, fire-index hand-derivations) and `Mode::MonteCarlo` land in
-//! P6d. `on_crit` never fires yet (EV mode has
-//! no discrete crit EVENT to hang it on without full branch tracking —
-//! left for P6d); `ProcEffect::CastAction` (a proc casting a free action)
-//! is implemented conservatively (gains + damage, no cost/cooldown, no
-//! further proc rolls, to avoid reentrancy) and untested — no fixture
-//! here exercises it.
+//! # Procs and Monte Carlo (P6d)
+//!
+//! [`Mode::Expected`] procs fire via the EV ACCUMULATOR method (see
+//! [`Sim::roll_procs_ev`]'s doc comment for the full semantics, including
+//! this task's documented choice for how an ICD interacts with an
+//! in-flight crossing — accumulation continues, one deferred fire max,
+//! pinned in `ev_accumulator_deferred_fire_during_icd_is_hand_worked`) and
+//! `on_crit` procs by weighting each hit's contribution by that hit's
+//! `"crit"` EVENT probability rather than firing outright (see
+//! [`Plan::crit_chance`] and `ev_on_crit_weights_by_crit_probability`) —
+//! the EV-consistent choice that makes the accumulator's long-run fire
+//! rate agree with `Mode::MonteCarlo`'s.
+//!
+//! [`Mode::MonteCarlo`] procs instead ROLL exactly ([`Sim::roll_procs_mc`]:
+//! `rng.next_f64() < chance`, ICD a hard gate, no accumulator/deferral —
+//! MC mode has no analogue of the EV accumulator's carry-over by design),
+//! and `on_crit` fires only on hits whose SAMPLED branch (via
+//! [`Plan::evaluate_phase_sampled`]) actually rolled a crit (see
+//! [`Sim::eval_action_damage_sampled`]) — exact, not probabilistic.
+//!
+//! `ProcEffect::CastAction` (a proc casting a free action, [`Sim::free_cast`])
+//! is scoped identically in both modes: gains + damage only, no cost/
+//! cooldown, no further proc rolls (avoids reentrancy), and its damage is
+//! ALWAYS the EV/branch-blended value (even under `Mode::MonteCarlo` —
+//! documented as a v1 scope limit on `free_cast`'s own doc comment, not an
+//! oversight) — pinned end-to-end by
+//! `proc_effect_cast_action_fires_a_free_instant_cast`.
+//!
+//! [`SimReport::distribution`] is `Mode::MonteCarlo`-only: `mean`/`std`
+//! (population, not sample — every sample IS the reported population) and
+//! `p10`/`p50`/`p90` (nearest-rank estimator) over the `iterations`
+//! per-iteration `dps` values — see [`super::report::Distribution`]'s doc
+//! comment. Every other `SimReport` field under `Mode::MonteCarlo` is the
+//! POOLED ARITHMETIC MEAN of that field across iterations (u64 fields
+//! rounded to the nearest whole count) — see [`run`]'s doc comment for why
+//! "pooled means" is unambiguous here (duration is never sampled).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::compile::{ProcEffect, SimPlan};
-use super::report::{ActionReport, PhaseReport, ResourceReport, SimReport, Totals};
+use super::report::{ActionReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals};
 use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
+use crate::rng::{mix_seed, Pcg32};
 use crate::scenario::{Phase, Scenario};
 use crate::simdef::Trigger;
 
-/// Execution fidelity for [`run`]. `Expected` is the only mode today (the
-/// deterministic branch-blended/accumulator engine described in the
-/// module docs); `Mode::MonteCarlo { iterations, seed }` arrives in P6d as
-/// a new variant, not a signature break — callers that already `match`
-/// exhaustively will get a compile error pointing at the new arm, which is
-/// the point.
+/// Execution fidelity for [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Deterministic branch-blended timeline: `Plan::evaluate`'s own
-    /// engine driven once per cast/tick, procs via the accumulator method.
+    /// engine driven once per cast/tick, procs via the EV accumulator
+    /// method (see module docs).
     Expected,
+    /// `iterations` full independent timeline runs, each seeded off
+    /// `seed` (see `mix_seed`'s doc comment for the derivation): procs
+    /// ROLL exactly (`rng.next_f64() < chance`, ICD a hard gate, no
+    /// accumulator) and damage/crits are SAMPLED
+    /// (`Plan::evaluate_phase_sampled`) rather than branch-blended. The
+    /// resulting [`SimReport`] carries the POOLED MEAN of every
+    /// per-iteration report field (see [`run`]'s docs) plus a
+    /// [`Distribution`] over the `iterations` per-iteration `dps` values.
+    MonteCarlo {
+        /// Number of independent timeline runs (must be `> 0`).
+        iterations: u32,
+        /// Master seed; iteration `i` derives its own `Pcg32` seed via
+        /// `mix_seed(seed, i)`.
+        seed: u64,
+    },
 }
+
+/// Floating-point tolerance for the EV accumulator's `acc >= 1.0` crossing
+/// check (see [`Sim::roll_procs_ev`]) — a mathematically-exact crossing can
+/// land a hair below `1.0` in `f64` after repeated `+=` of a value with no
+/// exact binary representation (`0.3`, notably).
+const PROC_FIRE_EPSILON: f64 = 1e-9;
 
 /// Preallocated executor buffers: a [`Plan`] [`EvalScratch`] (for every
 /// `Plan::evaluate_phase` call the sim makes) plus the sim's own extended
@@ -119,9 +163,29 @@ impl SimScratch {
     }
 }
 
-/// Run `sim_plan`'s rotation once against `build` in `scenario`, producing
-/// a [`SimReport`] of computed uptimes/dps. Owns its [`SimScratch`]
-/// internally for v1 (see that type's docs).
+/// Run `sim_plan`'s rotation against `build` in `scenario` under `mode`,
+/// producing a [`SimReport`] of computed uptimes/dps. `Mode::Expected` runs
+/// once (a single [`SimScratch`], owned internally for v1 — batch reuse
+/// across repeated `run` calls is a later phase). `Mode::MonteCarlo` runs
+/// `iterations` independent timelines (a FRESH `SimScratch`/`Sim`/`Pcg32`
+/// each — nothing carries across iterations except the derived seed) and
+/// POOLS them: every scalar field in the returned report (`total_damage`,
+/// per-action `casts`/`damage`, `buff_uptime`, `condition_uptime`,
+/// per-resource `time_capped`/`time_starved`, `proc_counts`) is the
+/// ARITHMETIC MEAN of that field across all `iterations` reports — chosen
+/// over "return one representative iteration" because a mean is what a
+/// reader actually wants from "run this fight 1000 times" (a single
+/// iteration is exactly as arbitrary as its own seed), and chosen over
+/// "recompute pooled `dps` from pooled `total_damage`" only in APPEARANCE:
+/// since every iteration shares the identical `duration` (a deterministic
+/// function of `scenario`, never sampled), `mean(total_damage) / duration`
+/// and `mean(dps)` are the SAME number — the two framings coincide exactly
+/// here, so "pooled means" is unambiguous. `u64` fields (`casts`,
+/// `proc_counts`) round their mean to the nearest whole count. The `dps`
+/// DISTRIBUTION itself (mean/std/percentiles across iterations, not
+/// pooled into a single number) is reported separately via
+/// [`SimReport::distribution`] — `Mode::Expected` leaves that `None` (a
+/// single deterministic run has no distribution to report).
 pub fn run(
     plan: &Plan,
     sim_plan: &SimPlan,
@@ -129,9 +193,6 @@ pub fn run(
     scenario: &Scenario,
     mode: Mode,
 ) -> Result<SimReport, PlanError> {
-    match mode {
-        Mode::Expected => {}
-    }
     if scenario.phases.is_empty() {
         return Err(PlanError {
             what: "scenario has no phases".into(),
@@ -154,10 +215,166 @@ pub fn run(
         });
     }
 
-    let scratch = SimScratch::new(plan, sim_plan);
-    let mut sim = Sim::new(plan, sim_plan, build, scenario, duration, scratch)?;
-    sim.run_loop()?;
-    Ok(sim.into_report())
+    match mode {
+        Mode::Expected => {
+            let scratch = SimScratch::new(plan, sim_plan);
+            let mut sim = Sim::new(plan, sim_plan, build, scenario, duration, scratch, None)?;
+            sim.run_loop()?;
+            Ok(sim.into_report())
+        }
+        Mode::MonteCarlo { iterations, seed } => {
+            run_monte_carlo(plan, sim_plan, build, scenario, duration, iterations, seed)
+        }
+    }
+}
+
+/// `Mode::MonteCarlo`'s own loop — see [`run`]'s doc comment for the
+/// pooling contract this builds.
+#[allow(clippy::too_many_arguments)]
+fn run_monte_carlo(
+    plan: &Plan,
+    sim_plan: &SimPlan,
+    build: &BuildState,
+    scenario: &Scenario,
+    duration: f64,
+    iterations: u32,
+    seed: u64,
+) -> Result<SimReport, PlanError> {
+    if iterations == 0 {
+        return Err(PlanError {
+            what: "Mode::MonteCarlo requires iterations > 0".into(),
+        });
+    }
+    let n = f64::from(iterations);
+
+    let mut dps_samples: Vec<f64> = Vec::with_capacity(iterations as usize);
+    let mut phase_damage_sum: Vec<f64> = vec![0.0; scenario.phases.len()];
+    let mut total_damage_sum = 0.0;
+    let mut action_casts_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut action_damage_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut buff_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut condition_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut resource_capped_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut resource_starved_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut proc_count_sum: BTreeMap<String, f64> = BTreeMap::new();
+
+    for i in 0..iterations {
+        let iter_seed = mix_seed(seed, u64::from(i));
+        let rng = Pcg32::new(iter_seed);
+        let scratch = SimScratch::new(plan, sim_plan);
+        let mut sim = Sim::new(
+            plan,
+            sim_plan,
+            build,
+            scenario,
+            duration,
+            scratch,
+            Some(rng),
+        )?;
+        sim.run_loop()?;
+        let report = sim.into_report();
+
+        dps_samples.push(report.total.dps);
+        total_damage_sum += report.total.total_damage;
+        for (idx, p) in report.phases.iter().enumerate() {
+            phase_damage_sum[idx] += p.total_damage;
+        }
+        for (name, a) in &report.actions {
+            *action_casts_sum.entry(name.clone()).or_insert(0.0) += a.casts as f64;
+            *action_damage_sum.entry(name.clone()).or_insert(0.0) += a.damage;
+        }
+        for (name, v) in &report.buff_uptime {
+            *buff_uptime_sum.entry(name.clone()).or_insert(0.0) += v;
+        }
+        for (name, v) in &report.condition_uptime {
+            *condition_uptime_sum.entry(name.clone()).or_insert(0.0) += v;
+        }
+        for (name, r) in &report.resources {
+            *resource_capped_sum.entry(name.clone()).or_insert(0.0) += r.time_capped;
+            *resource_starved_sum.entry(name.clone()).or_insert(0.0) += r.time_starved;
+        }
+        for (name, c) in &report.proc_counts {
+            *proc_count_sum.entry(name.clone()).or_insert(0.0) += *c as f64;
+        }
+    }
+
+    let phases: Vec<PhaseReport> = scenario
+        .phases
+        .iter()
+        .zip(phase_damage_sum.iter())
+        .map(|(p, &sum)| {
+            let dmg = sum / n;
+            PhaseReport {
+                name: p.name.clone(),
+                duration: p.weight,
+                total_damage: dmg,
+                dps: if p.weight > 0.0 { dmg / p.weight } else { 0.0 },
+            }
+        })
+        .collect();
+
+    let total_damage_mean = total_damage_sum / n;
+    let total = Totals {
+        duration,
+        total_damage: total_damage_mean,
+        dps: if duration > 0.0 {
+            total_damage_mean / duration
+        } else {
+            0.0
+        },
+    };
+
+    let mut actions = BTreeMap::new();
+    for (name, casts_sum) in &action_casts_sum {
+        let dmg = action_damage_sum.get(name).copied().unwrap_or(0.0) / n;
+        actions.insert(
+            name.clone(),
+            ActionReport {
+                casts: (casts_sum / n).round() as u64,
+                damage: dmg,
+                share: if total_damage_mean > 0.0 {
+                    dmg / total_damage_mean
+                } else {
+                    0.0
+                },
+            },
+        );
+    }
+
+    let mut buff_uptime = BTreeMap::new();
+    for (name, v) in &buff_uptime_sum {
+        buff_uptime.insert(name.clone(), v / n);
+    }
+    let mut condition_uptime = BTreeMap::new();
+    for (name, v) in &condition_uptime_sum {
+        condition_uptime.insert(name.clone(), v / n);
+    }
+    let mut resources = BTreeMap::new();
+    for (name, capped) in &resource_capped_sum {
+        let starved = resource_starved_sum.get(name).copied().unwrap_or(0.0);
+        resources.insert(
+            name.clone(),
+            ResourceReport {
+                time_capped: capped / n,
+                time_starved: starved / n,
+            },
+        );
+    }
+    let mut proc_counts = BTreeMap::new();
+    for (name, sum) in &proc_count_sum {
+        proc_counts.insert(name.clone(), (sum / n).round() as u64);
+    }
+
+    Ok(SimReport {
+        phases,
+        total,
+        actions,
+        buff_uptime,
+        condition_uptime,
+        resources,
+        proc_counts,
+        distribution: Some(Distribution::from_samples(&dps_samples)),
+    })
 }
 
 /// A finite `f64` wrapper with a total order — event times are validated
@@ -264,9 +481,20 @@ struct BuffRt {
     tick_rate: f64,
 }
 
-/// Per-proc runtime state (EV accumulator method).
+/// Per-proc runtime state. `acc`/`deferred` are EV-accumulator-only
+/// (untouched in MC mode, which rolls exactly instead — see
+/// [`Sim::roll_procs_mc`]); `icd_ready_at`/`fire_count` are shared by both
+/// modes.
 struct ProcRt {
+    /// EV mode only: the accumulator (`+= chance` per qualifying roll,
+    /// `-= 1.0` on a fire — see [`Sim::roll_procs_ev`]).
     acc: f64,
+    /// EV mode only: set when `acc` has crossed `1.0` while still inside
+    /// this proc's ICD — exactly ONE fire is queued regardless of how far
+    /// `acc` overshoots `1.0` before the ICD clears (see
+    /// [`Sim::roll_procs_ev`]'s doc comment for the full semantics this
+    /// pins).
+    deferred: bool,
     icd_ready_at: f64,
     fire_count: u64,
 }
@@ -318,6 +546,13 @@ struct Sim<'a> {
 
     scratch: SimScratch,
 
+    /// `Some` in `Mode::MonteCarlo` (this iteration's own [`Pcg32`], never
+    /// shared across iterations); `None` in `Mode::Expected`. Every method
+    /// that branches on execution fidelity does so via `self.rng.is_some()`
+    /// / `self.rng.as_mut()` rather than a separate `Mode` field — the RNG's
+    /// presence IS the mode, by construction (see [`Sim::new`]).
+    rng: Option<Pcg32>,
+
     /// Every condition name that ever appears in a scenario phase's
     /// uptimes or a buff's `conditions` map — the reporting surface for
     /// `condition_uptime`.
@@ -336,6 +571,7 @@ impl<'a> Sim<'a> {
         scenario: &'a Scenario,
         duration: f64,
         scratch: SimScratch,
+        rng: Option<Pcg32>,
     ) -> Result<Self, PlanError> {
         let n_actions = sim_plan.actions.len();
         let n_resources = sim_plan.resources.len();
@@ -398,6 +634,7 @@ impl<'a> Sim<'a> {
             procs: (0..n_procs)
                 .map(|_| ProcRt {
                     acc: 0.0,
+                    deferred: false,
                     icd_ready_at: 0.0,
                     fire_count: 0,
                 })
@@ -407,6 +644,7 @@ impl<'a> Sim<'a> {
             effective_phase: scenario.phases[0].clone(),
             effective_damage_build: build.clone(),
             scratch,
+            rng,
             condition_names,
             condition_accum: BTreeMap::new(),
             total_damage: 0.0,
@@ -852,39 +1090,71 @@ impl<'a> Sim<'a> {
         self.actions[action].casts += 1;
 
         let has_damage = self.sim_plan.actions[action].damage.is_some();
+        let mut is_crit = false;
         if has_damage {
-            let dmg = self.eval_action_damage(action)?;
+            let dmg = if self.rng.is_some() {
+                let (dmg, crit) = self.eval_action_damage_sampled(action)?;
+                is_crit = crit;
+                dmg
+            } else {
+                self.eval_action_damage(action)?
+            };
             self.total_damage += dmg;
             self.phase_damage[self.current_phase] += dmg;
             self.actions[action].damage += dmg;
         }
 
         self.mid_cast = false;
-        self.roll_procs(Trigger::OnCast)?;
-        if has_damage {
-            self.roll_procs(Trigger::OnHit)?;
+        if self.rng.is_some() {
+            self.roll_procs_mc(Trigger::OnCast, true)?;
+            if has_damage {
+                self.roll_procs_mc(Trigger::OnHit, true)?;
+                self.roll_procs_mc(Trigger::OnCrit, is_crit)?;
+            }
+        } else {
+            self.roll_procs_ev(Trigger::OnCast, 1.0)?;
+            if has_damage {
+                self.roll_procs_ev(Trigger::OnHit, 1.0)?;
+                let crit_chance = self.eval_action_crit_chance(action)?;
+                self.roll_procs_ev(Trigger::OnCrit, crit_chance)?;
+            }
         }
         Ok(())
     }
 
-    /// `damage_objective × hits` for one completed cast of `action`,
-    /// evaluated against the effective build with `action`'s own
-    /// `damage.stats` overlaid on top (`hits_per_use` excluded — read
-    /// directly, never fed to the `Plan`; see [`crate::simdef::ActionDamage`]).
-    fn eval_action_damage(&mut self, action: usize) -> Result<f64, PlanError> {
+    /// The per-cast overlay build: the effective damage build (base +
+    /// active buffs' contributions) with `action`'s own `damage.stats`
+    /// overlaid on top (`hits_per_use` excluded — read directly by
+    /// callers, never fed to the `Plan`; see
+    /// [`crate::simdef::ActionDamage`]). Shared by every per-cast `Plan`
+    /// query this action needs (EV damage, EV crit chance, sampled
+    /// damage+mask) so the overlay is built identically everywhere.
+    fn overlay_build_for_action(&self, action: usize) -> BuildState {
         let damage_stats = self.sim_plan.actions[action]
             .damage
             .as_ref()
-            .expect("caller checked damage.is_some()")
-            .clone();
-        let hits = damage_stats.get("hits_per_use").copied().unwrap_or(1.0);
+            .expect("caller checked damage.is_some()");
         let mut build = self.effective_damage_build.clone();
-        for (k, v) in &damage_stats {
+        for (k, v) in damage_stats {
             if k == "hits_per_use" {
                 continue;
             }
             build.stats.insert(k.clone(), *v);
         }
+        build
+    }
+
+    /// `damage_objective × hits` for one completed cast of `action`, EV
+    /// mode: `Plan::evaluate_phase`'s branch-blended value.
+    fn eval_action_damage(&mut self, action: usize) -> Result<f64, PlanError> {
+        let hits = self.sim_plan.actions[action]
+            .damage
+            .as_ref()
+            .expect("caller checked damage.is_some()")
+            .get("hits_per_use")
+            .copied()
+            .unwrap_or(1.0);
+        let build = self.overlay_build_for_action(action);
         let phase = self.effective_phase.clone();
         let objs = self
             .plan
@@ -892,7 +1162,122 @@ impl<'a> Sim<'a> {
         Ok(objs[self.sim_plan.damage_objective] * hits)
     }
 
-    fn roll_procs(&mut self, trigger: Trigger) -> Result<(), PlanError> {
+    /// EV mode only: the probability the `"crit"` event fires for one hit
+    /// of `action` — see [`Plan::crit_chance`]'s docs for the naming
+    /// convention and the fail-soft `0.0` when this game has no `"crit"`
+    /// event. Used to weight `on_crit` proc accumulation (see
+    /// [`Sim::roll_procs_ev`]'s doc comment).
+    fn eval_action_crit_chance(&mut self, action: usize) -> Result<f64, PlanError> {
+        let build = self.overlay_build_for_action(action);
+        let phase = self.effective_phase.clone();
+        self.plan
+            .crit_chance(&build, &phase, &mut self.scratch.eval)
+    }
+
+    /// MC mode only: `damage_objective × hits` for one completed cast of
+    /// `action`, SAMPLED (`Plan::evaluate_phase_sampled`) — returns the
+    /// damage AND whether the sampled branch fired the `"crit"` event
+    /// (`Plan::is_crit_bit_set`), which `complete_cast` feeds straight
+    /// into the `on_crit` proc roll (no separate crit-probability query
+    /// needed in MC mode — the coin was already flipped).
+    fn eval_action_damage_sampled(&mut self, action: usize) -> Result<(f64, bool), PlanError> {
+        let hits = self.sim_plan.actions[action]
+            .damage
+            .as_ref()
+            .expect("caller checked damage.is_some()")
+            .get("hits_per_use")
+            .copied()
+            .unwrap_or(1.0);
+        let build = self.overlay_build_for_action(action);
+        let phase = self.effective_phase.clone();
+        let plan = self.plan;
+        let rng = self.rng.as_mut().expect("caller checked rng.is_some()");
+        let (objs, mask) =
+            plan.evaluate_phase_sampled(&build, &phase, rng, &mut self.scratch.eval)?;
+        let dmg = objs[self.sim_plan.damage_objective] * hits;
+        let is_crit = plan.is_crit_bit_set(mask);
+        Ok((dmg, is_crit))
+    }
+
+    /// EV mode: the accumulator method (see module docs). `weight`
+    /// multiplies each qualifying roll's `chance` BEFORE accumulation —
+    /// `1.0` for `OnCast`/`OnHit` (every cast/hit qualifies outright), and
+    /// (the EV-consistent choice this task pins, since the design spec is
+    /// silent on it) `crit_chance` for `OnCrit`: a hit isn't "certainly" a
+    /// crit in EV mode, so an `on_crit` proc's per-hit contribution is
+    /// `proc_chance × P(crit)`, not `proc_chance` outright — this is
+    /// exactly what makes the EV accumulator's LONG-RUN fire rate agree
+    /// with MC mode's (which only rolls `on_crit` procs on hits that
+    /// actually sampled a crit).
+    ///
+    /// ICD semantics (the design spec says only "fires when the
+    /// accumulator crosses 1 (respecting ICD)" — this task's documented
+    /// choice for what "respecting" means): accumulation CONTINUES even
+    /// while a proc is on ICD (a crossing is never lost). A crossing that
+    /// happens OFF ICD fires immediately. A crossing that happens WHILE ON
+    /// ICD queues exactly ONE deferred fire (`ProcRt::deferred`) — `acc`
+    /// is NOT decremented at the crossing, only at the ACTUAL fire, which
+    /// happens the next time this trigger rolls at/after the ICD clears
+    /// (there is no dedicated "ICD cleared" event in this executor — see
+    /// module docs on why `ProcIcdClear` needs none — so "immediately when
+    /// ICD ends" means "at the earliest qualifying trigger at/after the
+    /// ICD clears", which is the only point in time this discrete-event
+    /// simulator can observe anyway). Further crossings while still
+    /// deferred don't queue a second fire — `acc` can overshoot `1.0`
+    /// arbitrarily far during a long ICD, but only one `1.0` is ever
+    /// consumed at the eventual fire, exactly matching "acc still
+    /// decremented at actual fire" (a single `-= 1.0`, not `-= floor(acc)`).
+    fn roll_procs_ev(&mut self, trigger: Trigger, weight: f64) -> Result<(), PlanError> {
+        let now = self.time;
+        self.refresh_time_varying_slots();
+        for pi in 0..self.sim_plan.procs.len() {
+            if self.sim_plan.procs[pi].trigger != trigger {
+                continue;
+            }
+            // Resolve a queued deferred fire once its ICD has cleared.
+            if self.procs[pi].deferred && now >= self.procs[pi].icd_ready_at {
+                self.fire_proc(pi, now)?;
+            }
+            // Accumulate this roll's chance — unconditionally, even mid-ICD.
+            let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots) * weight;
+            self.procs[pi].acc += chance;
+            // A fresh crossing either fires now (ICD clear) or queues.
+            // `PROC_FIRE_EPSILON` tolerance: a mathematically-exact
+            // crossing (e.g. 10 additions of 0.3, which sums to exactly
+            // 3.0 in decimal) can land a hair BELOW 1.0 in `f64` (`0.3`
+            // itself has no exact binary representation, and repeated
+            // `+=` compounds the rounding) — without the tolerance this
+            // crossing would be silently missed, breaking the hand-worked
+            // pin `ev_accumulator_fractional_chance_fires_at_hand_worked_hit_indices`
+            // documents (10th hit lands at `0.9999999999999998`, not
+            // `1.0`, without this).
+            if !self.procs[pi].deferred && self.procs[pi].acc >= 1.0 - PROC_FIRE_EPSILON {
+                if now >= self.procs[pi].icd_ready_at {
+                    self.fire_proc(pi, now)?;
+                } else {
+                    self.procs[pi].deferred = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// MC mode: procs ROLL exactly — `rng.next_f64() < chance`, no
+    /// accumulator, ICD a HARD gate (a roll blocked by ICD is simply
+    /// SKIPPED, not deferred or remembered — MC mode has no analogue of
+    /// the EV accumulator's carry-over, by design: each iteration is an
+    /// independent sample of what actually happens, and "an ICD-gated
+    /// near-miss quietly banks itself for later" is exactly the kind of
+    /// EV-only smoothing MC mode exists to NOT do). `qualifies` gates the
+    /// whole roll: `true` for `OnCast`/`OnHit` (every cast/hit qualifies),
+    /// and — mirroring `roll_procs_ev`'s `on_crit` weighting, but exactly
+    /// rather than probabilistically — whether THIS hit's sampled branch
+    /// actually fired the `"crit"` event for `OnCrit` (see
+    /// [`Sim::eval_action_damage_sampled`]).
+    fn roll_procs_mc(&mut self, trigger: Trigger, qualifies: bool) -> Result<(), PlanError> {
+        if !qualifies {
+            return Ok(());
+        }
         let now = self.time;
         self.refresh_time_varying_slots();
         for pi in 0..self.sim_plan.procs.len() {
@@ -900,12 +1285,18 @@ impl<'a> Sim<'a> {
                 continue;
             }
             if self.procs[pi].icd_ready_at > now {
-                continue;
+                continue; // hard gate — no accumulation, no memory.
             }
             let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
-            self.procs[pi].acc += chance;
-            if self.procs[pi].acc >= 1.0 {
-                self.procs[pi].acc -= 1.0;
+            // A fresh short-lived borrow of `self.rng`, released before
+            // the match arms below need `&mut self` in full (calling
+            // `self.apply_buff`/`self.free_cast`).
+            let roll = self
+                .rng
+                .as_mut()
+                .expect("caller checked rng.is_some()")
+                .next_f64();
+            if roll < chance {
                 self.procs[pi].fire_count += 1;
                 self.procs[pi].icd_ready_at = now + self.sim_plan.procs[pi].icd;
                 match self.sim_plan.procs[pi].effect {
@@ -917,10 +1308,30 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
+    /// Fire proc `pi` at `now`: consume the accumulator (EV mode only —
+    /// MC mode's `roll_procs_mc` never calls this, it applies the effect
+    /// inline), clear any deferred flag, start the ICD, apply the effect.
+    fn fire_proc(&mut self, pi: usize, now: f64) -> Result<(), PlanError> {
+        self.procs[pi].acc -= 1.0;
+        self.procs[pi].deferred = false;
+        self.procs[pi].fire_count += 1;
+        self.procs[pi].icd_ready_at = now + self.sim_plan.procs[pi].icd;
+        match self.sim_plan.procs[pi].effect {
+            ProcEffect::ApplyBuff(bi) => self.apply_buff(bi)?,
+            ProcEffect::CastAction(ai) => self.free_cast(ai)?,
+        }
+        Ok(())
+    }
+
     /// A proc-triggered free cast: gains + damage only, no cost/cooldown,
-    /// no further proc rolls (avoids reentrancy). Conservative and
-    /// UNTESTED — no fixture in this task exercises `ProcEffect::CastAction`;
-    /// tightening this is a P6d concern once a config needs it.
+    /// no further proc rolls (avoids reentrancy) — same scope in EV and MC
+    /// mode alike: damage is ALWAYS `eval_action_damage` (EV/branch-blended),
+    /// even when the firing proc itself came from a MC roll. This is a
+    /// DELIBERATE v1 scope limit, not an oversight: no fixture in this
+    /// crate yet drives a proc-triggered free cast under `Mode::MonteCarlo`,
+    /// so sampling its damage (and feeding ITS crit back into further
+    /// `on_crit` procs) is future work once a config actually needs it —
+    /// tightening this later is additive, not a breaking change.
     fn free_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
         self.apply_gain(action, now);
@@ -1074,6 +1485,11 @@ impl<'a> Sim<'a> {
             condition_uptime,
             resources,
             proc_counts,
+            // A single `Sim::run` (one seed, one timeline) has no
+            // distribution to report — `run_monte_carlo` builds its OWN
+            // `SimReport` from `iterations` of these raw reports rather
+            // than reusing this method (see that function).
+            distribution: None,
         }
     }
 }
@@ -1686,5 +2102,493 @@ mod tests {
             report.total.total_damage
         );
         assert!(close(report.total.duration, 20.0));
+    }
+
+    // ------------------------------------------------------------------
+    // A minimal SimDef shared by the P6d proc/MC fixtures below: a bare
+    // one-stat plan (`hit = dmg`, no branching), a spammable 1s-cast
+    // `filler` action, and one `apply_buff` proc slot the caller fills in
+    // with its own trigger/chance/icd — every fixture below only differs
+    // in that proc's config, so the CADENCE (one hit per second, hit N
+    // completing at t=N) is identical and hand-worked once, here.
+    // ------------------------------------------------------------------
+    fn minimal_plan() -> Plan {
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["dmg"],
+                 "pipeline": [ { "name": "hit", "expr": "dmg" } ],
+                 "objectives": ["hit"] }"#,
+        )
+        .unwrap();
+        plan::compile(&def).unwrap()
+    }
+
+    fn minimal_build() -> BuildState {
+        serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap()
+    }
+
+    fn filler_simdef(proc: ProcDef) -> SimDef {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "filler".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let mut buffs = BTreeMap::new();
+        buffs.insert(
+            "proc_buff".to_string(),
+            BuffDef {
+                duration: 0.5,
+                contributions: Vec::new(),
+                conditions: BTreeMap::new(),
+                tick_objective: None,
+            },
+        );
+        let mut procs = BTreeMap::new();
+        procs.insert("spark".to_string(), proc);
+        SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs,
+            procs,
+            damage_objective: "hit".into(),
+        }
+    }
+
+    fn filler_rotation() -> Rotation {
+        Rotation {
+            rules: vec![Rule {
+                action: "filler".into(),
+                when: None,
+            }],
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // EV accumulator, ICD 0: chance 0.3/hit, 1 hit/s, 10 hits. Hand-worked
+    // (acc starts 0, `-=1.0` on every crossing, `>=1.0` fires):
+    //   hit1 .3  hit2 .6  hit3 .9  hit4 1.2→FIRE(.2)  hit5 .5  hit6 .8
+    //   hit7 1.1→FIRE(.1)  hit8 .4  hit9 .7  hit10 1.0→FIRE(.0)
+    // Exactly 3 fires, at hits 4, 7, 10.
+    // ------------------------------------------------------------------
+    #[test]
+    fn ev_accumulator_fractional_chance_fires_at_hand_worked_hit_indices() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+        let simdef = filler_simdef(ProcDef {
+            trigger: Trigger::OnHit,
+            chance: "0.3".into(),
+            icd: 0.0,
+            apply_buff: Some("proc_buff".into()),
+            cast_action: None,
+        });
+        let sim_plan = sim_compile(&plan, &simdef, &filler_rotation()).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["filler"].casts, 10);
+        assert_eq!(
+            report.proc_counts["spark"], 3,
+            "got {:?}",
+            report.proc_counts
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EV accumulator, ICD gating with a DEFERRED fire: same chance
+    // (0.3/hit) and cadence (1 hit/s) as above, icd = 4.0 (the task's
+    // illustrative 2.5 turns out to never actually bind at this cadence —
+    // the natural gap between consecutive crossings here is 3.0s, and
+    // 2.5 < 3.0 lets every crossing fire immediately, which is a no-op
+    // test of ICD gating; 4.0 is chosen specifically because it's large
+    // enough to force exactly one deferred fire, which is the behavior
+    // this pin exists to prove). Hand-worked with THIS module's documented
+    // semantics (accumulation continues through an ICD; a crossing during
+    // ICD queues ONE deferred fire, resolved — and `acc` decremented —
+    // at the next qualifying roll at/after the ICD clears):
+    //   hit1 .3  hit2 .6  hit3 .9
+    //   hit4 1.2 → FIRE now=4>=icd_ready(0) → acc=.2, icd_ready=8
+    //   hit5 .5  hit6 .8
+    //   hit7 1.1 → CROSSES but now=7<icd_ready(8) → DEFERRED (acc stays 1.1)
+    //   hit8: first resolve the deferred fire (now=8>=icd_ready(8)) →
+    //         FIRE, acc=1.1−1.0=.1, icd_ready=12 ; then accumulate hit8's
+    //         own .3 → acc=.4 (no new crossing)
+    //   hit9 .7
+    //   hit10 1.0 → CROSSES but now=10<icd_ready(12) → deferred again,
+    //         never resolved (sim ends at duration=10, no hit after it)
+    // Exactly 2 REALIZED fires (hit4, hit8's resolution of hit7's cross).
+    //
+    // The fire COUNT alone (2) is not enough to pin "fires exactly at
+    // hit8, not hit10" — a WRONG semantic that instead "pauses
+    // accumulation during ICD" (rather than continuing it) also happens
+    // to land 2 fires here, just at hits 4 and 10 instead of 4 and 8
+    // (mutation-verified — see this task's commit). `proc_buff`'s
+    // duration (0.5s) makes the TIMING observable: applied at t=8, its
+    // active window [8, 8.5) is entirely inside `duration=10` and counts
+    // in full; applied at t=10 (== `duration`) instead, its window
+    // [10, 10.5) is entirely AFTER the sim ends, so `finalize` credits it
+    // ZERO active seconds. Two full 0.5s windows (t=4, t=8) → uptime
+    // (0.5+0.5)/10 = 0.1; the wrong-timing variant would read 0.05.
+    // ------------------------------------------------------------------
+    #[test]
+    fn ev_accumulator_deferred_fire_during_icd_is_hand_worked() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+        let simdef = filler_simdef(ProcDef {
+            trigger: Trigger::OnHit,
+            chance: "0.3".into(),
+            icd: 4.0,
+            apply_buff: Some("proc_buff".into()),
+            cast_action: None,
+        });
+        let sim_plan = sim_compile(&plan, &simdef, &filler_rotation()).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["filler"].casts, 10);
+        assert_eq!(
+            report.proc_counts["spark"], 2,
+            "got {:?} — icd must defer, not drop, the hit-7 crossing",
+            report.proc_counts
+        );
+        assert!(
+            close(report.buff_uptime["proc_buff"], 0.1),
+            "got {} — the deferred fire must land at hit8 (t=8), not hit10 \
+             (t=10, which would truncate its 0.5s window to zero inside \
+             `duration=10`)",
+            report.buff_uptime["proc_buff"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EV `on_crit` weighting: `toy_plan`'s "crit" event at crit_chance=25
+    // (0.25 probability). A crit-triggered proc at chance 1.0/icd 0.0
+    // therefore accumulates 1.0×0.25 = 0.25 per hit (the EV-consistent
+    // choice this task pins — see `roll_procs_ev`'s doc comment).
+    // 10 hits (same 1s cadence as the keystone test): acc = i×0.25,
+    // crossing exactly at hit 4 (1.0) and hit 8 (2.0) — both exact in
+    // binary (0.25 = 2⁻²) so there is no floating-point ambiguity about
+    // which hit crosses. Exactly 2 fires.
+    // ------------------------------------------------------------------
+    #[test]
+    fn ev_on_crit_weights_by_crit_probability() {
+        let plan = toy_plan();
+        let build = toy_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "spam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let mut buffs = BTreeMap::new();
+        buffs.insert(
+            "proc_buff".to_string(),
+            BuffDef {
+                duration: 0.5,
+                contributions: Vec::new(),
+                conditions: BTreeMap::new(),
+                tick_objective: None,
+            },
+        );
+        let mut procs = BTreeMap::new();
+        procs.insert(
+            "crit_proc".to_string(),
+            ProcDef {
+                trigger: Trigger::OnCrit,
+                chance: "1".into(),
+                icd: 0.0,
+                apply_buff: Some("proc_buff".into()),
+                cast_action: None,
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs,
+            procs,
+            damage_objective: "dps".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "spam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["spam"].casts, 10);
+        assert_eq!(
+            report.proc_counts["crit_proc"], 2,
+            "got {:?}",
+            report.proc_counts
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `ProcEffect::CastAction`: an `on_cast` proc (chance 1, icd 0) fires
+    // a free "nuke" cast (instant, no cost/cooldown) on every one of
+    // "trigger"'s 5 casts (1s cast time, 5s scenario → completions at
+    // t=1..5). `free_cast`'s documented scope: gains + damage only, no
+    // cost/cooldown paid, no further proc rolls. nuke's damage is the
+    // bare `dmg=100` stat (minimal_plan's `hit = dmg`), hits_per_use
+    // defaulting to 1 — so nuke's total damage = 5 × 100 = 500.
+    // ------------------------------------------------------------------
+    #[test]
+    fn proc_effect_cast_action_fires_a_free_instant_cast() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 5 } ] }"#).unwrap();
+
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "trigger".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: None,
+            },
+        );
+        actions.insert(
+            "nuke".to_string(),
+            ActionDef {
+                cast_time: "0".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let mut procs = BTreeMap::new();
+        procs.insert(
+            "free_nuke".to_string(),
+            ProcDef {
+                trigger: Trigger::OnCast,
+                chance: "1".into(),
+                icd: 0.0,
+                apply_buff: None,
+                cast_action: Some("nuke".into()),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs,
+            damage_objective: "hit".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "trigger".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["trigger"].casts, 5);
+        assert_eq!(report.actions["nuke"].casts, 5);
+        assert!(
+            close(report.actions["nuke"].damage, 500.0),
+            "got {}",
+            report.actions["nuke"].damage
+        );
+        assert_eq!(report.proc_counts["free_nuke"], 5);
+    }
+
+    // ------------------------------------------------------------------
+    // Monte Carlo determinism: the SAME seed, run twice, must produce a
+    // BYTE-IDENTICAL serialized `SimReport` — the whole reproducibility
+    // contract `Mode::MonteCarlo` exists to provide.
+    // ------------------------------------------------------------------
+    #[test]
+    fn monte_carlo_same_seed_twice_is_byte_identical() {
+        let plan = toy_plan();
+        let build = toy_build();
+        let scenario: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "arena", "weight": 10,
+                   "uptimes": { "enraged": 0.5 },
+                   "stats": { "enemy_dr": 20.0 } } ] }"#,
+        )
+        .unwrap();
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "spam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "dps".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "spam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let mode = Mode::MonteCarlo {
+            iterations: 50,
+            seed: 20260722,
+        };
+
+        let a = run(&plan, &sim_plan, &build, &scenario, mode).unwrap();
+        let b = run(&plan, &sim_plan, &build, &scenario, mode).unwrap();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EV-vs-MC convergence, crit-only (no procs): the same keystone
+    // fixture as `keystone_matches_level_1_exactly` (dps 282.15), run
+    // under `Mode::MonteCarlo` with N=10_000 at a fixed seed. Statistical
+    // assertion (not exact): relative error under 2%.
+    // ------------------------------------------------------------------
+    #[test]
+    fn monte_carlo_converges_to_ev_on_crit_only_case() {
+        let plan = toy_plan();
+        let build = toy_build();
+        let scenario: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "arena", "weight": 10,
+                   "uptimes": { "enraged": 0.5 },
+                   "stats": { "enemy_dr": 20.0 } } ] }"#,
+        )
+        .unwrap();
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "spam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: 0.0,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "dps".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "spam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+        let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        assert!(close(ev.total.dps, 282.15), "got {}", ev.total.dps);
+
+        let mc = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            Mode::MonteCarlo {
+                iterations: 10_000,
+                seed: 42,
+            },
+        )
+        .unwrap();
+        let dist = mc.distribution.expect("MC mode always sets distribution");
+        let rel_err = (dist.mean - ev.total.dps).abs() / ev.total.dps;
+        assert!(
+            rel_err < 0.02,
+            "mc mean {} vs ev dps {}, relative error {rel_err}",
+            dist.mean,
+            ev.total.dps
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EV-vs-MC convergence, procs: the fractional-chance accumulator
+    // fixture (chance 0.3/hit, icd 0, EV fire count 3) run under MC at
+    // N=2_000, fixed seed. Loose statistical bound (15%) — MC's proc
+    // count is a Binomial(10, 0.3)-per-iteration draw pooled/rounded
+    // across N iterations, not expected to match the EV accumulator's
+    // exact integer count, only to be IN THE NEIGHBORHOOD of it.
+    // ------------------------------------------------------------------
+    #[test]
+    fn monte_carlo_proc_count_is_near_ev_accumulator_count() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+        let simdef = filler_simdef(ProcDef {
+            trigger: Trigger::OnHit,
+            chance: "0.3".into(),
+            icd: 0.0,
+            apply_buff: Some("proc_buff".into()),
+            cast_action: None,
+        });
+        let sim_plan = sim_compile(&plan, &simdef, &filler_rotation()).unwrap();
+
+        let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        let ev_count = ev.proc_counts["spark"];
+        assert_eq!(ev_count, 3);
+
+        let mc = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            Mode::MonteCarlo {
+                iterations: 2_000,
+                seed: 7,
+            },
+        )
+        .unwrap();
+        let mc_count = mc.proc_counts["spark"] as f64;
+        let rel_err = (mc_count - ev_count as f64).abs() / ev_count as f64;
+        assert!(
+            rel_err < 0.15,
+            "mc mean proc count {mc_count} vs ev count {ev_count}, relative error {rel_err}"
+        );
     }
 }

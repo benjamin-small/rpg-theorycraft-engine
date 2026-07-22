@@ -31,10 +31,74 @@ pub struct SimReport {
     /// time spent pinned at cap (regen wasted because the pool was full),
     /// keyed by resource name.
     pub resources: BTreeMap<String, ResourceReport>,
-    /// Proc fire counts, keyed by proc name (the EV accumulator method —
-    /// see `sim::exec` module docs). Dedicated fire-index/fractional-chance
-    /// pins and Monte Carlo's exact-roll variant land in P6d.
+    /// Proc fire counts, keyed by proc name — the EV accumulator method's
+    /// fire count in `Mode::Expected`; the MEAN (rounded to the nearest
+    /// whole fire) across iterations in `Mode::MonteCarlo` (see
+    /// `sim::exec` module docs).
     pub proc_counts: BTreeMap<String, u64>,
+    /// `Some` only in `Mode::MonteCarlo`: the distribution of per-iteration
+    /// `dps` across every iteration (`None` in `Mode::Expected`, which
+    /// runs exactly once and has no distribution to report).
+    pub distribution: Option<Distribution>,
+}
+
+/// Monte Carlo's summary of one run's per-iteration `dps` samples: mean,
+/// population standard deviation, and three percentiles. Percentiles use
+/// the NEAREST-RANK estimator (no interpolation between order statistics —
+/// `rank = ceil(p/100 * n)`, 1-indexed, clamped into `[1, n]`): simple,
+/// deterministic, and exact on the sorted sample itself (no rounding
+/// choice needed for GAME numbers, which is the point). `std` is the
+/// POPULATION standard deviation (divides by `n`, not `n - 1`) — every
+/// sample IS the full population this report describes (there is no
+/// larger population `n` is estimating from), so the Bessel correction
+/// (which exists to de-bias a SAMPLE drawn from a larger population) does
+/// not apply here.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Distribution {
+    /// Arithmetic mean of every iteration's `dps`.
+    pub mean: f64,
+    /// Population standard deviation of every iteration's `dps`.
+    pub std: f64,
+    /// 10th percentile `dps` (nearest-rank estimator).
+    pub p10: f64,
+    /// 50th percentile `dps` (nearest-rank estimator; the median).
+    pub p50: f64,
+    /// 90th percentile `dps` (nearest-rank estimator).
+    pub p90: f64,
+}
+
+impl Distribution {
+    /// Summarize `samples` (one `dps` value per Monte Carlo iteration).
+    /// pub(crate): `sim::exec` is the only caller — a `SimReport`'s
+    /// `distribution` is only ever built from a real MC run's samples.
+    pub(crate) fn from_samples(samples: &[f64]) -> Self {
+        let n = samples.len();
+        assert!(
+            n > 0,
+            "Distribution::from_samples requires at least one sample"
+        );
+        let mean = samples.iter().sum::<f64>() / n as f64;
+        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let std = variance.sqrt();
+        let mut sorted: Vec<f64> = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("dps samples are finite"));
+        Distribution {
+            mean,
+            std,
+            p10: percentile(&sorted, 10.0),
+            p50: percentile(&sorted, 50.0),
+            p90: percentile(&sorted, 90.0),
+        }
+    }
+}
+
+/// Nearest-rank percentile of an already-SORTED-ascending slice — see
+/// [`Distribution`]'s docs for why this estimator (no interpolation).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    let rank = ((p / 100.0) * n as f64).ceil() as i64; // 1-indexed
+    let idx = rank.clamp(1, n as i64) - 1;
+    sorted[idx as usize]
 }
 
 /// One scenario phase's damage/dps totals.

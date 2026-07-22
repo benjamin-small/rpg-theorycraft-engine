@@ -6,6 +6,7 @@
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
 use crate::gamedef::{FoldKind, GameDef};
+use crate::rng::Pcg32;
 use crate::scenario::{Phase, Scenario};
 
 /// Hard cap on events: 2^8 = 256 branches per branched stage.
@@ -349,6 +350,25 @@ pub struct EvalScratch {
     stat_base: Vec<f64>,
 }
 
+/// How [`Plan::eval_phase`] resolves each `branched` stage — the ONE
+/// parameterization point `evaluate`/`explain`/`evaluate_phase`/
+/// `evaluate_phase_sampled` all share (never a forked copy of the engine;
+/// see the design spec's "same internal run/eval path parameterized"
+/// wording for `evaluate_sampled`).
+enum EvalKind<'a> {
+    /// The hot path: full branch enumeration, probability-weighted EV, no
+    /// tracing. What `evaluate`/`evaluate_phase` use.
+    Hot,
+    /// Full branch enumeration (same math as `Hot`) PLUS per-phase/
+    /// per-branch `PhaseTrace`/`BranchTrace` collection. What `explain`
+    /// uses.
+    Trace,
+    /// Monte Carlo: each `branched` stage samples exactly ONE mask via an
+    /// independent Bernoulli draw per event against `rng`, instead of
+    /// enumerating every mask. What `evaluate_phase_sampled` uses.
+    Sample(&'a mut Pcg32),
+}
+
 impl Plan {
     /// Allocate scratch buffers sized to THIS plan's slot layout. The
     /// result must only be passed to `evaluate` on this same `Plan` —
@@ -516,7 +536,13 @@ impl Plan {
 
         for phase in &scenario.phases {
             let w = phase.weight / weight_sum;
-            if let Some(pt) = self.eval_phase(build, phase, w, scratch, trace.is_some())? {
+            let kind = if trace.is_some() {
+                EvalKind::Trace
+            } else {
+                EvalKind::Hot
+            };
+            let (pt, _fired_mask) = self.eval_phase(build, phase, w, scratch, kind)?;
+            if let Some(pt) = pt {
                 trace
                     .as_mut()
                     .expect("phase_trace is Some only when trace is Some")
@@ -532,17 +558,24 @@ impl Plan {
     /// `scratch.objectives` per objective — the per-phase body shared by
     /// `run`'s scenario loop (`w` = that phase's normalized weight,
     /// `stat_base`/contributions resolved ONCE by the caller for the whole
-    /// scenario) and [`Plan::evaluate_phase`] (`w = 1.0`, resolved fresh
-    /// per call — see that method's docs). Returns the built `PhaseTrace`
-    /// when `want_trace` is set, else `None` (no allocation).
+    /// scenario) and [`Plan::evaluate_phase`]/[`Plan::evaluate_phase_sampled`]
+    /// (`w = 1.0`, resolved fresh per call — see those methods' docs).
+    /// `kind` picks how each `branched` stage resolves (see [`EvalKind`]).
+    /// Returns the built `PhaseTrace` when `kind` is [`EvalKind::Trace`]
+    /// (else `None`, no allocation) PLUS the union, over every `branched`
+    /// stage in this phase, of [`EvalKind::Sample`]'s per-stage sampled
+    /// fired-event mask (`0` for `Hot`/`Trace`, which don't sample) — see
+    /// [`Plan::evaluate_phase_sampled`]'s docs for why a union and not
+    /// "the last stage's mask".
     fn eval_phase(
         &self,
         build: &BuildState,
         phase: &Phase,
         w: f64,
         scratch: &mut EvalScratch,
-        want_trace: bool,
-    ) -> Result<Option<PhaseTrace>, PlanError> {
+        mut kind: EvalKind<'_>,
+    ) -> Result<(Option<PhaseTrace>, u32), PlanError> {
+        let want_trace = matches!(kind, EvalKind::Trace);
         let mut phase_trace: Option<PhaseTrace> = want_trace.then(|| PhaseTrace {
             name: phase.name.clone(),
             weight: w,
@@ -551,40 +584,18 @@ impl Plan {
             stages: Vec::new(),
             branches: Vec::new(),
         });
+        let mut fired_mask_union: u32 = 0;
 
-        // Stats: build values + phase overrides.
+        // Stats/conditions/base-bucket prefix — shared with `crit_chance`.
+        self.fill_prefix_slots(build, phase, scratch)?;
+
         let n_stats = self.n_stats;
-        scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
-        for (name, v) in &phase.stats {
-            let i = self.stat_id(name).ok_or_else(|| PlanError {
-                what: format!("unknown stat `{name}`"),
-            })?;
-            scratch.slots[i] = *v;
-        }
-
-        // Conditions: expression-readable uptime slots, fail-closed
-        // (missing uptime = 0.0), clamped into [0, 1].
-        for (ci, name) in self.condition_names.iter().enumerate() {
-            scratch.slots[n_stats + ci] = phase
-                .uptimes
-                .get(name)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
-        }
         let bucket_base = n_stats + self.n_conditions;
         if let Some(pt) = phase_trace.as_mut() {
             for (ci, name) in self.condition_names.iter().enumerate() {
                 pt.conditions
                     .push((name.clone(), scratch.slots[n_stats + ci]));
             }
-        }
-
-        // Base bucket raw sums/products: event-gated contribs EXCLUDED,
-        // condition-tagged scaled by uptime (missing = 0 — fail-closed).
-        self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
-        self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
-        if let Some(pt) = phase_trace.as_mut() {
             for (bi, name) in self.bucket_names.iter().enumerate() {
                 pt.buckets
                     .push((name.clone(), scratch.slots[bucket_base + bi]));
@@ -598,58 +609,63 @@ impl Plan {
                 scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
                 continue;
             }
-            // Branch enumeration over 2^n events. Chances depend only on
-            // PHASE slots (not on the branch), so evaluate each event's
-            // chance once per stage rather than once per mask.
+            // Chances depend only on PHASE slots (not on the branch), so
+            // evaluate each event's chance once per stage rather than once
+            // per mask/sample.
             let n_ev = self.events.len();
             let mut chances = [0.0f64; MAX_EVENTS];
             for (ei, ev) in self.events.iter().enumerate() {
                 chances[ei] = ev.chance.eval(&scratch.slots).clamp(0.0, 1.0);
             }
-            let mut ev_acc = 0.0;
-            for mask in 0u32..(1 << n_ev) {
-                // Weight = Π fired ? p : 1-p.
-                let mut weight = 1.0;
-                for (ei, &p) in chances.iter().enumerate().take(n_ev) {
-                    weight *= if mask & (1 << ei) != 0 { p } else { 1.0 - p };
-                }
-                if weight == 0.0 {
-                    continue;
-                }
-                // Branch slots: buckets recomputed with fired-event
-                // contributions included; event_factors = Π factors.
-                scratch.branch_slots.copy_from_slice(&scratch.slots);
-                self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
-                self.write_bucket_slots(
-                    &scratch.branch_bucket_raw,
-                    bucket_base,
-                    &mut scratch.branch_slots,
-                );
-                let mut factors = 1.0;
-                for (ei, ev) in self.events.iter().enumerate() {
-                    if mask & (1 << ei) != 0 {
-                        factors *= ev.factor.eval(&scratch.branch_slots);
+
+            match &mut kind {
+                EvalKind::Sample(rng) => {
+                    // Monte Carlo: ONE mask, sampled by an independent
+                    // Bernoulli draw per event — the branch this hit
+                    // actually rolled, not a probability blend.
+                    let mut mask = 0u32;
+                    for (ei, &p) in chances.iter().enumerate().take(n_ev) {
+                        if rng.next_f64() < p {
+                            mask |= 1 << ei;
+                        }
                     }
+                    let (value, _factors) =
+                        self.eval_branch(build, phase, mask, bucket_base, stage, scratch)?;
+                    scratch.slots[out_slot] = value;
+                    fired_mask_union |= mask;
                 }
-                let ef_slot = bucket_base + self.n_buckets + self.n_stages;
-                scratch.branch_slots[ef_slot] = factors;
-                let branch_value = stage.program.eval(&scratch.branch_slots);
-                ev_acc += weight * branch_value;
-                if let Some(pt) = phase_trace.as_mut() {
-                    let fired: Vec<String> = (0..n_ev)
-                        .filter(|&ei| mask & (1 << ei) != 0)
-                        .map(|ei| self.event_names[ei].clone())
-                        .collect();
-                    pt.branches.push(BranchTrace {
-                        stage: stage.name.clone(),
-                        fired,
-                        weight,
-                        event_factors: factors,
-                        value: branch_value,
-                    });
+                EvalKind::Hot | EvalKind::Trace => {
+                    // EV: full 2^n branch enumeration, probability-weighted.
+                    let mut ev_acc = 0.0;
+                    for mask in 0u32..(1 << n_ev) {
+                        // Weight = Π fired ? p : 1-p.
+                        let mut weight = 1.0;
+                        for (ei, &p) in chances.iter().enumerate().take(n_ev) {
+                            weight *= if mask & (1 << ei) != 0 { p } else { 1.0 - p };
+                        }
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        let (branch_value, factors) =
+                            self.eval_branch(build, phase, mask, bucket_base, stage, scratch)?;
+                        ev_acc += weight * branch_value;
+                        if let Some(pt) = phase_trace.as_mut() {
+                            let fired: Vec<String> = (0..n_ev)
+                                .filter(|&ei| mask & (1 << ei) != 0)
+                                .map(|ei| self.event_names[ei].clone())
+                                .collect();
+                            pt.branches.push(BranchTrace {
+                                stage: stage.name.clone(),
+                                fired,
+                                weight,
+                                event_factors: factors,
+                                value: branch_value,
+                            });
+                        }
+                    }
+                    scratch.slots[out_slot] = ev_acc;
                 }
             }
-            scratch.slots[out_slot] = ev_acc;
         }
         if let Some(pt) = phase_trace.as_mut() {
             for (si, stage) in self.stages.iter().enumerate() {
@@ -664,30 +680,93 @@ impl Plan {
             scratch.objectives[oi] += w * scratch.slots[bucket_base + self.n_buckets + si];
         }
 
-        Ok(phase_trace)
+        Ok((phase_trace, fired_mask_union))
     }
 
-    /// pub(crate): evaluate a SINGLE phase directly, weight `1.0`, no
-    /// scenario-level blending — for `sim::exec`'s per-cast/per-tick
-    /// evaluations, which construct a synthetic one-phase view of the
-    /// CURRENT sim phase (current phase's stats/uptimes, with buff-driven
-    /// condition overrides folded in — see `sim::exec` module docs) and
-    /// would otherwise need to allocate a throwaway single-phase
-    /// `Scenario` on every cast just to reuse `evaluate`. Unlike
-    /// `evaluate`, there is no scenario to validate (non-empty phases,
-    /// weight-sum > 0) — only this one phase's own uptime keys/finiteness
-    /// are checked (its `weight` field is ignored; `w` is fixed at `1.0`).
-    /// Resolves `build`'s stat base and validates its contributions fresh
-    /// on every call (unlike `evaluate`, which does this once for a whole
-    /// multi-phase scenario) — the sim passes a DIFFERENT build each call
-    /// (base + active buffs' contributions + this cast's stat overrides),
-    /// so there is nothing to cache across calls in v1.
-    pub(crate) fn evaluate_phase<'s>(
+    /// Fill `scratch.slots[0 .. bucket_base + n_buckets]` from
+    /// `scratch.stat_base` (already resolved by the caller) and `phase`:
+    /// stats (base + phase override), conditions (phase uptime, clamped),
+    /// and BASE bucket raw folds (event-gated contributions excluded — see
+    /// [`Plan::fold_buckets`]) written into bucket slots. This is the exact
+    /// prefix [`Plan::eval_phase`] then evaluates stages/branches on top
+    /// of, and the exact prefix a branched stage's own `chance`
+    /// expressions read — shared with [`Plan::crit_chance`], which reads
+    /// no further than this.
+    fn fill_prefix_slots(
         &self,
         build: &BuildState,
         phase: &Phase,
-        scratch: &'s mut EvalScratch,
-    ) -> Result<&'s [f64], PlanError> {
+        scratch: &mut EvalScratch,
+    ) -> Result<(), PlanError> {
+        let n_stats = self.n_stats;
+        scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
+        for (name, v) in &phase.stats {
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
+            scratch.slots[i] = *v;
+        }
+        for (ci, name) in self.condition_names.iter().enumerate() {
+            scratch.slots[n_stats + ci] = phase
+                .uptimes
+                .get(name)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+        }
+        let bucket_base = n_stats + self.n_conditions;
+        self.fold_buckets(build, phase, None, &mut scratch.base_bucket_raw)?;
+        self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
+        Ok(())
+    }
+
+    /// Evaluate one branch (`mask`) of a `branched` stage into
+    /// `scratch.branch_slots`, leaving `scratch.slots` (the base prefix)
+    /// untouched: bucket refold with this mask's event-gated contributions
+    /// included, `event_factors` = Π fired events' factors, then the
+    /// stage's own expression. Returns `(value, event_factors)`. The ONE
+    /// per-branch computation both [`EvalKind`] strategies read from (full
+    /// enumeration and single-sample alike) — never forked.
+    fn eval_branch(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        mask: u32,
+        bucket_base: usize,
+        stage: &CompiledStage,
+        scratch: &mut EvalScratch,
+    ) -> Result<(f64, f64), PlanError> {
+        scratch.branch_slots.copy_from_slice(&scratch.slots);
+        self.fold_buckets(build, phase, Some(mask), &mut scratch.branch_bucket_raw)?;
+        self.write_bucket_slots(
+            &scratch.branch_bucket_raw,
+            bucket_base,
+            &mut scratch.branch_slots,
+        );
+        let mut factors = 1.0;
+        for (ei, ev) in self.events.iter().enumerate() {
+            if mask & (1 << ei) != 0 {
+                factors *= ev.factor.eval(&scratch.branch_slots);
+            }
+        }
+        let ef_slot = bucket_base + self.n_buckets + self.n_stages;
+        scratch.branch_slots[ef_slot] = factors;
+        let value = stage.program.eval(&scratch.branch_slots);
+        Ok((value, factors))
+    }
+
+    /// Shared by [`Plan::evaluate_phase`]/[`Plan::evaluate_phase_sampled`]/
+    /// [`Plan::crit_chance`]: validate `phase`'s own uptime keys/
+    /// finiteness (no scenario to check — see `evaluate_phase`'s docs),
+    /// resolve `build`'s stat base fresh into `scratch.stat_base`, and
+    /// validate its contribution tags. Never touches `scratch.objectives`
+    /// — callers that report objectives zero it themselves.
+    fn validate_and_resolve_build_for_phase(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        scratch: &mut EvalScratch,
+    ) -> Result<(), PlanError> {
         for (cond, v) in &phase.uptimes {
             if !self.condition_names.iter().any(|n| n == cond) {
                 return Err(PlanError {
@@ -737,13 +816,111 @@ impl Plan {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// pub(crate): evaluate a SINGLE phase directly, weight `1.0`, no
+    /// scenario-level blending — for `sim::exec`'s per-cast/per-tick
+    /// evaluations, which construct a synthetic one-phase view of the
+    /// CURRENT sim phase (current phase's stats/uptimes, with buff-driven
+    /// condition overrides folded in — see `sim::exec` module docs) and
+    /// would otherwise need to allocate a throwaway single-phase
+    /// `Scenario` on every cast just to reuse `evaluate`. Unlike
+    /// `evaluate`, there is no scenario to validate (non-empty phases,
+    /// weight-sum > 0) — only this one phase's own uptime keys/finiteness
+    /// are checked (its `weight` field is ignored; `w` is fixed at `1.0`).
+    /// Resolves `build`'s stat base and validates its contributions fresh
+    /// on every call (unlike `evaluate`, which does this once for a whole
+    /// multi-phase scenario) — the sim passes a DIFFERENT build each call
+    /// (base + active buffs' contributions + this cast's stat overrides),
+    /// so there is nothing to cache across calls in v1.
+    pub(crate) fn evaluate_phase<'s>(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        scratch: &'s mut EvalScratch,
+    ) -> Result<&'s [f64], PlanError> {
+        self.validate_and_resolve_build_for_phase(build, phase, scratch)?;
         for o in scratch.objectives.iter_mut() {
             *o = 0.0;
         }
-
-        self.eval_phase(build, phase, 1.0, scratch, false)?;
+        self.eval_phase(build, phase, 1.0, scratch, EvalKind::Hot)?;
         Ok(&scratch.objectives)
+    }
+
+    /// pub(crate): the Monte Carlo counterpart of [`Plan::evaluate_phase`]
+    /// — the SAME engine (`eval_phase` with [`EvalKind::Sample`] instead of
+    /// [`EvalKind::Hot`]), so every `branched` stage samples ONE mask
+    /// (independent Bernoulli draw per event, via `rng`) instead of
+    /// enumerating every mask and blending by probability. Returns the
+    /// objective slice (as `evaluate_phase` does) PLUS the union, over
+    /// every `branched` stage this phase's pipeline has, of that stage's
+    /// own sampled fired-event mask (bit `i` set ⇒ event `i` fired on AT
+    /// LEAST ONE branched stage). Every `GameDef` in this crate (toy and
+    /// D4 alike) has exactly one branched stage, so "union" and "that one
+    /// stage's own mask" coincide today; a future multi-branched-stage
+    /// `GameDef` would need this documented — a union is the conservative
+    /// v1 choice (an event counts as "fired this hit" if it fired
+    /// ANYWHERE in the pipeline), rather than picking one stage's mask
+    /// arbitrarily and silently dropping information a caller like
+    /// `sim::exec`'s `on_crit` proc trigger might need from a different
+    /// stage.
+    pub(crate) fn evaluate_phase_sampled<'s>(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        rng: &mut Pcg32,
+        scratch: &'s mut EvalScratch,
+    ) -> Result<(&'s [f64], u32), PlanError> {
+        self.validate_and_resolve_build_for_phase(build, phase, scratch)?;
+        for o in scratch.objectives.iter_mut() {
+            *o = 0.0;
+        }
+        let (_, fired_mask) = self.eval_phase(build, phase, 1.0, scratch, EvalKind::Sample(rng))?;
+        Ok((&scratch.objectives, fired_mask))
+    }
+
+    /// pub(crate): the probability the event literally named `"crit"`
+    /// fires for one hit against `phase`, evaluated against the exact
+    /// STAT/CONDITION/base-BUCKET prefix a branched stage's own event
+    /// `chance` expressions read (see [`Plan::fill_prefix_slots`]).
+    /// Returns `0.0` if this Plan defines no event named `"crit"` (no crit
+    /// concept in this game — fail-soft, not fail-closed, since "no crit"
+    /// is a legitimate game shape, not a config error).
+    ///
+    /// `sim::exec`'s EV executor binds its `on_crit` proc trigger to this
+    /// specific literal event name — the design spec is silent on how a
+    /// generic engine should recognize "the crit event" out of an
+    /// arbitrary user-named event registry, and every `GameDef` fixture/
+    /// example in this crate already calls its crit event `"crit"` (see
+    /// `plan.rs`'s own `toy_def`, `search.rs`, `gamedef.rs`,
+    /// `sim::exec`'s own toy fixtures, and the `diablo4_basics`/
+    /// `your_own_game` examples) — a documented v1 convention, not a
+    /// silent guess.
+    pub(crate) fn crit_chance(
+        &self,
+        build: &BuildState,
+        phase: &Phase,
+        scratch: &mut EvalScratch,
+    ) -> Result<f64, PlanError> {
+        let Some(ei) = self.event_names.iter().position(|n| n == "crit") else {
+            return Ok(0.0);
+        };
+        self.validate_and_resolve_build_for_phase(build, phase, scratch)?;
+        self.fill_prefix_slots(build, phase, scratch)?;
+        Ok(self.events[ei].chance.eval(&scratch.slots).clamp(0.0, 1.0))
+    }
+
+    /// pub(crate): whether the bit for the event named `"crit"` is set in
+    /// an [`Plan::evaluate_phase_sampled`] fired-mask — `false` if this
+    /// Plan has no such event (mirrors [`Plan::crit_chance`]'s "no crit
+    /// concept" fallback; see that method's docs for the naming
+    /// convention this rests on).
+    pub(crate) fn is_crit_bit_set(&self, mask: u32) -> bool {
+        self.event_names
+            .iter()
+            .position(|n| n == "crit")
+            .is_some_and(|i| mask & (1 << i) != 0)
     }
 
     /// pub(crate): fill `out[0 .. n_stats + n_conditions]` with this
@@ -1356,6 +1533,89 @@ mod tests {
             ex.phases[0].branches.is_empty(),
             "got {:?}",
             ex.phases[0].branches
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // evaluate_phase_sampled: at chance 1.0 (crit_chance clamped to 100),
+    // the "crit" event is certain, so the single sampled branch must be
+    // EXACTLY the crit branch's own value (668.25 pre-dr, hand-worked in
+    // `toy_game_hand_worked_single_phase`'s doc comment) — dps = ×0.8 =
+    // 534.6 — and the fired mask must have bit 0 (the only event) set.
+    // ------------------------------------------------------------------
+    #[test]
+    fn evaluate_phase_sampled_at_chance_one_equals_crit_branch_exactly() {
+        let mut b = toy_build();
+        b.stats.insert("crit_chance".into(), 100.0); // clamps to 1.0
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let mut rng = crate::rng::Pcg32::new(1);
+        let phase = arena().phases[0].clone();
+        let (objs, mask) = plan
+            .evaluate_phase_sampled(&b, &phase, &mut rng, &mut scratch)
+            .unwrap();
+        assert!((objs[0] - 534.6).abs() < 1e-9, "got {}", objs[0]);
+        assert_eq!(mask, 1, "the sole event (\"crit\", bit 0) must be set");
+    }
+
+    // ------------------------------------------------------------------
+    // At chance 0.0, the "crit" event never fires — the single sampled
+    // branch must be EXACTLY the no-crit branch's value (247.5 pre-dr;
+    // dps = ×0.8 = 198.0), mask 0.
+    // ------------------------------------------------------------------
+    #[test]
+    fn evaluate_phase_sampled_at_chance_zero_equals_base_branch_exactly() {
+        let mut b = toy_build();
+        b.stats.insert("crit_chance".into(), 0.0);
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let mut rng = crate::rng::Pcg32::new(1);
+        let phase = arena().phases[0].clone();
+        let (objs, mask) = plan
+            .evaluate_phase_sampled(&b, &phase, &mut rng, &mut scratch)
+            .unwrap();
+        assert!((objs[0] - 198.0).abs() < 1e-9, "got {}", objs[0]);
+        assert_eq!(mask, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Statistical convergence: 10_000 independent samples (fixed seed) at
+    // the toy game's real 25% crit chance must average within 1% of
+    // `evaluate`'s own EV (282.15, the keystone pin) — this is a
+    // STATISTICAL assertion (not exact), documented as such; the 1%
+    // tolerance at N=10_000 against a two-branch Bernoulli mixture is
+    // comfortably wide (binomial std of the branch indicator at p=0.25,
+    // n=10_000 is ~0.0043, i.e. ~0.4% relative on the branch-selection
+    // frequency — 1% leaves ample margin against test flakiness while
+    // still catching a real wiring bug).
+    // ------------------------------------------------------------------
+    #[test]
+    fn evaluate_phase_sampled_ten_thousand_samples_converge_to_evaluate_ev() {
+        let plan = compile(&toy_def()).unwrap();
+        let build = toy_build();
+        let phase = arena().phases[0].clone();
+        let mut scratch = plan.scratch();
+
+        let mut sum = 0.0;
+        let mut rng = crate::rng::Pcg32::new(12345);
+        const N: u32 = 10_000;
+        for _ in 0..N {
+            let (objs, _mask) = plan
+                .evaluate_phase_sampled(&build, &phase, &mut rng, &mut scratch)
+                .unwrap();
+            sum += objs[0];
+        }
+        let mean = sum / f64::from(N);
+
+        let ev = 282.15; // the keystone pin, re-derived independently below.
+        let mut ev_scratch = plan.scratch();
+        let evaluated = plan.evaluate(&build, &arena(), &mut ev_scratch).unwrap()[0];
+        assert!((evaluated - ev).abs() < 1e-9, "got {evaluated}");
+
+        let rel_err = (mean - ev).abs() / ev;
+        assert!(
+            rel_err < 0.01,
+            "sampled mean {mean} vs EV {ev}, relative error {rel_err}"
         );
     }
 }
