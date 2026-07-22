@@ -163,6 +163,22 @@ optional later (names reserved by checking availability, not squatting).
 
 ## Done since
 
+- 2026-07-22 — P4c switchover complete in the consumer: `../diablo4-calc`
+  deleted its native `stats.rs`/`calc.rs` math; `calc::evaluate` is now a
+  Breakdown shim over `rtce_adapter` (D4-specific routing/gating/tagging)
+  plus a cached rtce `Plan` compiled from the committed `gamedef/`. All 7
+  archetype parity numbers reproduce unchanged through the shim (8,096.02 …
+  6,769.10); the consumer's full suite (120 tests/21 suites) is green. rtce
+  is now proven on **wasm32**, not just native: diablo4-calc's browser build
+  re-verified 8,096.02 with the vulnerable toggle at exactly ÷1.3800 running
+  through WASM → shim → rtce, with zero network calls — the first real
+  cross-target proof that the compiled-IR design (no JIT/codegen) holds on
+  a constrained target. What remains from the roadmap: `explain()`
+  (per-stage traces — spec'd, not yet built), P5 search module (Move,
+  batch pricing, top-K/Pareto), the docs/examples/CI maturation pass
+  (rustdoc, toy-game walkthrough, GitHub Actions), and crates.io
+  publication (`rtce`, `rtce-testkit`) once the post-P4c API is considered
+  stable.
 - 2026-07-21 — P1 complete: workspace (rtce + rtce-testkit), expression
   language end-to-end (lexer → parser → postfix Program → stack evaluator;
   min/max/clamp/floor; positioned fail-closed errors; compile-time symbol
