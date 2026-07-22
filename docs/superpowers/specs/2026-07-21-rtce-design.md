@@ -186,3 +186,6 @@ optional later (names reserved by checking availability, not squatting).
   diablo4-calc's T1–T10 reproduce through the generic engine, incl. the
   pinned 17,574.30 and variance bounds — mutation-proven on both the case
   and gamedef axes.
+- 2026-07-21 — P4 parity proof (in ../diablo4-calc): all 7 real archetype
+  builds bit-identical through the native engine and rtce via the committed
+  d4 gamedef + adapter. Maturation backlog staged in ROADMAP.md.
