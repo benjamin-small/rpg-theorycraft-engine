@@ -313,6 +313,27 @@ impl Plan {
             .map(|&i| self.stages[i].name.as_str())
             .collect()
     }
+
+    /// pub(crate): a condition's slot index within this plan's OWN unified
+    /// layout (`[stats | conditions | buckets | stages | event_factors]`),
+    /// or `None` if it isn't in this plan's condition registry. Mirrors
+    /// `stat_id`; `sim::compile` uses both to extend the flat namespace
+    /// without exposing the plan's internal layout publicly.
+    pub(crate) fn condition_id(&self, name: &str) -> Option<usize> {
+        self.condition_names
+            .iter()
+            .position(|c| c == name)
+            .map(|i| self.n_stats + i)
+    }
+
+    /// pub(crate): the total width of this plan's own unified slot array
+    /// (`n_stats + n_conditions + n_buckets + n_stages + 1` for
+    /// `event_factors`). `sim::compile` appends its own sim-state slots
+    /// immediately after this offset — see `sim` module docs for the
+    /// documented order.
+    pub(crate) fn own_slot_width(&self) -> usize {
+        self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1
+    }
 }
 
 /// Preallocated evaluation buffers — `evaluate` performs no heap allocation;

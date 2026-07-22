@@ -92,3 +92,5 @@ pub mod gamedef;
 pub mod plan;
 pub mod scenario;
 pub mod search;
+pub mod sim;
+pub mod simdef;
