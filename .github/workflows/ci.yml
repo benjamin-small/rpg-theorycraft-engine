@@ -36,7 +36,9 @@ jobs:
         run: cargo test --workspace
 
       - name: cargo run -p rtce --example your_own_game
+      - run: cargo run -p rtce --example diablo4_basics
         run: cargo run -p rtce --example your_own_game
+      - run: cargo run -p rtce --example diablo4_basics
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
