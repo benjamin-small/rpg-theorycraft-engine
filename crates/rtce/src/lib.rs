@@ -11,3 +11,4 @@ pub mod build;
 pub mod gamedef;
 pub mod plan;
 pub mod scenario;
+pub mod search;
