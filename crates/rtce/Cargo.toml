@@ -2,7 +2,12 @@
 name = "rtce"
 version = "0.1.0"
 edition = "2021"
-description = "RPG theorycraft engine: game algorithms as configuration, compiled once into fast evaluation plans."
+description = "RPG theorycraft engine: game algorithms as configuration, compiled once into fast, allocation-free evaluation plans."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/benjamin-small/rpg-theorycraft-engine"
+readme = "README.md"
+keywords = ["theorycraft", "rpg", "dps", "calculator", "simulation"]
+categories = ["game-development", "simulation"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

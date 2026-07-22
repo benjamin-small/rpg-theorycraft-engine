@@ -1,5 +1,10 @@
 # rpg-theorycraft-engine (rtce)
 
+[![CI](https://github.com/benjamin-small/rpg-theorycraft-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/benjamin-small/rpg-theorycraft-engine/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/rtce.svg)](https://crates.io/crates/rtce)
+[![docs.rs](https://docs.rs/rtce/badge.svg)](https://docs.rs/rtce)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A generic, config-driven theorycrafting engine. The game's algorithm —
 stats, fold rules, probabilistic events, damage pipeline — is
 configuration, compiled once into a fast evaluation plan. Extracted from
@@ -18,3 +23,14 @@ archetype builds are bit-identical through rtce (the standing numbers
 **solely** on rtce in production — its native damage math is deleted, and
 `calc::evaluate` is a thin shim over an rtce-compiled plan (including in
 the browser, via WASM).
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in this work by you shall be
+dual-licensed as above, without any additional terms or conditions.
