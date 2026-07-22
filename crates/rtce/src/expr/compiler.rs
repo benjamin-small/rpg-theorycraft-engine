@@ -8,6 +8,8 @@ use super::ExprError;
 
 /// Name → slot resolution, supplied by the caller (the stat registry later).
 pub trait Symbols {
+    /// Resolve `name` to its slot index, or `None` if it isn't defined —
+    /// callers turn `None` into a positioned `ExprError` at compile time.
     fn slot(&self, name: &str) -> Option<u16>;
 }
 
@@ -17,24 +19,41 @@ impl Symbols for std::collections::BTreeMap<String, u16> {
     }
 }
 
+/// One flat postfix stack-machine instruction. A [`Program`] is a `Vec<Op>`
+/// evaluated left to right against an operand stack.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
+    /// Push a literal value.
     Const(f64),
+    /// Push `slots[n]`.
     Load(u16),
+    /// Pop two, push their sum.
     Add,
+    /// Pop two (b, a), push `a - b`.
     Sub,
+    /// Pop two, push their product.
     Mul,
+    /// Pop two (b, a), push `a / b` (IEEE semantics — never panics).
     Div,
+    /// Pop one, push its negation.
     Neg,
+    /// Pop two, push the smaller.
     Min,
+    /// Pop two, push the larger.
     Max,
+    /// Pop three in push order (x, lo, hi), push `x` clamped into
+    /// `[lo, hi]` (total — see [`Program::eval`] for the inverted/NaN-bound
+    /// semantics).
     Clamp,
+    /// Pop one, push its floor.
     Floor,
 }
 
 /// Maximum evaluation stack depth; checked at compile, never at eval.
 pub const MAX_STACK: usize = 64;
 
+/// A compiled expression: a flat postfix [`Op`] stream plus its peak stack
+/// depth, ready for zero-allocation evaluation via [`Program::eval`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     ops: Vec<Op>,

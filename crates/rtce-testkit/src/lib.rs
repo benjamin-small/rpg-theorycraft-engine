@@ -1,8 +1,33 @@
-//! Golden-fixture harness for rtce and its consumer games.
+//! `rtce-testkit` — golden-fixture harness for `rtce` and its consumer
+//! games.
 //!
-//! House rules (inherited from diablo4-calc M1): a fixture directory that
-//! yields ZERO fixtures is a test failure — an empty glob must never pass
-//! silently; every fixture carries `name` and `source` provenance.
+//! This crate carries no test logic of its own; it's the small set of
+//! house rules every `rtce`-based game's test suite is expected to share,
+//! inherited from `diablo4-calc`'s M1 milestone:
+//!
+//! - **Golden fixtures live in JSON files, one case per file.**
+//!   [`for_each_fixture`] walks a directory, parses each `*.json` as a
+//!   `serde_json::Value`, and hands it to your callback in sorted-by-name
+//!   order (deterministic test output, deterministic diffs).
+//! - **An empty suite is a bug, not a pass.** If the fixture directory is
+//!   missing or yields zero `*.json` files, [`for_each_fixture`] panics
+//!   instead of silently iterating zero times — a typo'd path or an
+//!   accidentally-emptied directory must fail loudly, never look like
+//!   "all fixtures passed."
+//! - **Every fixture is provenance-tagged.** Each JSON file must carry a
+//!   `name` and a `source` key (where the expected number came from — a
+//!   hand-worked calculation, an in-game screenshot, another calculator)
+//!   so a reviewer can trace any pinned number back to its origin.
+//! - **Comparisons are relative-tolerance, not exact-float.** [`assert_close`]
+//!   compares `actual` against `expected` within a relative tolerance,
+//!   because floating-point pipelines rarely reproduce bit-for-bit across
+//!   platforms/optimization levels.
+//!
+//! Depend on this crate as a dev-dependency; use [`for_each_fixture`] to
+//! drive your golden-fixture tests and [`assert_close`] to check each
+//! result.
+
+#![warn(missing_docs)]
 
 use std::path::Path;
 

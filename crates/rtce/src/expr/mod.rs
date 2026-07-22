@@ -5,14 +5,15 @@
 
 mod compiler;
 mod lexer;
-mod parser; // Task 3 // Task 4
-pub use compiler::{compile, Op, Program, Symbols}; // Task 4
+mod parser;
+pub use compiler::{compile, Op, Program, Symbols};
 
 /// Position-carrying error for every stage (lex/parse/compile).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExprError {
     /// Byte offset into the source string.
     pub pos: usize,
+    /// Human-readable description of what went wrong.
     pub msg: String,
 }
 

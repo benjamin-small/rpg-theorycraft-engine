@@ -11,8 +11,13 @@ use crate::scenario::Scenario;
 /// Hard cap on events: 2^8 = 256 branches per branched stage.
 pub const MAX_EVENTS: usize = 8;
 
+/// A `plan::compile` or `Plan::evaluate`/`explain` failure: bad GameDef
+/// config (unknown/duplicate names, too many events, reserved names) or a
+/// bad runtime input (unknown stat/bucket/event/condition reference,
+/// non-finite/negative phase weight, empty scenario).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanError {
+    /// Human-readable description of what went wrong.
     pub what: String,
 }
 
@@ -31,6 +36,12 @@ impl From<ExprError> for PlanError {
     }
 }
 
+/// A `GameDef` compiled once into a flat, ready-to-evaluate form: every
+/// expression parsed and slot-resolved, every name checked, laid out over
+/// the unified slot array `[stats | conditions | buckets | stages |
+/// event_factors]`. Build one with `plan::compile` and reuse it for every
+/// `evaluate`/`explain` call — that's the whole "compile once, evaluate
+/// fast" contract.
 #[derive(Debug)]
 pub struct Plan {
     stat_names: Vec<String>,
@@ -112,6 +123,12 @@ impl Symbols for WithEventFactors<'_> {
     }
 }
 
+/// Compile a `GameDef` into a `Plan`: validate names (no collisions across
+/// stats/conditions/buckets/stages, no more than `MAX_EVENTS` events, no
+/// stage seeing a later stage, `event_factors` reserved and legal only in
+/// `branched` stages), parse and slot-resolve every expression, and lay
+/// out the unified slot array. This is the only place expressions get
+/// parsed — do it once per `GameDef` and reuse the result.
 pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     // `event_factors` is the engine's injected identifier (the per-branch
     // slot); a user name that collides would be silently shadowed.
@@ -236,33 +253,60 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
 /// tracing is OFF on the evaluate() hot path.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Explanation {
+    /// Same values, same order, as `evaluate`'s objective slice.
     pub objectives: Vec<f64>,
+    /// One trace per scenario phase, in scenario order.
     pub phases: Vec<PhaseTrace>,
 }
 
+/// Teaching trace for one scenario phase: every condition/bucket/stage
+/// value it resolved to, plus every event-branch a `branched` stage
+/// enumerated.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PhaseTrace {
+    /// This phase's name.
     pub name: String,
+    /// This phase's weight, already normalized (weight / sum of weights).
     pub weight: f64,
+    /// Condition name → resolved uptime (post-clamp), in registry order.
     pub conditions: Vec<(String, f64)>,
+    /// Bucket name → resolved (base, non-branched) slot value, in
+    /// registry order.
     pub buckets: Vec<(String, f64)>,
+    /// Stage name → resolved value (the branch-weighted EV for a
+    /// `branched` stage), in pipeline order.
     pub stages: Vec<(String, f64)>,
+    /// Every event-branch enumerated by every `branched` stage in this
+    /// phase, in stage-then-mask order.
     pub branches: Vec<BranchTrace>,
 }
 
+/// One event-branch of one `branched` stage: which events fired, that
+/// branch's probability weight, and the value it contributed.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BranchTrace {
+    /// Name of the `branched` stage this branch belongs to.
     pub stage: String,
+    /// Names of the events that fired on this branch (empty = none fired).
     pub fired: Vec<String>,
+    /// This branch's probability weight (product of fired chances and
+    /// unfired 1-chances); branches summing to zero weight are skipped.
     pub weight: f64,
+    /// `event_factors` for this branch: the product of every fired
+    /// event's factor expression (1.0 if none fired).
     pub event_factors: f64,
+    /// This branch's stage expression value.
     pub value: f64,
 }
 
 impl Plan {
+    /// Look up a stat's slot index by name, or `None` if it isn't in this
+    /// plan's stat registry.
     pub fn stat_id(&self, name: &str) -> Option<usize> {
         self.stat_names.iter().position(|s| s == name)
     }
+    /// The names of the stages exported as objectives, in the order their
+    /// values appear in `evaluate`'s/`explain`'s objective slice.
     pub fn objective_names(&self) -> Vec<&str> {
         self.objective_stages
             .iter()

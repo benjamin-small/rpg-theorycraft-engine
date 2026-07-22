@@ -5,6 +5,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The game's ALGORITHM, as configuration: the stat/condition/bucket
+/// registries, the probabilistic events, and the ordered pipeline of
+/// derived stages. `plan::compile` turns one of these into a `Plan` once;
+/// nothing here is touched again on the hot evaluation path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GameDef {
     /// Stat registry: names become slot offsets, in this order.
@@ -12,20 +16,28 @@ pub struct GameDef {
     /// Condition registry (uptime-gated contribution tags).
     #[serde(default)]
     pub conditions: Vec<String>,
+    /// Bucket registry: name → fold rule, keyed by bucket name.
     #[serde(default)]
     pub buckets: BTreeMap<String, BucketDef>,
+    /// Probabilistic event registry: name → chance/factor expressions.
     #[serde(default)]
     pub events: BTreeMap<String, EventDef>,
+    /// The ordered stages of the damage/output pipeline; later stages may
+    /// reference earlier ones by name.
     pub pipeline: Vec<StageDef>,
     /// Stage names exported as EvalResult objectives.
     pub objectives: Vec<String>,
 }
 
+/// A named bucket's fold rule — how the contributions tagged with this
+/// bucket combine into a single slot value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketDef {
+    /// How this bucket's contributions combine.
     pub fold: FoldKind,
 }
 
+/// How a bucket's tagged contributions combine into one slot value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FoldKind {
@@ -37,6 +49,9 @@ pub enum FoldKind {
     Product,
 }
 
+/// A probabilistic event (crit, proc, …): a chance of firing and a factor
+/// it contributes to `event_factors` when it does. Every combination of
+/// events is enumerated as a branch inside a `branched` stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventDef {
     /// Expression over stats; engine clamps the result to [0, 1].
@@ -46,9 +61,14 @@ pub struct EventDef {
     pub factor: String,
 }
 
+/// One named stage of the pipeline: an expression evaluated over every
+/// slot defined so far (stats, conditions, buckets, earlier stages).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageDef {
+    /// This stage's name; later stages and `objectives` refer to it by
+    /// this name.
     pub name: String,
+    /// The stage's expression, evaluated over the unified slot layout.
     pub expr: String,
     /// A branched stage is evaluated per event-branch and stores the
     /// probability-weighted EV. `event_factors` is only legal here.

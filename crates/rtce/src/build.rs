@@ -3,18 +3,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// ONE candidate: a full set of stat values plus every tagged contribution
+/// it makes into the game's buckets. This is the only piece of config that
+/// changes per permutation a search driver evaluates.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildState {
     /// Values for the GameDef stat registry, by name (missing = 0.0).
     #[serde(default)]
     pub stats: std::collections::BTreeMap<String, f64>,
+    /// Every value this build contributes into a bucket, each optionally
+    /// gated by an event or a condition (missing = 0.0).
     #[serde(default)]
     pub contributions: Vec<Contribution>,
 }
 
+/// One value flowing into one bucket, with optional gating tags. Untagged
+/// (`event: None, condition: None`) contributions always count; an
+/// `event`-tagged one counts only in branches where that event fired; a
+/// `condition`-tagged one scales by the active phase's uptime for that
+/// condition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contribution {
+    /// Name of the bucket this value folds into (must exist in the
+    /// GameDef's bucket registry).
     pub bucket: String,
+    /// The raw value contributed, before the bucket's fold is applied.
     pub value: f64,
     /// Counts only in branches where this event fired.
     #[serde(default)]

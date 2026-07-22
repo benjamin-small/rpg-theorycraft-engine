@@ -15,29 +15,43 @@ use crate::scenario::Scenario;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op")]
 pub enum Move {
+    /// Overwrite one stat's value.
     SetStat {
+        /// The stat to overwrite (must exist in the plan's registry).
         stat: String,
+        /// The new value.
         value: f64,
     },
+    /// Append a contribution to the build.
     AddContribution {
+        /// The contribution to add.
         contribution: Contribution,
     },
     /// Remove the FIRST contribution matching bucket+value(+tags) exactly.
     RemoveContribution {
+        /// The contribution to match and remove (bucket, value, event,
+        /// and condition must all match exactly).
         contribution: Contribution,
     },
 }
 
+/// One priceable candidate: an id plus the reversible `Move`s that turn
+/// the baseline `BuildState` into this candidate's build.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
+    /// Caller-assigned identifier, echoed back in `CandidateResult::id`.
     pub id: String,
+    /// Moves applied, in order, to a fresh copy of the baseline build.
     pub moves: Vec<Move>,
 }
 
+/// One candidate's priced objectives, across every scenario it was
+/// evaluated against.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateResult {
+    /// Echoes the `Candidate::id` this result was priced from.
     pub id: String,
-    /// objectives[scenario_index][objective_index]
+    /// `objectives[scenario_index][objective_index]`
     pub objectives: Vec<Vec<f64>>,
 }
 
