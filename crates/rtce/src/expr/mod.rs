@@ -3,10 +3,10 @@
 //! `Program` evaluated over a slot array. Fail-closed: unknown identifiers
 //! and syntax errors carry a byte position and never guess.
 
+mod compiler;
 mod lexer;
-mod parser;      // Task 3
-mod compiler;    // Task 4
-pub use compiler::{compile, Op, Program, Symbols};   // Task 4
+mod parser; // Task 3 // Task 4
+pub use compiler::{compile, Op, Program, Symbols}; // Task 4
 
 /// Position-carrying error for every stage (lex/parse/compile).
 #[derive(Debug, Clone, PartialEq)]

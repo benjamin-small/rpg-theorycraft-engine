@@ -11,15 +11,22 @@ use std::path::PathBuf;
 fn golden_fixtures_reproduce_pinned_values() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     for_each_fixture(&dir, |name, v| {
-        let slots_json = v["slots"].as_object().unwrap_or_else(|| panic!("{name}: slots"));
+        let slots_json = v["slots"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: slots"));
         let mut names: Vec<&String> = slots_json.keys().collect();
         names.sort();
-        let syms: BTreeMap<String, u16> =
-            names.iter().enumerate().map(|(i, n)| ((*n).clone(), i as u16)).collect();
-        let slots: Vec<f64> =
-            names.iter().map(|n| slots_json[*n].as_f64().unwrap()).collect();
-        let program = compile(v["expr"].as_str().unwrap(), &syms)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let syms: BTreeMap<String, u16> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ((*n).clone(), i as u16))
+            .collect();
+        let slots: Vec<f64> = names
+            .iter()
+            .map(|n| slots_json[*n].as_f64().unwrap())
+            .collect();
+        let program =
+            compile(v["expr"].as_str().unwrap(), &syms).unwrap_or_else(|e| panic!("{name}: {e}"));
         let actual = program.eval(&slots);
         assert_close(
             actual,

@@ -43,9 +43,7 @@ pub fn tokenize(src: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
             out.push((start, Tok::Num(n)));
         } else if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
-            while i < b.len()
-                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.')
-            {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.') {
                 i += 1;
             }
             out.push((start, Tok::Ident(src[start..i].to_string())));

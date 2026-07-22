@@ -25,7 +25,9 @@ impl std::error::Error for PlanError {}
 
 impl From<ExprError> for PlanError {
     fn from(e: ExprError) -> Self {
-        PlanError { what: e.to_string() }
+        PlanError {
+            what: e.to_string(),
+        }
     }
 }
 
@@ -123,15 +125,25 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         .chain(&def.conditions)
     {
         if name == "event_factors" {
-            return Err(PlanError { what: "`event_factors` is reserved".into() });
+            return Err(PlanError {
+                what: "`event_factors` is reserved".into(),
+            });
         }
     }
 
     // One flat namespace: stats, conditions, buckets, stages must not collide.
     let mut seen = std::collections::BTreeSet::new();
-    for name in def.stats.iter().chain(&def.conditions).chain(&bucket_names).chain(&stage_names) {
+    for name in def
+        .stats
+        .iter()
+        .chain(&def.conditions)
+        .chain(&bucket_names)
+        .chain(&stage_names)
+    {
         if !seen.insert(name.clone()) {
-            return Err(PlanError { what: format!("duplicate name `{name}`") });
+            return Err(PlanError {
+                what: format!("duplicate name `{name}`"),
+            });
         }
     }
     if def.events.len() > MAX_EVENTS {
@@ -156,10 +168,12 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     let mut event_names = Vec::new();
     for (name, ev) in &def.events {
         events.push(CompiledEvent {
-            chance: compile_expr(&ev.chance, &event_syms)
-                .map_err(|e| PlanError { what: format!("event `{name}` chance: {e}") })?,
-            factor: compile_expr(&ev.factor, &event_syms)
-                .map_err(|e| PlanError { what: format!("event `{name}` factor: {e}") })?,
+            chance: compile_expr(&ev.chance, &event_syms).map_err(|e| PlanError {
+                what: format!("event `{name}` chance: {e}"),
+            })?,
+            factor: compile_expr(&ev.factor, &event_syms).map_err(|e| PlanError {
+                what: format!("event `{name}` factor: {e}"),
+            })?,
         });
         event_names.push(name.clone());
     }
@@ -176,20 +190,29 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
             slot: event_factors_slot,
             enabled: s.branched,
         };
-        let program = compile_expr(&s.expr, &syms)
-            .map_err(|e| PlanError { what: format!("stage `{}`: {e}", s.name) })?;
-        stages.push(CompiledStage { name: s.name.clone(), program, branched: s.branched });
+        let program = compile_expr(&s.expr, &syms).map_err(|e| PlanError {
+            what: format!("stage `{}`: {e}", s.name),
+        })?;
+        stages.push(CompiledStage {
+            name: s.name.clone(),
+            program,
+            branched: s.branched,
+        });
     }
 
     if def.objectives.is_empty() {
-        return Err(PlanError { what: "no objectives".into() });
+        return Err(PlanError {
+            what: "no objectives".into(),
+        });
     }
     let mut objective_stages = Vec::new();
     for o in &def.objectives {
         let idx = stage_names
             .iter()
             .position(|s| s == o)
-            .ok_or_else(|| PlanError { what: format!("unknown objective `{o}`") })?;
+            .ok_or_else(|| PlanError {
+                what: format!("unknown objective `{o}`"),
+            })?;
         objective_stages.push(idx);
     }
 
@@ -241,7 +264,10 @@ impl Plan {
         self.stat_names.iter().position(|s| s == name)
     }
     pub fn objective_names(&self) -> Vec<&str> {
-        self.objective_stages.iter().map(|&i| self.stages[i].name.as_str()).collect()
+        self.objective_stages
+            .iter()
+            .map(|&i| self.stages[i].name.as_str())
+            .collect()
     }
 }
 
@@ -295,7 +321,10 @@ impl Plan {
         scenario: &Scenario,
         scratch: &mut EvalScratch,
     ) -> Result<Explanation, PlanError> {
-        let mut explanation = Explanation { objectives: Vec::new(), phases: Vec::new() };
+        let mut explanation = Explanation {
+            objectives: Vec::new(),
+            phases: Vec::new(),
+        };
         self.run(build, scenario, scratch, Some(&mut explanation))?;
         explanation.objectives = scratch.objectives.clone();
         Ok(explanation)
@@ -315,7 +344,11 @@ impl Plan {
     ) -> Result<(), PlanError> {
         let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
         debug_assert_eq!(scratch.slots.len(), n, "scratch must come from this plan");
-        debug_assert_eq!(scratch.branch_slots.len(), n, "scratch must come from this plan");
+        debug_assert_eq!(
+            scratch.branch_slots.len(),
+            n,
+            "scratch must come from this plan"
+        );
         debug_assert_eq!(
             scratch.base_bucket_raw.len(),
             self.n_buckets,
@@ -326,9 +359,15 @@ impl Plan {
             self.objective_stages.len(),
             "scratch must come from this plan"
         );
-        debug_assert_eq!(scratch.stat_base.len(), self.n_stats, "scratch must come from this plan");
+        debug_assert_eq!(
+            scratch.stat_base.len(),
+            self.n_stats,
+            "scratch must come from this plan"
+        );
         if scenario.phases.is_empty() {
-            return Err(PlanError { what: "scenario has no phases".into() });
+            return Err(PlanError {
+                what: "scenario has no phases".into(),
+            });
         }
         // Fail-closed per-phase: a single negative/non-finite weight could
         // otherwise hide inside a positive sum, and a non-finite uptime
@@ -367,7 +406,9 @@ impl Plan {
         // negating it would accept NaN; check both sides explicitly instead
         // (clippy::neg_cmp_op_on_partial_ord).
         if weight_sum.is_nan() || weight_sum <= 0.0 {
-            return Err(PlanError { what: "phase weights must sum > 0".into() });
+            return Err(PlanError {
+                what: "phase weights must sum > 0".into(),
+            });
         }
 
         // Resolve + validate build ONCE: stats and contribution tags.
@@ -375,25 +416,31 @@ impl Plan {
             *slot = 0.0;
         }
         for (name, v) in &build.stats {
-            let i = self
-                .stat_id(name)
-                .ok_or_else(|| PlanError { what: format!("unknown stat `{name}`") })?;
+            let i = self.stat_id(name).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{name}`"),
+            })?;
             scratch.stat_base[i] = *v;
         }
         // Contribution tags validate per call (cheap linear scans over
         // small registries; index resolution caches are a P5 concern).
         for c in &build.contributions {
             if !self.bucket_names.iter().any(|b| b == &c.bucket) {
-                return Err(PlanError { what: format!("unknown bucket `{}`", c.bucket) });
+                return Err(PlanError {
+                    what: format!("unknown bucket `{}`", c.bucket),
+                });
             }
             if let Some(e) = &c.event {
                 if !self.event_names.iter().any(|n| n == e) {
-                    return Err(PlanError { what: format!("unknown event `{e}`") });
+                    return Err(PlanError {
+                        what: format!("unknown event `{e}`"),
+                    });
                 }
             }
             if let Some(cd) = &c.condition {
                 if !self.condition_names.iter().any(|n| n == cd) {
-                    return Err(PlanError { what: format!("unknown condition `{cd}`") });
+                    return Err(PlanError {
+                        what: format!("unknown condition `{cd}`"),
+                    });
                 }
             }
         }
@@ -422,22 +469,27 @@ impl Plan {
             let n_stats = self.n_stats;
             scratch.slots[..n_stats].copy_from_slice(&scratch.stat_base);
             for (name, v) in &phase.stats {
-                let i = self
-                    .stat_id(name)
-                    .ok_or_else(|| PlanError { what: format!("unknown stat `{name}`") })?;
+                let i = self.stat_id(name).ok_or_else(|| PlanError {
+                    what: format!("unknown stat `{name}`"),
+                })?;
                 scratch.slots[i] = *v;
             }
 
             // Conditions: expression-readable uptime slots, fail-closed
             // (missing uptime = 0.0), clamped into [0, 1].
             for (ci, name) in self.condition_names.iter().enumerate() {
-                scratch.slots[n_stats + ci] =
-                    phase.uptimes.get(name).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                scratch.slots[n_stats + ci] = phase
+                    .uptimes
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
             }
             let bucket_base = n_stats + self.n_conditions;
             if let Some(pt) = phase_trace.as_mut() {
                 for (ci, name) in self.condition_names.iter().enumerate() {
-                    pt.conditions.push((name.clone(), scratch.slots[n_stats + ci]));
+                    pt.conditions
+                        .push((name.clone(), scratch.slots[n_stats + ci]));
                 }
             }
 
@@ -447,7 +499,8 @@ impl Plan {
             self.write_bucket_slots(&scratch.base_bucket_raw, bucket_base, &mut scratch.slots);
             if let Some(pt) = phase_trace.as_mut() {
                 for (bi, name) in self.bucket_names.iter().enumerate() {
-                    pt.buckets.push((name.clone(), scratch.slots[bucket_base + bi]));
+                    pt.buckets
+                        .push((name.clone(), scratch.slots[bucket_base + bi]));
                 }
             }
 
@@ -513,7 +566,10 @@ impl Plan {
             }
             if let Some(pt) = phase_trace.as_mut() {
                 for (si, stage) in self.stages.iter().enumerate() {
-                    pt.stages.push((stage.name.clone(), scratch.slots[bucket_base + self.n_buckets + si]));
+                    pt.stages.push((
+                        stage.name.clone(),
+                        scratch.slots[bucket_base + self.n_buckets + si],
+                    ));
                 }
             }
 
@@ -522,7 +578,11 @@ impl Plan {
             }
 
             if let Some(pt) = phase_trace {
-                trace.as_mut().expect("phase_trace is Some only when trace is Some").phases.push(pt);
+                trace
+                    .as_mut()
+                    .expect("phase_trace is Some only when trace is Some")
+                    .phases
+                    .push(pt);
             }
         }
 
@@ -546,7 +606,11 @@ impl Plan {
             };
         }
         for c in &build.contributions {
-            let bi = self.bucket_names.iter().position(|b| b == &c.bucket).unwrap();
+            let bi = self
+                .bucket_names
+                .iter()
+                .position(|b| b == &c.bucket)
+                .unwrap();
             if let Some(e) = &c.event {
                 let ei = self.event_names.iter().position(|n| n == e).unwrap();
                 match fired_mask {
@@ -659,7 +723,10 @@ mod tests {
         for i in 0..9 {
             def.events.insert(
                 format!("e{i}"),
-                crate::gamedef::EventDef { chance: "0".into(), factor: "1".into() },
+                crate::gamedef::EventDef {
+                    chance: "0".into(),
+                    factor: "1".into(),
+                },
             );
         }
         assert!(compile(&def).unwrap_err().what.contains("events"));
@@ -701,7 +768,11 @@ mod tests {
         let plan = compile(&toy_def()).unwrap();
         let mut scratch = plan.scratch();
         let objectives = plan.evaluate(&toy_build(), &arena(), &mut scratch).unwrap();
-        assert!((objectives[0] - 282.15).abs() < 1e-9, "got {}", objectives[0]);
+        assert!(
+            (objectives[0] - 282.15).abs() < 1e-9,
+            "got {}",
+            objectives[0]
+        );
     }
 
     #[test]
@@ -722,8 +793,14 @@ mod tests {
         .unwrap();
         let plan = compile(&toy_def()).unwrap();
         let mut scratch = plan.scratch();
-        let objectives = plan.evaluate(&toy_build(), &scenario, &mut scratch).unwrap();
-        assert!((objectives[0] - 319.0275).abs() < 1e-9, "got {}", objectives[0]);
+        let objectives = plan
+            .evaluate(&toy_build(), &scenario, &mut scratch)
+            .unwrap();
+        assert!(
+            (objectives[0] - 319.0275).abs() < 1e-9,
+            "got {}",
+            objectives[0]
+        );
     }
 
     #[test]
@@ -733,14 +810,21 @@ mod tests {
 
         let mut b = toy_build();
         b.contributions[0].bucket = "nope".into();
-        assert!(plan.evaluate(&b, &arena(), &mut scratch).unwrap_err().what.contains("nope"));
+        assert!(plan
+            .evaluate(&b, &arena(), &mut scratch)
+            .unwrap_err()
+            .what
+            .contains("nope"));
 
         let mut b = toy_build();
         b.stats.insert("mystery".into(), 1.0);
-        assert!(plan.evaluate(&b, &arena(), &mut scratch).unwrap_err().what.contains("mystery"));
+        assert!(plan
+            .evaluate(&b, &arena(), &mut scratch)
+            .unwrap_err()
+            .what
+            .contains("mystery"));
 
-        let bad: Scenario =
-            serde_json::from_str(r#"{ "phases": [] }"#).unwrap();
+        let bad: Scenario = serde_json::from_str(r#"{ "phases": [] }"#).unwrap();
         assert!(plan
             .evaluate(&toy_build(), &bad, &mut scratch)
             .unwrap_err()
@@ -782,15 +866,17 @@ mod tests {
         let mut b = toy_build();
         b.stats.insert("crit_chance".into(), 400.0);
         // no-uptime phase: enraged contribution contributes 0.
-        let s: Scenario = serde_json::from_str(
-            r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#,
-        )
-        .unwrap();
+        let s: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
         // additive crit = 40 + 30 = 70 → 1.7 ; hit = 150×1.7×2.25×1.1 = 631.125
         let plan = compile(&toy_def()).unwrap();
         let mut scratch = plan.scratch();
         let objectives = plan.evaluate(&b, &s, &mut scratch).unwrap();
-        assert!((objectives[0] - 631.125).abs() < 1e-9, "got {}", objectives[0]);
+        assert!(
+            (objectives[0] - 631.125).abs() < 1e-9,
+            "got {}",
+            objectives[0]
+        );
     }
 
     #[test]
@@ -803,7 +889,9 @@ mod tests {
         .unwrap();
         let plan = compile(&toy_def()).unwrap();
         let mut scratch = plan.scratch();
-        let err = plan.evaluate(&toy_build(), &scenario, &mut scratch).unwrap_err();
+        let err = plan
+            .evaluate(&toy_build(), &scenario, &mut scratch)
+            .unwrap_err();
         assert!(err.what.contains("weight"), "got: {}", err.what);
     }
 
@@ -909,7 +997,8 @@ mod tests {
                  "objectives": ["out"] }"#,
         )
         .unwrap();
-        let build: BuildState = serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
+        let build: BuildState =
+            serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
         let plan = compile(&def).unwrap();
         let mut scratch = plan.scratch();
 
@@ -951,29 +1040,42 @@ mod tests {
         // Same fixtures/hand numbers as toy_game_hand_worked_single_phase.
         let plan = compile(&toy_def()).unwrap();
         let mut scratch = plan.scratch();
-        let objectives = plan.evaluate(&toy_build(), &arena(), &mut scratch).unwrap().to_vec();
+        let objectives = plan
+            .evaluate(&toy_build(), &arena(), &mut scratch)
+            .unwrap()
+            .to_vec();
 
         let mut scratch = plan.scratch();
         let ex = plan.explain(&toy_build(), &arena(), &mut scratch).unwrap();
 
         assert_eq!(ex.objectives, objectives);
-        assert!((ex.objectives[0] - 282.15).abs() < 1e-9, "got {:?}", ex.objectives);
+        assert!(
+            (ex.objectives[0] - 282.15).abs() < 1e-9,
+            "got {:?}",
+            ex.objectives
+        );
 
         assert_eq!(ex.phases.len(), 1);
         let p = &ex.phases[0];
         assert!((p.weight - 1.0).abs() < 1e-9);
         assert!(
-            p.conditions.iter().any(|(n, v)| n == "enraged" && (v - 0.5).abs() < 1e-9),
+            p.conditions
+                .iter()
+                .any(|(n, v)| n == "enraged" && (v - 0.5).abs() < 1e-9),
             "got {:?}",
             p.conditions
         );
         assert!(
-            p.buckets.iter().any(|(n, v)| n == "additive" && (v - 50.0).abs() < 1e-9),
+            p.buckets
+                .iter()
+                .any(|(n, v)| n == "additive" && (v - 50.0).abs() < 1e-9),
             "got {:?}",
             p.buckets
         );
         assert!(
-            p.stages.iter().any(|(n, v)| n == "base" && (v - 150.0).abs() < 1e-9),
+            p.stages
+                .iter()
+                .any(|(n, v)| n == "base" && (v - 150.0).abs() < 1e-9),
             "got {:?}",
             p.stages
         );
@@ -985,8 +1087,16 @@ mod tests {
         assert!((weight_sum - 1.0).abs() < 1e-9, "got {weight_sum}");
 
         let unfired = hit_branches.iter().find(|b| b.fired.is_empty()).unwrap();
-        assert!((unfired.weight - 0.75).abs() < 1e-9, "got {}", unfired.weight);
-        assert!((unfired.value - 247.5).abs() < 1e-9, "got {}", unfired.value);
+        assert!(
+            (unfired.weight - 0.75).abs() < 1e-9,
+            "got {}",
+            unfired.weight
+        );
+        assert!(
+            (unfired.value - 247.5).abs() < 1e-9,
+            "got {}",
+            unfired.value
+        );
         assert!((unfired.event_factors - 1.0).abs() < 1e-9);
 
         let fired = hit_branches.iter().find(|b| !b.fired.is_empty()).unwrap();
@@ -1032,7 +1142,8 @@ mod tests {
                  "objectives": ["out"] }"#,
         )
         .unwrap();
-        let build: BuildState = serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
+        let build: BuildState =
+            serde_json::from_str(r#"{ "stats": { "base_v": 100.0 } }"#).unwrap();
         let scenario: Scenario = serde_json::from_str(
             r#"{ "phases": [ { "name": "p", "weight": 1, "uptimes": { "enraged": 0.5 } } ] }"#,
         )
@@ -1041,6 +1152,10 @@ mod tests {
         let mut scratch = plan.scratch();
         let ex = plan.explain(&build, &scenario, &mut scratch).unwrap();
         assert!((ex.objectives[0] - 200.0).abs() < 1e-9);
-        assert!(ex.phases[0].branches.is_empty(), "got {:?}", ex.phases[0].branches);
+        assert!(
+            ex.phases[0].branches.is_empty(),
+            "got {:?}",
+            ex.phases[0].branches
+        );
     }
 }

@@ -15,10 +15,17 @@ use crate::scenario::Scenario;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op")]
 pub enum Move {
-    SetStat { stat: String, value: f64 },
-    AddContribution { contribution: Contribution },
+    SetStat {
+        stat: String,
+        value: f64,
+    },
+    AddContribution {
+        contribution: Contribution,
+    },
     /// Remove the FIRST contribution matching bucket+value(+tags) exactly.
-    RemoveContribution { contribution: Contribution },
+    RemoveContribution {
+        contribution: Contribution,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -41,7 +48,9 @@ fn contribution_matches(a: &Contribution, b: &Contribution) -> bool {
 fn apply_move(plan: &Plan, build: &mut BuildState, mv: &Move) -> Result<(), PlanError> {
     match mv {
         Move::SetStat { stat, value } => {
-            plan.stat_id(stat).ok_or_else(|| PlanError { what: format!("unknown stat `{stat}`") })?;
+            plan.stat_id(stat).ok_or_else(|| PlanError {
+                what: format!("unknown stat `{stat}`"),
+            })?;
             build.stats.insert(stat.clone(), *value);
             Ok(())
         }
@@ -50,13 +59,18 @@ fn apply_move(plan: &Plan, build: &mut BuildState, mv: &Move) -> Result<(), Plan
             Ok(())
         }
         Move::RemoveContribution { contribution } => {
-            let pos = build.contributions.iter().position(|c| contribution_matches(c, contribution));
+            let pos = build
+                .contributions
+                .iter()
+                .position(|c| contribution_matches(c, contribution));
             match pos {
                 Some(i) => {
                     build.contributions.remove(i);
                     Ok(())
                 }
-                None => Err(PlanError { what: "no matching contribution to remove".into() }),
+                None => Err(PlanError {
+                    what: "no matching contribution to remove".into(),
+                }),
             }
         }
     }
@@ -85,14 +99,22 @@ pub fn price(
             let obj = plan.evaluate(&working, scenario, scratch)?;
             objectives.push(obj.to_vec());
         }
-        out.push(CandidateResult { id: candidate.id.clone(), objectives });
+        out.push(CandidateResult {
+            id: candidate.id.clone(),
+            objectives,
+        });
     }
     Ok(out)
 }
 
 /// Indices of the k best results by (scenario_idx, objective_idx),
 /// descending. Ties are broken by ascending index (stable sort).
-pub fn top_k(results: &[CandidateResult], scenario: usize, objective: usize, k: usize) -> Vec<usize> {
+pub fn top_k(
+    results: &[CandidateResult],
+    scenario: usize,
+    objective: usize,
+    k: usize,
+) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..results.len()).collect();
     idx.sort_by(|&a, &b| {
         let va = results[a].objectives[scenario][objective];
@@ -192,7 +214,10 @@ mod tests {
         let candidates = vec![
             Candidate {
                 id: "set_stat".into(),
-                moves: vec![Move::SetStat { stat: "crit_chance".into(), value: 100.0 }],
+                moves: vec![Move::SetStat {
+                    stat: "crit_chance".into(),
+                    value: 100.0,
+                }],
             },
             Candidate {
                 id: "add_contrib".into(),
@@ -226,7 +251,10 @@ mod tests {
         let mut expected1 = base.clone();
         expected1.stats.insert("crit_chance".into(), 100.0);
         let mut s = plan.scratch();
-        let obj1 = plan.evaluate(&expected1, &arena(), &mut s).unwrap().to_vec();
+        let obj1 = plan
+            .evaluate(&expected1, &arena(), &mut s)
+            .unwrap()
+            .to_vec();
         assert_eq!(results[0].id, "set_stat");
         assert_eq!(results[0].objectives, vec![obj1]);
 
@@ -239,7 +267,10 @@ mod tests {
             condition: None,
         });
         let mut s = plan.scratch();
-        let obj2 = plan.evaluate(&expected2, &arena(), &mut s).unwrap().to_vec();
+        let obj2 = plan
+            .evaluate(&expected2, &arena(), &mut s)
+            .unwrap()
+            .to_vec();
         assert_eq!(results[1].objectives, vec![obj2]);
 
         // Expected 3: RemoveContribution of the indep +10.
@@ -251,7 +282,10 @@ mod tests {
             .unwrap();
         expected3.contributions.remove(pos);
         let mut s = plan.scratch();
-        let obj3 = plan.evaluate(&expected3, &arena(), &mut s).unwrap().to_vec();
+        let obj3 = plan
+            .evaluate(&expected3, &arena(), &mut s)
+            .unwrap()
+            .to_vec();
         assert_eq!(results[2].objectives, vec![obj3]);
     }
 
@@ -264,7 +298,10 @@ mod tests {
         let candidates = vec![
             Candidate {
                 id: "a".into(),
-                moves: vec![Move::SetStat { stat: "crit_chance".into(), value: 999.0 }],
+                moves: vec![Move::SetStat {
+                    stat: "crit_chance".into(),
+                    value: 999.0,
+                }],
             },
             Candidate {
                 id: "b".into(),
@@ -291,7 +328,11 @@ mod tests {
         ];
         let mut scratch = plan.scratch();
         let _ = price(&plan, &base, &candidates, &scenarios, &mut scratch).unwrap();
-        assert_eq!(serde_json::to_string(&base).unwrap(), pristine, "base must be untouched");
+        assert_eq!(
+            serde_json::to_string(&base).unwrap(),
+            pristine,
+            "base must be untouched"
+        );
     }
 
     #[test]
@@ -303,7 +344,10 @@ mod tests {
 
         let bad_stat = vec![Candidate {
             id: "x".into(),
-            moves: vec![Move::SetStat { stat: "mystery".into(), value: 1.0 }],
+            moves: vec![Move::SetStat {
+                stat: "mystery".into(),
+                value: 1.0,
+            }],
         }];
         let err = price(&plan, &base, &bad_stat, &scenarios, &mut scratch).unwrap_err();
         assert!(err.what.contains("mystery"), "got: {}", err.what);
@@ -320,17 +364,33 @@ mod tests {
             }],
         }];
         let err = price(&plan, &base, &bad_remove, &scenarios, &mut scratch).unwrap_err();
-        assert!(err.what.contains("no matching contribution"), "got: {}", err.what);
+        assert!(
+            err.what.contains("no matching contribution"),
+            "got: {}",
+            err.what
+        );
     }
 
     fn synthetic_results() -> Vec<CandidateResult> {
         // Single scenario, two objectives. r0/r1 incomparable; r1/r2 tie
         // (neither dominates); r3 dominated by both r0 and r1.
         vec![
-            CandidateResult { id: "r0".into(), objectives: vec![vec![10.0, 5.0]] },
-            CandidateResult { id: "r1".into(), objectives: vec![vec![8.0, 8.0]] },
-            CandidateResult { id: "r2".into(), objectives: vec![vec![8.0, 8.0]] },
-            CandidateResult { id: "r3".into(), objectives: vec![vec![3.0, 3.0]] },
+            CandidateResult {
+                id: "r0".into(),
+                objectives: vec![vec![10.0, 5.0]],
+            },
+            CandidateResult {
+                id: "r1".into(),
+                objectives: vec![vec![8.0, 8.0]],
+            },
+            CandidateResult {
+                id: "r2".into(),
+                objectives: vec![vec![8.0, 8.0]],
+            },
+            CandidateResult {
+                id: "r3".into(),
+                objectives: vec![vec![3.0, 3.0]],
+            },
         ]
     }
 
@@ -357,9 +417,15 @@ mod tests {
 
     #[test]
     fn moves_round_trip_serde() {
-        let mv = Move::SetStat { stat: "crit_chance".into(), value: 42.0 };
+        let mv = Move::SetStat {
+            stat: "crit_chance".into(),
+            value: 42.0,
+        };
         let json = serde_json::to_value(&mv).unwrap();
-        assert_eq!(json, serde_json::json!({"op": "set_stat", "stat": "crit_chance", "value": 42.0}));
+        assert_eq!(
+            json,
+            serde_json::json!({"op": "set_stat", "stat": "crit_chance", "value": 42.0})
+        );
         let back: Move = serde_json::from_value(json).unwrap();
         match back {
             Move::SetStat { stat, value } => {
@@ -370,7 +436,12 @@ mod tests {
         }
 
         let mv2 = Move::AddContribution {
-            contribution: Contribution { bucket: "additive".into(), value: 10.0, event: None, condition: None },
+            contribution: Contribution {
+                bucket: "additive".into(),
+                value: 10.0,
+                event: None,
+                condition: None,
+            },
         };
         let json2 = serde_json::to_value(&mv2).unwrap();
         assert_eq!(json2["op"], "add_contribution");
@@ -378,7 +449,12 @@ mod tests {
         assert!(matches!(back2, Move::AddContribution { .. }));
 
         let mv3 = Move::RemoveContribution {
-            contribution: Contribution { bucket: "additive".into(), value: 10.0, event: None, condition: None },
+            contribution: Contribution {
+                bucket: "additive".into(),
+                value: 10.0,
+                event: None,
+                condition: None,
+            },
         };
         let json3 = serde_json::to_value(&mv3).unwrap();
         assert_eq!(json3["op"], "remove_contribution");

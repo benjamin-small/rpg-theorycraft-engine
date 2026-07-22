@@ -43,10 +43,17 @@ impl Func {
 
 pub fn parse(src: &str) -> Result<Ast, ExprError> {
     let toks = tokenize(src)?;
-    let mut p = Parser { toks, pos: 0, src_len: src.len() };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        src_len: src.len(),
+    };
     let ast = p.expr()?;
     if p.pos != p.toks.len() {
-        return Err(ExprError { pos: p.peek_pos(), msg: "trailing input".into() });
+        return Err(ExprError {
+            pos: p.peek_pos(),
+            msg: "trailing input".into(),
+        });
     }
     Ok(ast)
 }
@@ -62,7 +69,10 @@ impl Parser {
         self.toks.get(self.pos).map(|(_, t)| t)
     }
     fn peek_pos(&self) -> usize {
-        self.toks.get(self.pos).map(|(p, _)| *p).unwrap_or(self.src_len)
+        self.toks
+            .get(self.pos)
+            .map(|(p, _)| *p)
+            .unwrap_or(self.src_len)
     }
     fn expr(&mut self) -> Result<Ast, ExprError> {
         let mut lhs = self.term()?;
@@ -159,12 +169,18 @@ impl Parser {
                 self.pos += 1;
                 let inner = self.expr()?;
                 if !matches!(self.peek(), Some(Tok::RParen)) {
-                    return Err(ExprError { pos: self.peek_pos(), msg: "expected `)`".into() });
+                    return Err(ExprError {
+                        pos: self.peek_pos(),
+                        msg: "expected `)`".into(),
+                    });
                 }
                 self.pos += 1;
                 Ok(inner)
             }
-            _ => Err(ExprError { pos, msg: "expected number, identifier, or `(`".into() }),
+            _ => Err(ExprError {
+                pos,
+                msg: "expected number, identifier, or `(`".into(),
+            }),
         }
     }
 }
@@ -181,7 +197,11 @@ mod tests {
             Ast::Bin(
                 BinOp::Add,
                 Box::new(Ast::Num(1.0)),
-                Box::new(Ast::Bin(BinOp::Mul, Box::new(Ast::Num(2.0)), Box::new(Ast::Num(3.0))))
+                Box::new(Ast::Bin(
+                    BinOp::Mul,
+                    Box::new(Ast::Num(2.0)),
+                    Box::new(Ast::Num(3.0))
+                ))
             )
         );
         // -a * b parses as (-a) * b.
@@ -198,7 +218,11 @@ mod tests {
             parse("(1 + 2) * 3").unwrap(),
             Ast::Bin(
                 BinOp::Mul,
-                Box::new(Ast::Bin(BinOp::Add, Box::new(Ast::Num(1.0)), Box::new(Ast::Num(2.0)))),
+                Box::new(Ast::Bin(
+                    BinOp::Add,
+                    Box::new(Ast::Num(1.0)),
+                    Box::new(Ast::Num(2.0))
+                )),
                 Box::new(Ast::Num(3.0))
             )
         );

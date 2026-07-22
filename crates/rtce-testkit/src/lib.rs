@@ -33,8 +33,8 @@ pub fn for_each_fixture(dir: &Path, mut f: impl FnMut(&str, &serde_json::Value))
         dir.display()
     );
     for path in entries {
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let raw =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let v: serde_json::Value = serde_json::from_str(&raw)
             .unwrap_or_else(|e| panic!("{}: invalid JSON: {e}", path.display()));
         assert!(
@@ -75,7 +75,9 @@ mod tests {
         fs::write(dir.join("b.json"), r#"{"name":"b","source":"t","v":2}"#).unwrap();
         fs::write(dir.join("a.json"), r#"{"name":"a","source":"t","v":1}"#).unwrap();
         let mut seen = Vec::new();
-        for_each_fixture(&dir, |name, v| seen.push((name.to_string(), v["v"].as_i64().unwrap())));
+        for_each_fixture(&dir, |name, v| {
+            seen.push((name.to_string(), v["v"].as_i64().unwrap()))
+        });
         assert_eq!(seen, vec![("a".into(), 1), ("b".into(), 2)]);
 
         fs::write(dir.join("c.json"), r#"{"v":3}"#).unwrap();

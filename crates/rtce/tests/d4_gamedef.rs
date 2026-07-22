@@ -10,7 +10,9 @@ use rtce_testkit::{assert_close, for_each_fixture};
 use std::path::PathBuf;
 
 fn fixtures(sub: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/d4").join(sub)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/d4")
+        .join(sub)
 }
 
 fn d4_plan() -> rtce::plan::Plan {
@@ -28,11 +30,17 @@ fn scenario_from(uptimes: &serde_json::Value) -> Scenario {
 #[test]
 fn t_cases_reproduce_diablo4_calc_numbers() {
     let plan = d4_plan();
-    let names: Vec<String> =
-        plan.objective_names().iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = plan
+        .objective_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut scratch = plan.scratch();
     for_each_fixture(&fixtures("cases"), |case, v| {
-        assert!(v["uptimes"].is_object(), "{case}: uptimes must be an explicit object");
+        assert!(
+            v["uptimes"].is_object(),
+            "{case}: uptimes must be an explicit object"
+        );
         let build: BuildState = serde_json::from_value(v["build"].clone()).unwrap();
         let scenario = scenario_from(&v["uptimes"]);
         let objectives = plan.evaluate(&build, &scenario, &mut scratch).unwrap();
@@ -44,7 +52,12 @@ fn t_cases_reproduce_diablo4_calc_numbers() {
                 .iter()
                 .position(|n| n == key)
                 .unwrap_or_else(|| panic!("{case}: unknown objective `{key}`"));
-            assert_close(objectives[i], want.as_f64().unwrap(), tol, &format!("{case}.{key}"));
+            assert_close(
+                objectives[i],
+                want.as_f64().unwrap(),
+                tol,
+                &format!("{case}.{key}"),
+            );
         }
     });
 }
@@ -58,7 +71,11 @@ fn t9_dot_is_crit_immune() {
     let mut build: BuildState = serde_json::from_value(v["build"].clone()).unwrap();
     let scenario = scenario_from(&v["uptimes"]);
 
-    let dot_i = plan.objective_names().iter().position(|n| *n == "dot_dps").unwrap();
+    let dot_i = plan
+        .objective_names()
+        .iter()
+        .position(|n| *n == "dot_dps")
+        .unwrap();
     let before = plan.evaluate(&build, &scenario, &mut scratch).unwrap()[dot_i];
     build.stats.insert("crit_chance".into(), 100.0);
     let after = plan.evaluate(&build, &scenario, &mut scratch).unwrap()[dot_i];

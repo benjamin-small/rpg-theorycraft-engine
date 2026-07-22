@@ -6,8 +6,8 @@
 //! tens of thousands of permutations. Design:
 //! docs/superpowers/specs/2026-07-21-rtce-design.md.
 
-pub mod expr;
 pub mod build;
+pub mod expr;
 pub mod gamedef;
 pub mod plan;
 pub mod scenario;

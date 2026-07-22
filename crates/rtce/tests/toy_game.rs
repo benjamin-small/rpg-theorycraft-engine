@@ -10,7 +10,9 @@ use rtce_testkit::assert_close;
 use std::path::PathBuf;
 
 fn load<T: serde::de::DeserializeOwned>(name: &str) -> T {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toy").join(name);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toy")
+        .join(name);
     serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
 }
 

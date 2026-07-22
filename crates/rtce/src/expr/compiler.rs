@@ -185,7 +185,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn syms(names: &[&str]) -> BTreeMap<String, u16> {
-        names.iter().enumerate().map(|(i, n)| (n.to_string(), i as u16)).collect()
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.to_string(), i as u16))
+            .collect()
     }
 
     #[test]
@@ -208,7 +212,10 @@ mod tests {
         let s = syms(&["x"]);
         assert_eq!(compile("clamp(x, 0, 10)", &s).unwrap().eval(&[42.0]), 10.0);
         assert_eq!(compile("clamp(x, 0, 10)", &s).unwrap().eval(&[-3.0]), 0.0);
-        assert_eq!(compile("min(x, 4) + max(x, 4)", &s).unwrap().eval(&[9.0]), 13.0);
+        assert_eq!(
+            compile("min(x, 4) + max(x, 4)", &s).unwrap().eval(&[9.0]),
+            13.0
+        );
         assert_eq!(compile("floor(x / 4)", &s).unwrap().eval(&[9.0]), 2.0);
         assert_eq!(compile("-x * 2", &s).unwrap().eval(&[5.0]), -10.0);
     }
