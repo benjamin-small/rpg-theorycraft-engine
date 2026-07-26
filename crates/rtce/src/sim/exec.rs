@@ -4919,6 +4919,38 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The span still OPEN when the sim ends counts: `finalize` closes the
+    // stack integral at `duration` exactly the way it closes
+    // `buff_uptime`'s active span.
+    //
+    // The same `add_refresh_all` fixture over 25s instead of 20s. The
+    // last application lands at t=24 (applications are every 2s and the
+    // proc's icd then runs to 26, so the t=25 hit is gated) — so the
+    // final second is absorbed by nothing but `finalize`.
+    //   ∫ stacks dt = 1·2 + 2·2 + 3·21 = 2 + 4 + 63 = 69
+    //   avg_stacks  = 69 / 25 = 2.76
+    // Dropping `finalize`'s flush would silently report 66/25 = 2.64.
+    // ------------------------------------------------------------------
+    #[test]
+    fn avg_stacks_integrates_the_span_still_open_when_the_sim_ends() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 25 } ] }"#).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert!(
+            close(report.avg_stacks["charge"], 2.76),
+            "avg_stacks: got {} — want (1·2 + 2·2 + 3·21)/25 = 2.76 (2.64 \
+             would mean the final open span went uncounted)",
+            report.avg_stacks["charge"]
+        );
+    }
+
+    // ------------------------------------------------------------------
     // `add_independent` (PoE2 poison): every instance keeps its OWN
     // duration, and at `max_stacks` the EARLIEST-EXPIRING instance is
     // evicted to make room for the new one.
@@ -5134,6 +5166,75 @@ mod tests {
             "EV {} vs MC {} total damage",
             ev.total.total_damage,
             mc.total.total_damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The EV/MC gate again, this time in the STOCHASTIC regime the spec
+    // actually names — a steady-state stack COUNT, not a deterministic
+    // trajectory. `add_independent`, UNBOUNDED (max_stacks 0), duration
+    // 4, applied by an `on_hit` proc at chance 0.5 with no ICD against
+    // the filler's 1 hit/s cadence.
+    //
+    // Steady state, both modes: applications arrive at 0.5/s and each
+    // instance lives 4s, so by Little's law the mean live count is
+    //   L = λ × W = 0.5 × 4 = 2.
+    //
+    // EV, exactly (the accumulator crosses on every second hit, so
+    // applications land at t=2,4,…,40 and an instance applied at t is
+    // live on [t, t+4)):
+    //   [0,2)  0 stacks   [2,4)  1 stack    [4,6)  2 stacks
+    //   [6,40] 2 stacks — at every t≥6 exactly the two applications in
+    //          (t−4, t] are live (at t=6 the t=2 instance expires BEFORE
+    //          the t=6 hit applies its own: same instant, lower seq).
+    //   ∫ stacks dt = 1·2 + 2·2 + 2·34 = 2 + 4 + 68 = 74
+    //   avg_stacks  = 74 / 40 = 1.85
+    //
+    // MC rolls each hit exactly, so it reaches the same steady-state 2
+    // but ramps in faster — its first application can land at t=1, where
+    // EV's accumulator defers to t=2. Its expected integral is
+    //   0 + 0.5 + 1.0 + 1.5 + 2.0×36 = 75 → 1.875,
+    // i.e. 1.4% above EV's 1.85 from the RAMP alone, with the
+    // steady-state level identical. Hence: EV pinned exactly, and the two
+    // required within 5% of each other. If they ever diverge the way the
+    // P6 review's ICD-bound proc regime did (+48%), this is the test that
+    // says so.
+    // ------------------------------------------------------------------
+    #[test]
+    fn steady_state_stack_count_converges_between_ev_and_monte_carlo() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 40 } ] }"#).unwrap();
+        // Unbounded `add_independent`, applied by an on_hit proc at 0.5.
+        let mut simdef = stack_simdef(ReapplyPolicy::AddIndependent, 0, 4.0, 100.0, "0.5", 0.0);
+        simdef.procs.get_mut("charge_pulse").unwrap().trigger = Trigger::OnHit;
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+
+        let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        let mc = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            Mode::MonteCarlo {
+                iterations: 2_000,
+                seed: 7,
+            },
+        )
+        .unwrap();
+
+        let (a, b) = (ev.avg_stacks["charge"], mc.avg_stacks["charge"]);
+        assert!(
+            close(a, 1.85),
+            "EV avg_stacks {a} — want the hand-worked 74/40 = 1.85 \
+             (steady-state 2 with the accumulator's t=0..2 ramp)"
+        );
+        let rel_err = (b - a).abs() / a;
+        assert!(
+            rel_err < 0.05,
+            "EV avg_stacks {a} vs MC {b}, relative error {rel_err} — the \
+             modes must agree on the steady-state stack count"
         );
     }
 
