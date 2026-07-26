@@ -548,16 +548,38 @@ struct ResourceRt {
     starved_since: Option<f64>,
 }
 
-/// Per-buff runtime state.
-struct BuffRt {
-    active: bool,
+/// ONE live application of a buff — the unit a [`BuffRt`]'s instance list
+/// holds. A binary (non-stacking) buff is the degenerate case: at most one
+/// of these, replaced in place on every reapplication.
+struct BuffInstance {
+    /// The instant this instance was applied (or, for a refresh-in-place,
+    /// last reapplied).
+    #[allow(dead_code)] // read by P7c-T2's snapshot tick_objective.
+    applied_at: f64,
+    /// The instant this instance expires.
     expire_at: f64,
-    /// Bumped on every apply/refresh — lets a stale `BuffExpire` (from a
-    /// window that was refreshed before it fired) recognize itself as
-    /// stale and no-op.
+    /// P7c-T2 (snapshot DoTs): the `tick_objective` rate captured at THIS
+    /// instance's application, ticked unchanged to expiry. Carried but
+    /// never read yet — every buff still ticks the live, re-evaluated rate.
+    #[allow(dead_code)] // read by P7c-T2's snapshot tick_objective.
+    snapshot_rate: f64,
+}
+
+/// Per-buff runtime state. A buff is ACTIVE exactly while `instances` is
+/// non-empty; the instance list is the single source of truth for the
+/// `buff.<name>`/`buff_remaining.<name>` symbols and the effective fold.
+struct BuffRt {
+    /// Every live application, in application order. Empty = inactive.
+    instances: Vec<BuffInstance>,
+    /// Bumped on every instance-set MUTATION (application or expiry
+    /// sweep) — lets a stale `BuffExpire` (scheduled against an
+    /// instance set that has since changed) recognize itself as stale and
+    /// no-op. At most one non-stale `BuffExpire` is ever on the heap per
+    /// buff, at `min(expire_at)` (see [`Sim::handle_buff_expire`]).
     generation: u64,
     /// Start of the CURRENT continuous active span (unchanged by a
-    /// refresh — only a real expiry closes the span).
+    /// refresh or a stack-count change — only a drop to ZERO instances
+    /// closes the span).
     activated_at: f64,
     /// Seconds accumulated across every CLOSED active span.
     active_seconds: f64,
@@ -720,8 +742,7 @@ impl<'a> Sim<'a> {
             resource_regen: vec![0.0; n_resources],
             buffs: (0..n_buffs)
                 .map(|_| BuffRt {
-                    active: false,
-                    expire_at: 0.0,
+                    instances: Vec::new(),
                     generation: 0,
                     activated_at: 0.0,
                     active_seconds: 0.0,
@@ -977,22 +998,32 @@ impl<'a> Sim<'a> {
             )
         })?;
         let expire_at = now + duration;
+        let was_active = !self.buffs[bi].instances.is_empty();
         self.buffs[bi].generation += 1;
         let generation = self.buffs[bi].generation;
-        if !self.buffs[bi].active {
+        if !was_active {
             self.flush_before_change();
-            self.buffs[bi].active = true;
             self.buffs[bi].activated_at = now;
-            // `expire_at` is committed BEFORE the refold, so anything the
+            // The instance is pushed BEFORE the refold, so anything the
             // refold evaluates (a resource `max`/`regen_per_sec`, notably)
             // sees `buff.<this>` = 1 AND a `buff_remaining.<this>` that
             // agrees with it, rather than a half-applied window.
-            self.buffs[bi].expire_at = expire_at;
+            self.buffs[bi].instances.push(BuffInstance {
+                applied_at: now,
+                expire_at,
+                snapshot_rate: 0.0,
+            });
             self.active_buff_set.push(bi);
             self.active_buff_set.sort_unstable();
             self.refresh_after_change()?;
+        } else {
+            // Refresh in place: one instance, expiry reset. The instance
+            // COUNT is unchanged, so nothing the effective fold depends on
+            // moved and no refold is needed.
+            let inst = &mut self.buffs[bi].instances[0];
+            inst.applied_at = now;
+            inst.expire_at = expire_at;
         }
-        self.buffs[bi].expire_at = expire_at;
         self.schedule(
             expire_at,
             Event::BuffExpire {
@@ -1003,16 +1034,70 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
+    /// The scheduled expiry sweep for `bi`: drop every instance whose
+    /// window has closed at `now`, then reschedule at the new earliest
+    /// expiry if any instance survives.
+    ///
+    /// `generation` is the self-cancel: an application since this event was
+    /// scheduled bumped the counter and scheduled its own event, so this
+    /// one is stale and no-ops. A reschedule from HERE reuses the SAME
+    /// generation — the invariant is "at most one non-stale `BuffExpire`
+    /// per buff on the heap, at `min(expire_at)`", and a sweep that leaves
+    /// instances behind is still the same generation's sweep.
     fn handle_buff_expire(&mut self, bi: usize, generation: u64) -> Result<(), PlanError> {
-        if !self.buffs[bi].active || self.buffs[bi].generation != generation {
-            return Ok(()); // stale — refreshed since this was scheduled.
+        if self.buffs[bi].instances.is_empty() || self.buffs[bi].generation != generation {
+            return Ok(()); // stale — the instance set changed since.
         }
         let now = self.time;
-        self.flush_before_change();
-        self.buffs[bi].active_seconds += now - self.buffs[bi].activated_at;
-        self.buffs[bi].active = false;
-        self.active_buff_set.retain(|&x| x != bi);
-        self.refresh_after_change()
+        let expiring = self.buffs[bi]
+            .instances
+            .iter()
+            .filter(|i| i.expire_at <= now)
+            .count();
+        if expiring > 0 {
+            self.flush_before_change();
+            // `retain` leaves only instances with `expire_at > now`, so the
+            // reschedule below can never land at or before `now` — no
+            // same-instant expiry loop is possible.
+            self.buffs[bi].instances.retain(|i| i.expire_at > now);
+            if self.buffs[bi].instances.is_empty() {
+                self.buffs[bi].active_seconds += now - self.buffs[bi].activated_at;
+                self.active_buff_set.retain(|&x| x != bi);
+            }
+            self.refresh_after_change()?;
+        }
+        if let Some(next) = self.earliest_expiry(bi) {
+            self.schedule(
+                next,
+                Event::BuffExpire {
+                    buff: bi,
+                    generation,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `bi`'s earliest instance expiry, or `None` when it is inactive.
+    fn earliest_expiry(&self, bi: usize) -> Option<f64> {
+        self.buffs[bi]
+            .instances
+            .iter()
+            .map(|i| i.expire_at)
+            .min_by(|a, b| {
+                a.partial_cmp(b)
+                    .expect("expiries are finite (see schedule)")
+            })
+    }
+
+    /// `bi`'s LONGEST remaining window in seconds — the value
+    /// `buff_remaining.<buff>` reads. `0.0` when inactive.
+    fn longest_remaining(&self, bi: usize, now: f64) -> f64 {
+        self.buffs[bi]
+            .instances
+            .iter()
+            .map(|i| (i.expire_at - now).max(0.0))
+            .fold(0.0_f64, f64::max)
     }
 
     /// Settle `ri`'s continuous linear regen up to `now`, crediting any
@@ -1287,15 +1372,15 @@ impl<'a> Sim<'a> {
         }
         let buff_base = cooldown_base + sim_plan.actions.len();
         for bi in 0..sim_plan.buffs.len() {
-            self.scratch.slots[buff_base + bi] = if self.buffs[bi].active { 1.0 } else { 0.0 };
+            self.scratch.slots[buff_base + bi] = if self.buffs[bi].instances.is_empty() {
+                0.0
+            } else {
+                1.0
+            };
         }
         let buff_remaining_base = buff_base + sim_plan.buffs.len();
         for bi in 0..sim_plan.buffs.len() {
-            self.scratch.slots[buff_remaining_base + bi] = if self.buffs[bi].active {
-                (self.buffs[bi].expire_at - now).max(0.0)
-            } else {
-                0.0
-            };
+            self.scratch.slots[buff_remaining_base + bi] = self.longest_remaining(bi, now);
         }
         let casts_base = buff_remaining_base + sim_plan.buffs.len();
         for ai in 0..sim_plan.actions.len() {
@@ -1815,7 +1900,7 @@ impl<'a> Sim<'a> {
         self.flush_conditions(now);
         self.flush_ticks(now);
         for b in self.buffs.iter_mut() {
-            if b.active {
+            if !b.instances.is_empty() {
                 b.active_seconds += now - b.activated_at;
             }
         }
