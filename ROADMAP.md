@@ -152,8 +152,9 @@ NOT decided in 0.3.0. Three groups:
   `on_hit` scales with `hits_per_use`) — today's answer is documented and
   pinned in each case, which is not the same as being right. None should
   be guessed at without a config that needs the answer.
-- **API and coverage debt** (`SimScratch`, the `ProcDef` effect arity,
-  the untested `refresh`+live-DoT path, `expr::MAX_STACK`).
+- **API and coverage debt** (the unvalidated contribution VALUE,
+  `SimScratch`, the `ProcDef` effect arity, the untested
+  `refresh`+live-DoT path, `expr::MAX_STACK`).
 
 - [ ] Harmonize `apply_buff`'s ARITY between `ActionDef` (a
       `Vec<String>` list) and `ProcDef` (a single `Option<String>`) —
@@ -265,6 +266,35 @@ NOT decided in 0.3.0. Three groups:
       fix differ (weight the EV accumulator by `hits` vs loop the roll),
       and they are NOT equivalent under an ICD — so this wants a config
       that needs it, not a guess.
+- [ ] **`Contribution::value` is never checked for finiteness** (0.3.0
+      release review) — the one number in the sim config that P7b's
+      evaluation-instant sweep and P7's `ProcDef::icd` fix both missed,
+      and it SHIPS in 0.3.0. It is a bare `f64` on
+      `crate::build::Contribution`; `sim::compile` clones
+      `BuffDef::contributions` straight through into `CompiledBuff`
+      (`crates/rtce/src/sim/compile.rs`, the `contributions:
+      b.contributions.clone()` line), and `Plan` checks phase weights and
+      phase uptimes only (`plan.rs`, the three `is_finite` sites) — so
+      nothing on either level looks at the value.
+
+      Repro, probed directly at the 0.3.0 release review: a one-stat
+      `GameDef` (`hit = dmg * (1 + additive / 100)`, one `sum` bucket), a
+      spammable action applying a buff whose single contribution is
+      `{ "bucket": "additive", "value": <v> }`, run through `sim::run` in
+      `Mode::Expected` over a 5s single-phase scenario. `v = 50.0` gives
+      `Ok(700)`; `v = f64::NAN` gives `Ok(NaN)`; `v = f64::INFINITY` gives
+      `Ok(inf)`. All three are `Ok` — the bad two produce a poisoned
+      `SimReport` with no error anywhere, which is a strictly worse
+      failure than the `icd` NaN that WAS fixed. For contrast, the
+      neighbouring `BuffDef::conditions` map IS caught, with "phase `p`
+      uptime `marked` must be finite, got NaN".
+
+      Note the fix has two halves, because the type is shared: the same
+      `Contribution` is also `BuildState::contributions`, i.e. Level-1
+      config that `Plan::evaluate` reads. Validating only the sim half
+      would leave `Plan::evaluate` accepting the same NaN. Not fixed in
+      0.3.0 purely because it is a behavior change caught at release-review
+      time; it is not a design question and wants no config to justify it.
 - [ ] `sim::SimScratch` is public, constructible, and accepted by
       nothing — `sim::run` builds its own internally (0.3.0 release
       review). It is the clearest piece of dead public API in the crate.

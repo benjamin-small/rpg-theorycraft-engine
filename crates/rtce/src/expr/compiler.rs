@@ -21,7 +21,14 @@ impl Symbols for std::collections::BTreeMap<String, u16> {
 
 /// One flat postfix stack-machine instruction. A [`Program`] is a `Vec<Op>`
 /// evaluated left to right against an operand stack.
+///
+/// `#[non_exhaustive]`: this is the COMPILED representation of an
+/// expression, and it is the engine's to extend — P6 added the nine
+/// comparison/logic ops to it, and a later grammar addition will add more.
+/// It is reachable outside the crate through [`Program::ops`], so `match`
+/// on it with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Op {
     /// Push a literal value.
     Const(f64),

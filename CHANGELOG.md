@@ -84,20 +84,23 @@ than `Option<usize>`, and `SimReport::buff_uptime` is REPLACED by
 `buffs: BTreeMap<String, BuffReport>` (`.uptime` plus the new
 `.avg_stacks`).
 
-**`#[non_exhaustive]` swept across every engine-produced type**, and this
-minor bump is the last free window for it — adding the attribute is itself
-a breaking change. Now marked: every COMPILED type (`SimPlan`,
-`CompiledAction`, `CompiledBuff`, `CompiledProc`, `CompiledResource`,
-`CompiledRule`, `CompiledTick`, `CompiledValue`, and the `ProcEffect`
-enum), every read-only REPORT type (all seven in `sim::report`, plus
+**`#[non_exhaustive]` swept across every engine-produced type.** Adding the
+attribute is itself a breaking change, so it wants a release that permits
+one; under 0.x every minor bump does, and this is the first one after the
+compiled and report surfaces settled. Now marked: every COMPILED type
+(`SimPlan`, `CompiledAction`, `CompiledBuff`, `CompiledProc`,
+`CompiledResource`, `CompiledRule`, `CompiledTick`, `CompiledValue`, and
+the `ProcEffect` enum), plus `expr::Op` — the compiled instruction enum
+reachable through `Program::ops()`, which P6 grew by nine variants — every
+read-only REPORT type (all seven in `sim::report`, plus
 `plan::Explanation` / `PhaseTrace` / `BranchTrace` and
 `search::CandidateResult`), and both ERROR types (`PlanError`,
 `ExprError`). The rationale is uniform: the engine constructs them, no
-consumer does, and every sequencing phase so far has added a field to
-one — so later measurements should be additive rather than breaking. If
-you construct or exhaustively destructure any of them, you cannot after
-0.3.0; read them field by field instead, and `match` on `ProcEffect` with
-a `_` arm.
+consumer does, and every sequencing phase so far has added a field or a
+variant to one — so later measurements should be additive rather than
+breaking. If you construct or exhaustively destructure any of them, you
+cannot after 0.3.0; read them field by field instead, and `match` on
+`ProcEffect` and `Op` with a `_` arm.
 
 The CONFIG types are deliberately NOT marked, so a caller building a
 `GameDef`/`SimDef`/`BuildState`/`Scenario` in Rust can still write a
@@ -468,19 +471,33 @@ struct literal.
   both ways: within one list a `duration` EXPRESSION is sequential (it
   reads sim state, so a later entry sees earlier entries' stack counts)
   while a snapshot MAGNITUDE is frozen (it reads a build, captured once).
+  That partition is two-way only if you leave CONDITIONS out of it, and
+  they are a third axis — LIVE, not frozen. See "Frozen at the world the
+  cast found" below for the correction.
 
 - **`ProcDef::icd` is validated fail-closed at `sim::compile`.** It is a
   bare literal rather than a `NumOrExpr`, so it never went through P7b's
-  evaluation-instant checks and was the last unvalidated number in the sim
-  config. Both bad values failed SILENTLY, and NaN failed in the worst
-  direction: the ICD gate is `now < icd_ready_at`, false for every `now`
-  once that deadline is NaN — so `icd: NaN` DELETED the internal cooldown
-  instead of tightening it, turning a gated proc into an ungated one with
-  no error anywhere. `icd` must now be finite and `>= 0`, with the same
-  positioned error its neighbours produce. **Upgrade note:** this rejects
-  a config that compiled in 0.2.0, but only one whose `icd` was NaN,
-  infinite, or negative — none of which can be deliberate. Pinned by
+  evaluation-instant checks. Both bad values failed SILENTLY, and NaN
+  failed in the worst direction: the ICD gate is `now < icd_ready_at`,
+  false for every `now` once that deadline is NaN — so `icd: NaN` DELETED
+  the internal cooldown instead of tightening it, turning a gated proc
+  into an ungated one with no error anywhere. `icd` must now be finite
+  and `>= 0`, with the same positioned error its neighbours produce.
+  **Upgrade note:** this rejects a config that compiled in 0.2.0, but
+  only one whose `icd` was NaN, infinite, or negative — none of which can
+  be deliberate. Pinned by
   `a_non_finite_or_negative_proc_icd_is_a_compile_error`.
+
+  **This does NOT close out the sim config's numeric validation**, and the
+  entry should not be read that way. `BuffDef::contributions[].value` is
+  still a bare `f64` that nothing checks — `sim::compile` clones it
+  straight through, and `Plan` validates phase weights and phase uptimes
+  but not contribution values — so a NaN there still returns `Ok(NaN)`
+  total damage and an infinity still returns `Ok(inf)`, both silently.
+  That gap ships in 0.3.0; it is recorded with its repro under 0.4.0 in
+  `ROADMAP.md`. What `icd` was is the last unvalidated number that failed
+  in the SAFETY-OFF direction (NaN deleting a gate rather than poisoning
+  a result).
 
 - **`SimReport::condition_uptime` is clamped to `[0, 1]` for buff-driven
   values.** A condition is an uptime FRACTION, and `Plan` clamps it to

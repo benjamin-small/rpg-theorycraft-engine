@@ -788,7 +788,9 @@ struct CastMeasurement {
 /// (buff-driven while a buff is active, else the current phase's static
 /// uptime — see [`Sim::condition_value`]).
 ///
-/// `value` is CLAMPED to `[0, 1]` on the way in. A condition is an uptime
+/// `value` is CLAMPED to `[0, 1]` on the way in — by one LIVE site, in
+/// [`Sim::refresh_after_change`] (the seeding clamp in [`Sim::new`] is
+/// belt-and-braces: no buff is active yet there). A condition is an uptime
 /// FRACTION, and `Plan` clamps it to that range on the way into its slots,
 /// so an out-of-range `BuffDef::conditions` value (`marked: 5.0`) folds as
 /// `1.0` — but [`Sim::condition_value`] returns the buff's raw number, and
@@ -947,7 +949,12 @@ impl<'a> Sim<'a> {
         };
 
         for name in sim.condition_names.clone() {
-            let v = sim.condition_value(&name).clamp(0.0, 1.0); // see `CondAccum`
+            // Belt-and-braces, and DEAD as written: `active_buff_set` was
+            // seeded empty just above, so `condition_value` can only take
+            // its scenario branch here — and that branch already clamps.
+            // The one LIVE clamp for `CondAccum::value` is the one in
+            // `refresh_after_change`, where a buff CAN be driving it.
+            let v = sim.condition_value(&name).clamp(0.0, 1.0);
             sim.condition_accum.insert(
                 name,
                 CondAccum {

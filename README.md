@@ -64,7 +64,7 @@ buckets and 12 pipeline stages; read it if you want the exact thing.)
     { "name": "hit_after_dr", "expr": "hit * (1 - enemy_dr / 100)" },
     { "name": "raw_aps", "expr": "base_aps * (1 + min(as_sum, 100) / 100)" },
     { "name": "hit_dps", "expr": "hit_after_dr * hits_per_use * raw_aps" },
-    // … hit_min / hit_max (the roll band), and the three DoT stages
+    // … hit_min / hit_max (the roll band), and the two DoT stages
     { "name": "total_dps", "expr": "hit_dps + dot_dps" }
   ],
   "objectives": ["total_dps", "hit_after_dr", "hit_min", "hit_max",

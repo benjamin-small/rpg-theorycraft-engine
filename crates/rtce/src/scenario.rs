@@ -2,8 +2,12 @@
 //! weighted phases with stat overrides and condition-uptime fractions.
 //! Level-1 semantics (weighted-phase blending); the Level-2 timeline
 //! simulator ([`crate::sim::run`], shipped in 0.2.0) SHARES this schema —
-//! it reads the same phases and stat overrides, and COMPUTES the condition
-//! uptimes rather than reading the asserted ones.
+//! it reads the same phases and stat overrides, and COMPUTES a condition's
+//! uptime only where a live buff drives it. The precedence is the one
+//! `crate::sim` states: an active buff's `conditions` entry WINS while that
+//! buff lasts, and otherwise the phase's ASSERTED uptime below is what the
+//! sim uses — so for a condition no buff drives, `SimReport`'s reported
+//! uptime is exactly the number written here.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
