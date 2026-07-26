@@ -35,14 +35,22 @@ pub struct SimDef {
 /// instant.
 ///
 /// Untagged: a JSON number deserializes to [`NumOrExpr::Num`] and a JSON
-/// string to [`NumOrExpr::Expr`], so every rtce 0.2.0 config — which only
-/// ever wrote plain numbers in these positions — parses and behaves
-/// EXACTLY as before. A `Num` is pre-baked into a constant at
-/// `sim::compile`; an `Expr` is parsed there against the sim symbol space
-/// (see the `sim` module docs), with the usual positioned, fail-closed
-/// error for an unknown identifier or a syntax problem. Pipeline stages
-/// and buckets are NOT in that space — naming one is a compile error, the
-/// same as any other unresolved name.
+/// string to [`NumOrExpr::Expr`]. Every rtce 0.2.0 config — which only
+/// ever wrote plain numbers in these positions — therefore PARSES
+/// unchanged, and a literal reaches the executor as the identical `f64`
+/// the old field held: `Num` is pre-baked into a constant at
+/// `sim::compile`, so the literal path adds no evaluation and no rounding.
+/// (That is a statement about THIS type only. The 0.3.0 release notes
+/// carry two deliberate executor behavior FIXES landed alongside it, which
+/// can move results for configs whose proc `chance` reads state another
+/// proc mutates in the same trigger batch, or which have an `on_hit` proc
+/// that changes crit chance — see the CHANGELOG.)
+///
+/// An `Expr` is parsed at `sim::compile` against the sim symbol space (see
+/// the `sim` module docs), with the usual positioned, fail-closed error
+/// for an unknown identifier or a syntax problem. Pipeline stages and
+/// buckets are NOT in that space — naming one is a compile error, the same
+/// as any other unresolved name.
 ///
 /// # Evaluation instants
 ///
@@ -61,7 +69,13 @@ pub struct SimDef {
 /// PREDICTED: the executor's resource-affordability wake time is solved
 /// from the cost as evaluated at that decision instant, and if the
 /// expression's value has changed by the time the wake fires, the wake
-/// simply re-decides at the new value (see `sim::exec`'s `earliest_afford`).
+/// simply re-decides at the new value (see `sim::exec`'s `afford`).
+///
+/// Keep cost expressions CHEAP for that reason. A cost is the only one of
+/// these fields evaluated on a hot path — once per rule per decision point
+/// — where the others are evaluated once per cast or per buff
+/// application. A literal costs nothing at all (it is a pre-baked
+/// constant), so leave a fixed cost as a number.
 ///
 /// # Fail-closed
 ///
@@ -70,6 +84,11 @@ pub struct SimDef {
 /// additionally reject a negative result. [`ActionDamage::stats`] values
 /// may legitimately be negative (a stat is not a quantity of anything), so
 /// only finiteness is enforced there.
+///
+/// Deliberately NOT `#[non_exhaustive]`, unlike the compiled
+/// [`crate::sim::CompiledValue`]: this is a CONFIG type, "number or
+/// expression" is the whole idea, and a caller building or inspecting a
+/// `SimDef` in Rust should be able to match it exhaustively.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum NumOrExpr {
@@ -88,18 +107,29 @@ impl Default for NumOrExpr {
     }
 }
 
+/// A number is always a literal: `NumOrExpr::from(40.0)` is
+/// [`NumOrExpr::Num`], the pre-baked-constant path.
 impl From<f64> for NumOrExpr {
     fn from(v: f64) -> Self {
         NumOrExpr::Num(v)
     }
 }
 
+/// A string is ALWAYS an expression, even when it looks like a number:
+/// `NumOrExpr::from("40")` is [`NumOrExpr::Expr`] — a compiled program
+/// that evaluates to 40, not the literal [`NumOrExpr::Num`]`(40.0)`. The
+/// two agree on every value they produce (the grammar's numeric literals
+/// are `f64`), so this is a representation difference, not a semantic
+/// one — but it is the one place this type can be misread, and it does
+/// cost a `Program` and an evaluation. Write `40.0.into()` for a
+/// constant.
 impl From<&str> for NumOrExpr {
     fn from(s: &str) -> Self {
         NumOrExpr::Expr(s.to_string())
     }
 }
 
+/// As [`From<&str>`][`NumOrExpr::from`]: a string is always an expression.
 impl From<String> for NumOrExpr {
     fn from(s: String) -> Self {
         NumOrExpr::Expr(s)
@@ -159,6 +189,16 @@ pub struct ActionDamage {
     /// the damage query and the `on_crit` proc weight), and need only be
     /// FINITE — a stat may legitimately be negative. `hits_per_use` lives
     /// in this map and follows the same rule. See [`NumOrExpr`].
+    ///
+    /// The completion instant has internal ORDER, and these expressions
+    /// are evaluated at a fixed point within it: AFTER this action's
+    /// [`ActionDef::gain`] is credited and after its own cast is counted,
+    /// and BEFORE any of this cast's proc rolls. So an expression here
+    /// reads a resource at its POST-gain amount, and `casts.<this action>`
+    /// INCLUDES the cast being resolved (`1` on the first cast, never
+    /// `0`). A buff applied by this cast's own procs is NOT visible —
+    /// which is the point: a proc triggered by a hit cannot change what
+    /// that hit was.
     #[serde(default)]
     pub stats: BTreeMap<String, NumOrExpr>,
 }
@@ -174,10 +214,25 @@ pub struct BuffDef {
     /// APPLICATION and SNAPSHOTTED onto the window it starts (or
     /// refreshes): a stat/phase change afterwards never retroactively
     /// lengthens or shortens a window already in flight — the NEXT
-    /// application re-evaluates and gets the new value. It is evaluated
-    /// against the state as of the application instant, BEFORE this buff's
-    /// own contributions/conditions are folded into the effective build.
-    /// Must be finite and `>= 0` — see [`NumOrExpr`].
+    /// application re-evaluates and gets the new value. Must be finite and
+    /// `>= 0` — see [`NumOrExpr`].
+    ///
+    /// It reads the LIVE state at that instant, which differs between the
+    /// two application paths — deliberately, and this buff's own effects
+    /// are never un-folded to hide the difference:
+    ///
+    /// - **First application** (this buff not currently active):
+    ///   `buff.<self>` is `0`, `buff_remaining.<self>` is `0`, and a
+    ///   condition this buff drives reads its non-buff value.
+    /// - **Refresh** (this buff already active): the outgoing window is
+    ///   still in force, so `buff.<self>` is `1`, a condition this buff
+    ///   drives reads its BUFF-DRIVEN value, and `buff_remaining.<self>`
+    ///   is the time left on the window being REPLACED.
+    ///
+    /// The refresh reading is what makes pandemic-style refreshes
+    /// expressible as data — `"min(12, buff_remaining.x + 8)"` extends by
+    /// 8s up to a 12s cap. Bucket CONTRIBUTIONS are invisible on both
+    /// paths: buckets are not in the sim symbol space at all.
     ///
     /// NB: the reserved sim symbol `duration` is the SCENARIO's total
     /// length in seconds, not this field. An expression here that names
@@ -259,15 +314,16 @@ pub struct Rule {
     pub when: Option<String>,
 }
 
+/// Verbatim from docs/superpowers/specs/2026-07-22-p6-sequencing-design.md
+/// "Config surface" section (jsonc comments stripped — serde_json has no
+/// comment support; every key/value is copied unchanged, including the
+/// `cast_time` formula `"1.0 / base_aps"`). Every position that P7b made
+/// expression-valued is a plain JSON NUMBER here, which is exactly what
+/// makes this the 0.2.0 compatibility fixture — shared by this module's
+/// parse test and `sim::exec`'s behavioral one, so there is ONE copy and
+/// no unchecked claim of byte-identity between two.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Verbatim from docs/superpowers/specs/2026-07-22-p6-sequencing-design.md
-    // "Config surface" section (jsonc comments stripped — serde_json has no
-    // comment support; every key/value is copied unchanged, including the
-    // `cast_time` formula `"1.0 / base_aps"`).
-    const SIMDEF_JSON: &str = r#"{
+pub(crate) const P6_SPEC_SIMDEF_JSON: &str = r#"{
       "resources": {
         "mana": { "max": "max_mana", "regen_per_sec": "mana_regen" }
       },
@@ -297,6 +353,10 @@ mod tests {
       "damage_objective": "hit_after_dr"
     }"#;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     // Verbatim from the spec's "Rotation (candidate-domain …)" section.
     const ROTATION_JSON: &str = r#"{ "rules": [
       { "action": "frost_nova", "when": "cooldown.frost_nova == 0 and buff.vuln_window == 0" },
@@ -306,7 +366,7 @@ mod tests {
 
     #[test]
     fn simdef_round_trips_the_spec_example_verbatim() {
-        let def: SimDef = serde_json::from_str(SIMDEF_JSON).unwrap();
+        let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
 
         assert_eq!(def.resources["mana"].max, "max_mana");
         assert_eq!(def.resources["mana"].regen_per_sec, "mana_regen");

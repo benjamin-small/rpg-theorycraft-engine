@@ -48,9 +48,14 @@
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full
-      effective build today); folding the EV `on_crit` crit-chance query
-      (`eval_action_crit_chance`) into the same `Plan` call
-      `eval_action_damage` already makes, instead of a second pass.
+      effective build today). The second half of this item is DONE as a
+      side effect of P7b: the EV `on_crit` crit-chance query no longer
+      builds a second overlay — `Sim::measure_cast` builds ONE per cast
+      and both queries read it. It is still a second `Plan` call (folding
+      it into `eval_action_damage`'s call remains open), but it is no
+      longer a second overlay, and it now happens at the cast's own
+      instant rather than after the cast's procs — a correctness fix, not
+      just a trim (see the 0.3.0 notes).
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

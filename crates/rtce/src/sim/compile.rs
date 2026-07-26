@@ -17,7 +17,12 @@ use crate::simdef::{NumOrExpr, Rotation, SimDef, Trigger};
 /// per field and documented on [`NumOrExpr`]; the executor calls
 /// [`CompiledValue::eval`] at exactly that instant and validates the
 /// result fail-closed there.
-#[derive(Debug)]
+///
+/// `#[non_exhaustive]`: the COMPILED representation is the engine's to
+/// extend (a future variant could pre-fold a common shape), and no
+/// consumer needs to match on it — `eval` is the whole interface.
+#[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum CompiledValue {
     /// A literal from the config, pre-baked.
     Const(f64),
@@ -26,10 +31,17 @@ pub enum CompiledValue {
 }
 
 impl CompiledValue {
-    /// This value at the instant `slots` describes. Never validates —
-    /// the caller does that at the field's documented evaluation instant,
-    /// so the error can name the field and the instant (see `sim::exec`'s
-    /// `eval_field`).
+    /// This value at the instant `slots` describes.
+    ///
+    /// `slots` is the executor's combined `[plan slots | sim slots]` array
+    /// (see [`SimPlan::slot_width`] and the `sim` module's slot-layout
+    /// docs); the executor owns it and keeps it current — there is no
+    /// supported way for a consumer to build one, so in practice this is
+    /// called by `sim::run` and read by no one else.
+    ///
+    /// Never validates: the caller does that at the field's documented
+    /// evaluation instant, so the error can name the field and the instant
+    /// (see `sim::exec`'s `Sim::eval_quantity`/`Sim::eval_stat`).
     pub fn eval(&self, slots: &[f64]) -> f64 {
         match self {
             CompiledValue::Const(v) => *v,
@@ -713,9 +725,9 @@ mod tests {
         assert_eq!(sp.actions[0].cost.len(), 1);
         assert_eq!(sp.actions[0].cost[0].0, 0); // "mana"
                                                 // A literal is pre-baked into a constant — no Program at all.
-        assert!(matches!(sp.actions[0].cost[0].1, CompiledValue::Const(v) if v == 40.0));
-        assert!(matches!(sp.actions[1].cooldown, CompiledValue::Const(v) if v == 10.0));
-        assert!(matches!(sp.buffs[0].duration, CompiledValue::Const(v) if v == 6.0));
+        assert_eq!(sp.actions[0].cost[0].1, CompiledValue::Const(40.0));
+        assert_eq!(sp.actions[1].cooldown, CompiledValue::Const(10.0));
+        assert_eq!(sp.buffs[0].duration, CompiledValue::Const(6.0));
         assert!(sp.actions[0].damage.is_some());
         assert_eq!(sp.actions[1].name, "frost_nova");
 
