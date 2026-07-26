@@ -80,9 +80,22 @@ fn main() {
     //    exact), and `actions: ["bolt"]` so a slam's cast is not an event
     //    for it at all.
     //
-    //    Both durations are half-integer `representative` values, which
-    //    keeps every expiry strictly between cast completions so no pin
-    //    leans on a same-instant tie-break.
+    //    Both durations are half-integer `representative` values, and that
+    //    is load-bearing: it keeps every expiry strictly BETWEEN cast
+    //    completions. When a buff's window closes on exactly the instant a
+    //    cast completes, the `BuffExpire` was scheduled earlier and so
+    //    carries the lower `seq` — it resolves FIRST, and the cast measures
+    //    itself WITHOUT the buff it is about to refresh. That is not
+    //    hypothetical here: `shock` at a flat `2.0` (refreshed by a bolt
+    //    every 2s) still reports 0.95 uptime, but bolt damage falls
+    //    2175 → 1837.5, because every bolt after the first loses its own
+    //    shock bonus. 2.5 sidesteps that, so the pins below measure the
+    //    TRIGGER mechanic and not an intra-instant ordering artifact.
+    //
+    //    This is a mid-fight ordering property and has nothing to do with
+    //    the fight horizon: a cast completing at exactly `duration` counts,
+    //    whatever else is queued at that instant (see `Sim::run_loop`'s
+    //    "horizon rule").
     let simdef_json = r#"{
       "actions": {
         "bolt": {

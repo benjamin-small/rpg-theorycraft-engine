@@ -129,6 +129,41 @@
       `TickObjectiveRepr`) report "data did not match any variant" rather
       than the inner field error, which is positioned but unhelpful —
       worth a hand-written `Deserialize` if the sweep happens.
+- [ ] **Should `CastComplete` out-rank a coincident `BuffExpire`?**
+      (P7e-T2 review) — 0.4.0 question, OPEN, deliberately not decided in
+      0.3.0. Same-instant events resolve in scheduling (`seq`) order, so a
+      buff whose window closes exactly when the cast that would refresh it
+      completes expires FIRST (it was scheduled back at the last
+      application, so it holds the lower `seq`) — and that cast measures
+      itself without the buff it is about to re-apply. Arguably wrong: a
+      cast that refreshes a buff at the instant it lapses should plausibly
+      keep it up, and a player would never describe that frame as a gap.
+
+      What makes it worth deciding, rather than leaving to config hygiene,
+      is that the cost is INVISIBLE in the integrated columns. The gap is
+      zero-width, so uptime / `avg_stacks` / `condition_uptime` read
+      exactly as if nothing happened while damage drops. Measured on
+      `examples/poe2_triggers.rs` (`shock` refreshed by a bolt every 2s),
+      changing only the duration:
+
+      | shock duration | shock uptime | bolt damage |
+      | -------------- | ------------ | ----------- |
+      | 2.5            | 0.95         | 2175.0      |
+      | 2.0            | 0.95         | 1837.5      |
+
+      15% of bolt damage, with nothing in the report pointing at it. The
+      three PoE2 slices' half-integer `representative` durations dodge it
+      deliberately and now say so; `sim`'s module docs carry the warning
+      under "A buff expiring on the cast grid".
+
+      NOT changed in 0.3.0 on purpose: the ordering is long-standing 0.2.0
+      behavior, it is orthogonal to the P7e-T2 horizon-drain fix (which is
+      about WHICH events resolve at `t == duration`, not their order), and
+      reordering would move numbers across the suite. If it changes it
+      wants its own slice, a mutation-proven pin, and a migration note —
+      `CastComplete`-before-`BuffExpire` cannot be expressed by `seq`
+      alone and needs a second ordering key on the queue, the same
+      machinery the P6 design notes declined for `End`.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

@@ -82,10 +82,18 @@ fn main() {
     //         (`representative`) to make the shared clock VISIBLE: the
     //         three applications ask for 4.5s, 5.5s and 6.5s in turn, so a
     //         per-instance clock and a shared one land on measurably
-    //         different expiries. The half-seconds are deliberate too —
-    //         they keep every expiry instant strictly BETWEEN cast
-    //         completions, so no pin below has to lean on the
-    //         expiry-before-same-instant-completion tie-break.
+    //         different expiries. The half-seconds are deliberate too, and
+    //         load-bearing: they keep every expiry instant strictly BETWEEN
+    //         cast completions. A `BuffExpire` sharing an instant with a
+    //         `CastComplete` was scheduled earlier, so it carries the lower
+    //         `seq` and resolves FIRST — the stack is already gone when the
+    //         rule `when` and the damage measurement read it. At a flat
+    //         `"4 + stacks.frenzy_charge"` that alone reshapes the whole
+    //         cycle (15 frenzy / 25 spender instead of 12 / 28), which
+    //         would make this slice a lesson in event ordering rather than
+    //         in the shared clock. NOT a fight-horizon concern: a cast
+    //         completing at exactly `duration` counts regardless (see
+    //         `Sim::run_loop`'s "horizon rule").
     //      one contribution of `+10` to `more_global`, a `product` bucket.
     //         Per-stack, the VALUE is scaled by the live count, so 3
     //         charges fold as ×(1 + 3·10/100) = ×1.30 — read the pin

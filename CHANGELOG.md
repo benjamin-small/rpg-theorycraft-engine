@@ -214,6 +214,60 @@ until then, per semver's "anything goes" pre-1.0 clause).
   0.x, but an upgrader deserves the warning; add `apply_buff: Vec::new()`
   / `actions: None`, or switch to `..Default::default()` on `ActionDef`.
 
+- **Fixed (behavior): the fight horizon is DRAINED, so a cast completing
+  at `t == duration` is never silently dropped.** The run loop processed
+  at most ONE event at the horizon: it popped an event, advanced the
+  clock, handled it, then broke on `time >= duration` — so any other event
+  already queued at that same instant was discarded, and WHICH one
+  survived was decided by the heap's `(time, seq)` tiebreak. Concretely, a
+  `BuffExpire` landing on the horizon carried the lower `seq`, popped
+  first, and swallowed the `CastComplete` there — dropping that cast
+  whole: its count, its damage, and its `apply_buff`. A cast at the
+  horizon DID count when it was alone on the instant, so this was never
+  "the horizon excludes its boundary"; it was order-dependent silent
+  damage loss.
+
+  The horizon rule is now stated in the public `sim` module docs and
+  pinned: no cast BEGINS at or after `duration`; every event already
+  scheduled AT `duration` is processed, in the usual `seq` order; a cast
+  completing exactly at `duration` counts. The drain is bounded
+  (`HORIZON_DRAIN_LIMIT`) and fails closed naming the looping event,
+  matching the instant-cast livelock guard's shape.
+
+  **Upgrading from 0.2.0: this can move your numbers.** Any config with
+  INTEGER buff durations will eventually land an expiry exactly on an
+  integer fight's horizon, and every such config was losing its final
+  cast. The symptom is an off-by-one cast count that depends on the buff
+  duration: a 10s fight of 1s casts applying a `refresh` buff reported 9
+  casts at durations 2 / 5 / 9, and 10 at 9.5. Nothing in this repo moved
+  — no `sim::exec` pin, and `diablo4_rotation` holds byte for byte
+  (225199.1088 / 3753.31848 / 0.4, MC block included), because its 60th
+  cast was already alone at the horizon and its `vuln_window` expiries
+  land at 4, 14, …, 54 — never at 60. A config of YOURS that does move was
+  measuring the bug; the new number is the correct one.
+
+  One edge becomes newly reachable and is pinned rather than left to
+  drift: a ZERO-WEIGHT FINAL PHASE puts a `PhaseBoundary` on the horizon
+  too, and since it was scheduled at sim construction it holds the lower
+  `seq` and resolves first — so a cast completing at `duration` is
+  measured under, and credited to, that zero-width phase. That follows the
+  `seq` rule and is a consequence of draining the instant, not a designed
+  statement about what a zero-width phase should own.
+
+- **Docs: a buff expiring on the cast grid.** New `sim` module-docs
+  section on a long-standing (0.2.0, unchanged) consequence of `seq`
+  ordering that costs damage silently: a `BuffExpire` sharing an instant
+  with the `CastComplete` that would refresh it resolves FIRST, so the
+  refreshing cast does not benefit from its own buff. The gap is
+  zero-width, so `uptime`/`avg_stacks`/`condition_uptime` read as if
+  nothing happened and only damage moves — `examples/poe2_triggers.rs` at
+  `shock: 2.0` instead of `2.5` reports the same 0.95 uptime with bolt
+  damage down 2175 → 1837.5. Worth checking whenever a buff duration is an
+  exact multiple of the refreshing action's cadence. Whether the ordering
+  itself should change (a `CastComplete` arguably ought to out-rank a
+  coincident `BuffExpire`) is an open 0.4.0 question in `ROADMAP.md`,
+  explicitly not decided here.
+
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated
   against a slot array whose time-varying tail (`buff.*`,

@@ -100,6 +100,79 @@
 //! skips the rest of the cast pipeline: no cost, no cooldown, and no
 //! further proc rolls (which is what bounds proc recursion).
 //!
+//! # The fight horizon
+//!
+//! The fight runs on `[0, duration]`, where `duration` is the sum of the
+//! scenario's phase weights, and the last instant of it — `t == duration`,
+//! the HORIZON — obeys three rules:
+//!
+//! - **No cast BEGINS at or after `duration`.** The rotation makes no new
+//!   commitments at the horizon: nothing is chosen, no cost is paid, no
+//!   cooldown is armed.
+//! - **Every event already scheduled AT `duration` is processed.** The
+//!   executor drains the whole instant; it does not stop after the first
+//!   event there. Within the instant they resolve in scheduling order
+//!   (the `seq` tiebreaker), exactly as at any other instant.
+//! - **Therefore a cast completing exactly at `duration` counts** — its
+//!   `casts`, its damage and its `apply_buff` all land. A cast started at
+//!   `duration − cast_time` is a full cast, not a truncated one.
+//!
+//! Read together: the horizon is CLOSED for things already in flight and
+//! OPEN for nothing new. A 10s fight of 1s casts is ten casts, the tenth
+//! completing on the buzzer, whether or not a buff happens to expire on
+//! that same instant.
+//!
+//! Buff windows are integrated the same way: a window closing at
+//! `duration` is credited its full span, whether it is closed by its own
+//! `BuffExpire` at the horizon or by the end-of-fight flush.
+//!
+//! # A buff expiring on the cast grid (read this one)
+//!
+//! Events sharing an instant resolve in SCHEDULING order (the `seq`
+//! tiebreaker), at the horizon and everywhere else alike. One consequence
+//! is worth calling out on its own, because it costs damage silently:
+//!
+//! > When a buff's window closes at exactly the instant the cast that
+//! > would refresh it completes, the `BuffExpire` was scheduled EARLIER —
+//! > back when the buff was last applied — so it carries the lower `seq`
+//! > and resolves FIRST. The buff is already down when that cast measures
+//! > itself. The cast re-applies it immediately afterwards, so the window
+//! > never visibly lapses; only that cast's own damage is short.
+//!
+//! This bites whenever a buff's `duration` is an exact multiple of the
+//! cadence of the action that refreshes it — which is exactly what a
+//! config author is most likely to write by hand ("2s shock, refreshed by
+//! a bolt every 2s").
+//!
+//! **The uptime column will not tell you.** The expiry and the
+//! reapplication share an instant, so the gap is zero-width and every
+//! INTEGRATED measurement — [`BuffReport::uptime`], `avg_stacks`,
+//! `SimReport::condition_uptime` — reads exactly as if nothing happened.
+//! The loss appears only in damage. Measured on
+//! `examples/poe2_triggers.rs`, whose `shock` is refreshed by a bolt every
+//! 2s, changing nothing but the duration:
+//!
+//! ```text
+//!     shock duration      shock uptime      bolt damage
+//!                2.5              0.95           2175.0
+//!                2.0              0.95           1837.5
+//! ```
+//!
+//! Identical uptime, 15% less damage. The guidance that falls out of it:
+//! if a buff duration lands exactly on the cast grid, nudge it off — the
+//! examples' half-integer `representative` durations are that nudge, and
+//! say so — or expect the refreshing cast not to benefit from its own
+//! buff. If a damage number looks low while the uptimes look perfect,
+//! this is the first thing to check.
+//!
+//! Whether this ordering is the RIGHT semantics is an open question for a
+//! later version, recorded in `ROADMAP.md`: a `CastComplete` arguably
+//! ought to resolve before a coincident `BuffExpire`, since a cast that
+//! refreshes a buff at the instant it lapses should plausibly keep it up.
+//! Deliberately NOT decided here — the ordering is long-standing behavior,
+//! orthogonal to the horizon rule above, and changing it would move
+//! numbers for every config that hits it.
+//!
 //! # Sim slot layout
 //!
 //! A future executor maintains one flat `&[f64]` slot array shaped

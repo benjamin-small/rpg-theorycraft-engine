@@ -166,9 +166,12 @@
 //!   checked only when a trigger fires, never something a rule waits on.
 //! - `End` needs no event either: the run loop's own termination check
 //!   (`heap top time > duration`, or heap empty) reaches `duration`
-//!   exactly, INCLUDING a cast that completes AT the boundary (needed for
-//!   the keystone cross-check — a cast starting at `duration −
-//!   cast_time` must still count). Scheduling a sentinel `End` entry would
+//!   exactly and DRAINS that instant, INCLUDING a cast that completes AT
+//!   the boundary (needed for the keystone cross-check — a cast starting
+//!   at `duration − cast_time` must still count) even when a `BuffExpire`
+//!   shares the instant with it. See [`Sim::run_loop`]'s "horizon rule"
+//!   for the full statement, and [`super`]'s "fight horizon" section for
+//!   the config author's version. Scheduling a sentinel `End` entry would
 //!   have to out-rank same-instant real events via a second ordering key
 //!   ON TOP OF `seq`, which the spec's own "seq tiebreaker" wording does
 //!   not ask for — the duration check gets the identical result with one
@@ -279,6 +282,29 @@ const PROC_FIRE_EPSILON: f64 = 1e-9;
 /// — see that method's doc comment for why such a config has no finite
 /// answer to compute in the first place.
 const INSTANT_CHAIN_LIMIT: u32 = 10_000;
+
+/// Hard bound on events processed at the fight horizon (`t == duration`)
+/// before [`Sim::run_loop`]'s drain fails closed rather than hang — the
+/// same fail-closed shape as [`INSTANT_CHAIN_LIMIT`], deliberately a
+/// SEPARATE constant rather than a reuse of it.
+///
+/// Separate because the two bound different things and would want
+/// different tuning: `INSTANT_CHAIN_LIMIT` bounds ONE rotation decision's
+/// zero-time cast chain (a config with no finite dps at all), while this
+/// bounds how many already-scheduled events may resolve at the LAST
+/// instant of the fight. Aliasing them would make a future retune of
+/// either silently retune the other, for no shared reason beyond both
+/// being "some big number".
+///
+/// Nothing in this executor can currently reach it: the only same-instant
+/// rescheduler is [`Sim::handle_buff_expire`], which retains only
+/// instances with `expire_at > now` and so can never re-arm at `now`, and
+/// [`Sim::attempt_decision`] (the only source of new casts and `Wake`s) is
+/// SKIPPED at the horizon. It is insurance against a future scheduling
+/// policy that can re-arm at the same instant, so such a policy fails
+/// closed with a positioned error naming the looping event instead of
+/// hanging inside the drain.
+const HORIZON_DRAIN_LIMIT: u32 = 10_000;
 
 /// Preallocated executor buffers: a [`Plan`] [`EvalScratch`] (for every
 /// `Plan::evaluate_phase` call the sim makes) plus the sim's own extended
@@ -2466,18 +2492,82 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
+    /// The discrete-event loop: pop the earliest event, advance the clock
+    /// to it, resolve it, re-decide. Terminates when the heap is empty or
+    /// its next event lies strictly PAST the fight horizon.
+    ///
+    /// # The horizon rule
+    ///
+    /// The horizon is `t == duration`, and the rule (stated for config
+    /// authors in [`super`]'s "fight horizon" section) is:
+    ///
+    /// - No cast may BEGIN at or after `duration` — `attempt_decision` is
+    ///   skipped once the clock reaches the horizon, so the rotation makes
+    ///   no new commitments there.
+    /// - EVERY event already scheduled AT `duration` is processed. The
+    ///   loop DRAINS the instant rather than stopping after the first one.
+    /// - Therefore a cast completing exactly at `duration` counts — its
+    ///   `casts`, its damage and its `apply_buff` all land.
+    ///
+    /// The drain is the load-bearing part. Before it, the loop broke on
+    /// `time >= duration` immediately after handling ONE event, so any
+    /// other event queued at that same instant was silently discarded and
+    /// WHICH one survived was decided by the heap's `(time, seq)`
+    /// tie-break: a `BuffExpire` landing on the horizon would swallow the
+    /// `CastComplete` there, dropping that cast whole. A cast at the
+    /// horizon already counted when it was ALONE on the instant, so this
+    /// was never "the horizon excludes its boundary" — it was
+    /// order-dependent silent damage loss. Pinned by
+    /// `cast_completing_at_the_horizon_counts_even_when_a_buff_expires_there`.
+    ///
+    /// The drain is bounded by [`HORIZON_DRAIN_LIMIT`] and fails closed
+    /// naming the looping event — see that constant for why nothing can
+    /// reach it today and why it is nonetheless there.
     fn run_loop(&mut self) -> Result<(), PlanError> {
         self.attempt_decision()?;
-        loop {
-            if self.time >= self.duration {
-                break;
-            }
-            let Some(top) = self.heap.peek() else { break };
+        let mut horizon_events: u32 = 0;
+        while let Some(top) = self.heap.peek() {
             if top.time.0 > self.duration {
                 break;
             }
             let item = self.heap.pop().expect("just peeked Some");
             self.time = item.time.0;
+            // The clock is monotone (the heap pops in `(time, seq)` order),
+            // so once this is true every remaining event that passes the
+            // `> duration` guard above sits at exactly `duration`: this
+            // flag IS "we are draining the horizon instant".
+            let at_horizon = self.time >= self.duration;
+            if at_horizon {
+                horizon_events += 1;
+                if horizon_events > HORIZON_DRAIN_LIMIT {
+                    // Name the CONFIG entity, not just the variant — the
+                    // whole point of the bound is to say WHAT looped.
+                    let culprit = match item.event {
+                        Event::CastComplete { action } => {
+                            format!(
+                                "cast completion of action `{}`",
+                                self.sim_plan.actions[action].name
+                            )
+                        }
+                        Event::BuffExpire { buff, .. } => {
+                            format!("expiry of buff `{}`", self.sim_plan.buffs[buff].name)
+                        }
+                        Event::PhaseBoundary { phase } => {
+                            format!("phase boundary into `{}`", self.scenario.phases[phase].name)
+                        }
+                        Event::Wake => "a rotation wake".to_string(),
+                    };
+                    return Err(PlanError {
+                        what: format!(
+                            "horizon drain livelock: {culprit} at t={} — {HORIZON_DRAIN_LIMIT} \
+                             events processed at the fight horizon (duration={}) without the \
+                             queue draining; some effect is rescheduling itself at the same \
+                             instant (see `Sim::run_loop`'s doc comment)",
+                            self.time, self.duration
+                        ),
+                    });
+                }
+            }
             match item.event {
                 Event::CastComplete { action } => self.complete_cast(action)?,
                 Event::BuffExpire { buff, generation } => {
@@ -2490,10 +2580,11 @@ impl<'a> Sim<'a> {
                 }
                 Event::Wake => {}
             }
-            if self.time >= self.duration {
-                break;
+            // No cast BEGINS at or after the horizon — only already
+            // committed ones complete.
+            if !at_horizon {
+                self.attempt_decision()?;
             }
-            self.attempt_decision()?;
         }
         self.finalize();
         Ok(())
@@ -3864,6 +3955,221 @@ mod tests {
                 report.total.total_damage
             );
             assert!(close(report.total.duration, 20.0));
+        }
+    }
+
+    /// The fight horizon: what happens to events scheduled at exactly
+    /// `t == duration` (P7b review — see [`Sim::run_loop`]'s doc comment
+    /// for the rule these pin).
+    mod horizon {
+        use super::*;
+
+        /// `filler`: 1s cast, spammed, applying a `refresh` buff of the
+        /// given duration at each cast complete. Nothing here reads the
+        /// buff — it exists purely to put a `BuffExpire` on the heap.
+        fn horizon_fixture(buff_duration: f64) -> (SimDef, Rotation) {
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "filler".to_string(),
+                ActionDef {
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: Some(ActionDamage {
+                        stats: BTreeMap::new(),
+                    }),
+                    apply_buff: vec!["window".into()],
+                },
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "window".to_string(),
+                BuffDef {
+                    duration: NumOrExpr::Num(buff_duration),
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: None,
+                },
+            );
+            (
+                SimDef {
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs: BTreeMap::new(),
+                    damage_objective: "hit".into(),
+                },
+                Rotation {
+                    rules: vec![Rule {
+                        action: "filler".into(),
+                        when: None,
+                    }],
+                },
+            )
+        }
+
+        // ------------------------------------------------------------------
+        // A cast completing AT the horizon counts — and keeps counting when
+        // a `BuffExpire` happens to land on the same instant.
+        //
+        // Hand-worked cadence (10s fight, 1s cast, spammed from t=0): casts
+        // complete at t=1,2,…,10 — TEN of them, the tenth landing exactly on
+        // the horizon. Each completion refreshes `window`, so the buff's
+        // pending expiry is always `(last cast) + buff_duration`; a stale
+        // event from application `k` sits on the heap at `k + duration` and
+        // no-ops when popped (generation cancel).
+        //
+        // What each `buff_duration` puts at t=10 alongside `CastComplete`:
+        //   2   → BuffExpire(10) from the t=8 application (stale at t=9)
+        //   5   → BuffExpire(10) from the t=5 application (stale at t=6)
+        //   9   → BuffExpire(10) from the t=1 application (stale at t=2)
+        //   9.5 → nothing: expiries land at 10.5, 11.5, … — never at 10
+        //
+        // In all four cases the tenth cast completes at t=10 and must be
+        // credited: 10 casts × 100 dmg = 1000 over 10s = 100 dps.
+        //
+        // Before the horizon drain this returned NINE casts for 2/5/9 (the
+        // `BuffExpire` carried the lower `seq`, so it popped first, and the
+        // loop broke on `time >= duration` before ever reaching the
+        // `CastComplete`) and TEN for 9.5 — silent, order-dependent damage
+        // loss decided by a heap tie-break.
+        // ------------------------------------------------------------------
+        #[test]
+        fn cast_completing_at_the_horizon_counts_even_when_a_buff_expires_there() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let scenario: Scenario =
+                serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+
+            for buff_duration in [2.0, 5.0, 9.0, 9.5] {
+                let (simdef, rotation) = horizon_fixture(buff_duration);
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+                assert_eq!(
+                    report.actions["filler"].casts, 10,
+                    "buff duration {buff_duration}"
+                );
+                assert!(
+                    close(report.total.total_damage, 1000.0),
+                    "buff duration {buff_duration}: got {}",
+                    report.total.total_damage
+                );
+                assert!(
+                    close(report.total.dps, 100.0),
+                    "buff duration {buff_duration}: got {}",
+                    report.total.dps
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // A ZERO-WEIGHT FINAL PHASE puts a `PhaseBoundary` on the horizon,
+        // and the drain makes that instant's ordering OBSERVABLE for the
+        // first time. This pins what it currently does.
+        //
+        // Fixture: phases `[main: 10, epilogue: 0]`, so `duration` is 10 and
+        // the boundary into `epilogue` is scheduled at exactly t=10. A 1s
+        // `filler` is spammed, so casts complete at t=1,2,…,10. `epilogue`
+        // overrides `dmg` to 250 (vs the build's 100), which makes "which
+        // phase's effective state did the 10th cast measure under?" visible
+        // in the damage number rather than only in the attribution.
+        //
+        // Both events sit at t=10. The boundary was scheduled during
+        // `Sim::new` (phase weights are static config), the `CastComplete`
+        // at t=9 by `begin_cast` — so the boundary holds the far lower `seq`
+        // and resolves FIRST. Therefore:
+        //   main     = casts at t=1..9  = 9 × 100 =  900, dps 900/10 = 90
+        //   epilogue = the t=10 cast    = 1 × 250 =  250, dps 0.0
+        //              (weight 0 — `PhaseReport::dps` guards the divide)
+        //   total    =                              1150 over 10s = 115 dps
+        //   casts    = 10
+        //
+        // The attribution follows the `seq` rule and nothing else: it is a
+        // CONSEQUENCE of draining the horizon in scheduling order, not a
+        // designed choice about what a zero-width phase should own. Pinned
+        // so that a future phase wanting different attribution has to change
+        // this number deliberately instead of drifting into it.
+        //
+        // Also discriminating for the drain itself: before it, the boundary
+        // popped first and the loop broke, dropping the 10th cast entirely
+        // (9 casts, 900 total, epilogue 0).
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_zero_weight_final_phase_takes_the_horizon_cast_by_the_seq_rule() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let scenario: Scenario = serde_json::from_str(
+                r#"{ "phases": [ { "name": "main", "weight": 10 },
+                                 { "name": "epilogue", "weight": 0,
+                                   "stats": { "dmg": 250.0 } } ] }"#,
+            )
+            .unwrap();
+
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "filler".to_string(),
+                ActionDef {
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: Some(ActionDamage {
+                        stats: BTreeMap::new(),
+                    }),
+                    apply_buff: Vec::new(),
+                },
+            );
+            let simdef = SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            };
+            let rotation = Rotation {
+                rules: vec![Rule {
+                    action: "filler".into(),
+                    when: None,
+                }],
+            };
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+            assert_eq!(report.actions["filler"].casts, 10);
+            // The boundary resolved BEFORE the cast: the 10th cast is
+            // measured under `epilogue` (250, not 100) and credited to it.
+            assert!(
+                close(report.phases[0].total_damage, 900.0),
+                "main: got {}",
+                report.phases[0].total_damage
+            );
+            assert!(
+                close(report.phases[0].dps, 90.0),
+                "got {}",
+                report.phases[0].dps
+            );
+            assert!(
+                close(report.phases[1].total_damage, 250.0),
+                "epilogue: got {}",
+                report.phases[1].total_damage
+            );
+            // Weight 0 — the report guards the divide rather than emitting inf.
+            assert_eq!(report.phases[1].duration, 0.0);
+            assert!(
+                close(report.phases[1].dps, 0.0),
+                "got {}",
+                report.phases[1].dps
+            );
+            assert!(
+                close(report.total.total_damage, 1150.0),
+                "got {}",
+                report.total.total_damage
+            );
+            assert!(close(report.total.dps, 115.0), "got {}", report.total.dps);
         }
     }
 

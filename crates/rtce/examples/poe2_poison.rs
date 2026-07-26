@@ -82,8 +82,20 @@ fn main() {
     //    contrast run at the bottom.
     //
     //    The 4.5s duration is `representative` and half-integer on
-    //    purpose: it keeps every expiry instant strictly between cast
-    //    completions, so no pin has to lean on a same-instant tie-break.
+    //    purpose: it keeps every expiry instant strictly BETWEEN cast
+    //    completions. A `BuffExpire` sharing an instant with a
+    //    `CastComplete` was scheduled earlier, so it carries the lower
+    //    `seq` and resolves FIRST — the outgoing instance is already gone
+    //    when the incoming one captures its snapshot rate. That capture is
+    //    the same number on every application HERE (see above), so nothing
+    //    below would actually move; the half-second keeps it that way by
+    //    construction rather than by luck, and keeps the clipped-tail
+    //    arithmetic (4+3+2+1+0, no instance landing on the 20s edge) plain
+    //    to read.
+    //
+    //    NOT a fight-horizon concern: a cast completing at exactly
+    //    `duration` counts, whatever else is queued at that instant (see
+    //    `Sim::run_loop`'s "horizon rule").
     let simdef_json = r#"{
       "actions": {
         "viper_strike": {
