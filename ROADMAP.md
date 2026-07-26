@@ -27,28 +27,43 @@
   CI-run. Published at `rtce` 0.2.0 (`cargo publish --dry-run` clean).
 
 ## Next
-- [ ] **BUG (found in P7e, UNFIXED — decide before 0.3.0 ships):
-      `sim::exec::run_loop` processes at most ONE event at `t ==
-      duration`.** The loop pops an event, sets `self.time`, handles it,
-      then breaks on `self.time >= self.duration` — so any OTHER event
-      already queued for that same instant is silently discarded, and
-      which one survives is decided by the heap's `(time, seq)` tie-break
-      (first scheduled wins). In practice a `BuffExpire` scheduled at
-      exactly the fight's end swallows the `CastComplete` there, dropping
-      that cast whole: its `casts` count, its damage, and its
-      `apply_buff`. Minimal repro — one 1s filler applying a `refresh`
-      buff, 10s fight: 10 casts when the buff duration is 9.5s, but 9
-      casts (and 9/10 of the damage) for ANY integer duration, because
-      some application then lands an expiry exactly on t=10. A cast
-      completing at `duration` DOES count when it is the only event there
-      (`diablo4_rotation`'s 60th cast is), so this is not "the horizon
-      excludes its boundary" — it is order-dependent. Left unfixed in
-      P7e: it is a core-loop change with the whole pin suite downstream,
-      and "does a cast completing exactly at the horizon count?" is a
-      semantics decision rather than a typo. The three PoE2 slices work
-      AROUND it with half-integer buff durations (which also keeps their
-      expiries off the cast grid), and `diablo4_rotation` never hits it
-      (its `vuln_window` expiries land at 4, 14, …, 54, never at 60).
+- [x] **BUG: `sim::exec::run_loop` processed at most ONE event at `t ==
+      duration`** — found in P7e, FIXED in P7e-T2 (0.3.0). The loop popped
+      an event, set `self.time`, handled it, then broke on `self.time >=
+      self.duration` — so any OTHER event already queued for that same
+      instant was silently discarded, and which one survived was decided
+      by the heap's `(time, seq)` tie-break (first scheduled wins). In
+      practice a `BuffExpire` scheduled at exactly the fight's end
+      swallowed the `CastComplete` there, dropping that cast whole: its
+      `casts` count, its damage, and its `apply_buff`. A cast completing
+      at `duration` DID count when it was the only event there
+      (`diablo4_rotation`'s 60th cast is), so this was never "the horizon
+      excludes its boundary" — it was order-dependent silent damage loss.
+
+      Repro, now the regression pin — one 1s filler applying a `refresh`
+      buff, 10s fight: 9 casts at buff durations 2 / 5 / 9, 10 at 9.5.
+      (The earlier wording here said "9 casts for ANY integer duration",
+      which was never right: at a duration ≥ 10 no expiry lands on t=10 at
+      all, and the count is a correct 10.)
+
+      OUTCOME: the horizon is now DRAINED — no cast BEGINS at or after
+      `duration`, every event already scheduled AT `duration` is
+      processed, so a cast completing exactly at `duration` counts. Zero
+      pins moved anywhere in the repo, `diablo4_rotation` byte-identical
+      (225199.1088 / 3753.31848 / 0.4, MC block included), both consumers
+      byte-identical. Mutation evidence: reinstating the break drops both
+      horizon pins to 9 casts; removing the "no cast begins at the
+      horizon" guard fails three pre-existing pins. The drain's bound
+      (`HORIZON_DRAIN_LIMIT`) is reachable via trailing zero-weight phases
+      and pinned by
+      `too_many_zero_weight_phases_at_the_horizon_fails_closed`.
+
+      The three PoE2 slices KEEP their half-integer buff durations, but
+      for the other reason: measurement showed the rationale was the
+      mid-fight `seq` ordering below, not this bug. Integer durations
+      would reshape `poe2_charges`' cycle and cost `poe2_triggers` 15.5%
+      of bolt damage — three lessons in event ordering instead of three
+      lessons in charges/poison/triggers.
 - [ ] Publish: GitHub repo, then crates.io (`rtce`, `rtce-testkit`) — the
       API survived the P4c switchover; semver honesty: 0.x until publish.
       Publish `rtce-testkit` first (no rtce-workspace deps of its own);
@@ -140,21 +155,27 @@
       keep it up, and a player would never describe that frame as a gap.
 
       What makes it worth deciding, rather than leaving to config hygiene,
-      is that the cost is INVISIBLE in the integrated columns. The gap is
-      zero-width, so uptime / `avg_stacks` / `condition_uptime` read
-      exactly as if nothing happened while damage drops. Measured on
-      `examples/poe2_triggers.rs` (`shock` refreshed by a bolt every 2s),
-      changing only the duration:
+      is that the cost is INVISIBLE in the integrated column a reader would
+      reach for. Both effects are PINNED as contrast runs (not merely
+      measured — these numbers ship to docs.rs, so they carry tests), each
+      changing exactly one duration:
 
-      | shock duration | shock uptime | bolt damage |
-      | -------------- | ------------ | ----------- |
-      | 2.5            | 0.95         | 2175.0      |
-      | 2.0            | 0.95         | 1837.5      |
+      | example         | change                | integral            | damage           |
+      | --------------- | --------------------- | ------------------- | ---------------- |
+      | `poe2_triggers` | shock 2.5 → 2.0       | uptime 0.95 → 0.95  | bolt 2175 → 1837.5 |
+      | `poe2_charges`  | `"4.5 + stacks"` → `"4 + stacks"` | avg_stacks 2.25 → 2.25 | total 11748 → 10875 |
 
-      15% of bolt damage, with nothing in the report pointing at it. The
-      three PoE2 slices' half-integer `representative` durations dodge it
-      deliberately and now say so; `sim`'s module docs carry the warning
-      under "A buff expiring on the cast grid".
+      `poe2_charges` is the sharper case: the stack falls off on a cast
+      instant, the rotation's `when` reads the lower count, and the whole
+      cycle reshapes (12 generators / 28 spenders → 15 / 25) while
+      `avg_stacks` still reports 2.25 to the last bit. (Its `uptime` does
+      move, 0.85 → 0.875, since that gap is a full second rather than
+      zero-width — it is the stack integral that goes blind there, and the
+      uptime integral in the triggers case.)
+
+      The three PoE2 slices' half-integer `representative` durations dodge
+      this deliberately and now say so; `sim`'s module docs carry the
+      warning under "A buff expiring on the cast grid".
 
       NOT changed in 0.3.0 on purpose: the ordering is long-standing 0.2.0
       behavior, it is orthogonal to the P7e-T2 horizon-drain fix (which is

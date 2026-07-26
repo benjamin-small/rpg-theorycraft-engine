@@ -25,7 +25,7 @@ use rtce::build::BuildState;
 use rtce::gamedef::GameDef;
 use rtce::plan::compile as plan_compile;
 use rtce::scenario::Scenario;
-use rtce::sim::{compile as sim_compile, run, Mode, SimReport};
+use rtce::sim::{compile as sim_compile, run, Mode};
 use rtce::simdef::{Rotation, SimDef};
 
 fn close(a: f64, b: f64) -> bool {
@@ -193,6 +193,19 @@ fn main() {
     // truncated tail — which is why BOTH are stated: 4.5 is the mechanic,
     // 3.875 is this 20-second fight.
     //
+    // That dilution has a CLOSED FORM, which is what lets the steady state
+    // itself be pinned rather than only described. For an integer fight of
+    // D seconds at this cadence:
+    //   ∫ stacks dt = 4.5·(D−5)        [instances that live their full 4.5]
+    //               + (4 + 3 + 2 + 1 + 0)   [the five clipped by the end]
+    //               = 4.5·D − 12.5
+    //   avg_stacks  = 4.5 − 12.5/D
+    // D = 20 gives 4.5 − 0.625 = 3.875, the pin above; D = 200 gives
+    // 4.5 − 0.0625 = 4.4375. Both are asserted below, and so is the
+    // identity `avg_stacks + 12.5/D == 4.5` — an EXACT equality at both
+    // durations, which pins λW = 4.5 as the limit the fight is diluting
+    // rather than as a number in a comment.
+    //
     // ── The numbers ───────────────────────────────────────────────────
     // A snapshot buff's total tick rate is Σ(instance rates), and the
     // stack count is already inherent in that sum, so the DoT is
@@ -232,6 +245,36 @@ fn main() {
         report.buffs["poison"].uptime
     );
     println!("\n  EV pins hold: 6000 hit + 11625 DoT = 17625 / 881.25 dps / 3.875 stacks ✓");
+
+    // ── The steady state itself, pinned (see the closed form above) ────
+    //
+    // Same build, same rotation, same simdef — only the fight is longer,
+    // so the SAME 12.5 instance-seconds of end-clipping are spread over
+    // ten times the duration. `avg_stacks` must be 4.5 − 12.5/200 exactly,
+    // and the λW = 4.5 identity must hold at BOTH durations.
+    let long_dummy: Scenario = serde_json::from_str(
+        r#"{ "phases": [ { "name": "dummy", "weight": 200,
+              "stats": { "enemy_res_phys": 20.0, "enemy_res_chaos": 30.0 } } ] }"#,
+    )
+    .expect("valid scenario");
+    let long_run = run(&plan, &sim_plan, &build, &long_dummy, Mode::Expected).expect("ev sim runs");
+    let long_stacks = long_run.buffs["poison"].avg_stacks;
+    println!(
+        "  over 200s instead of 20s: avg_stacks {long_stacks:.4} \
+         (steady state 4.5 less 12.5/200)"
+    );
+    assert_eq!(long_run.actions["viper_strike"].casts, 200);
+    assert!(
+        close(long_stacks, 4.4375),
+        "avg_stacks at 200s: got {long_stacks} — want 4.5 − 12.5/200"
+    );
+    // λW = 4.5, recovered exactly from both fights.
+    assert!(
+        close(report.buffs["poison"].avg_stacks + 12.5 / 20.0, 4.5)
+            && close(long_stacks + 12.5 / 200.0, 4.5),
+        "Little's law: both durations must recover λW = 4.5 exactly"
+    );
+    println!("  steady-state pin holds: λW = 4.5, diluted by exactly 12.5/D ✓");
 
     // ── Monte Carlo, and why EXACT equality is the right gate ─────────
     //
@@ -302,6 +345,16 @@ fn main() {
     // spelling looks equivalent and is silently worth half. It is also why
     // rtce 0.2.0 could not express a PoE2 ailment at all — `apply_buff` on
     // an action is what makes the ailment inherit its applying hit.
+    //
+    // Spelled out as a full literal rather than as a string replace on the
+    // config above (the idiom the sibling examples use, and the better one
+    // where the two configs differ in ONE key). Here they do not: this
+    // variant DELETES `apply_buff` from the action AND ADDS a whole
+    // `procs` block, so a replace would be two edits with no single
+    // assertion that could confirm both landed. The literal is the honest
+    // spelling when the contrast is structural — and the three assertions
+    // at the bottom are what hold the two runs to differing in the DoT
+    // alone.
     let proc_simdef: SimDef = serde_json::from_str(
         r#"{
           "actions": {
@@ -364,18 +417,31 @@ fn main() {
     );
     println!("  contrast pins hold: 5812.5 DoT — exactly half the action-applied 11625 ✓");
 
-    // A last honest note, asserted rather than asserted-in-prose: the two
-    // runs differ ONLY in the DoT. Same casts, same hit damage, same
-    // stacks — so the 2× really is attributable to the capture and to
-    // nothing else about the two configs.
-    fn shape(r: &SimReport) -> (u64, f64, f64) {
-        (
-            r.actions["viper_strike"].casts,
-            r.actions["viper_strike"].damage,
-            r.buffs["poison"].avg_stacks,
-        )
-    }
-    assert_eq!(shape(&report).0, shape(&via_proc).0);
-    assert!(close(shape(&report).1, shape(&via_proc).1));
-    assert!(close(shape(&report).2, shape(&via_proc).2));
+    // A last honest note, asserted rather than claimed in prose: the two
+    // runs differ ONLY in the DoT. The cast count, the hit damage and the
+    // instance trajectory are all untouched — so the 2× really is
+    // attributable to what the snapshot CAPTURED, and to nothing else
+    // about the two configs.
+    assert_eq!(
+        via_proc.actions["viper_strike"].casts, report.actions["viper_strike"].casts,
+        "the proc spelling must not change the cadence"
+    );
+    assert!(
+        close(
+            via_proc.actions["viper_strike"].damage,
+            report.actions["viper_strike"].damage
+        ),
+        "hit damage must be untouched: proc {} vs action {}",
+        via_proc.actions["viper_strike"].damage,
+        report.actions["viper_strike"].damage
+    );
+    assert!(
+        close(
+            via_proc.buffs["poison"].avg_stacks,
+            report.buffs["poison"].avg_stacks
+        ),
+        "the instance trajectory must be identical: proc {} vs action {}",
+        via_proc.buffs["poison"].avg_stacks,
+        report.buffs["poison"].avg_stacks
+    );
 }

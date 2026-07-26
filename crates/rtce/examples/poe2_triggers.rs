@@ -27,7 +27,7 @@ use rtce::gamedef::GameDef;
 use rtce::plan::compile as plan_compile;
 use rtce::scenario::Scenario;
 use rtce::sim::{compile as sim_compile, run, Mode};
-use rtce::simdef::{Rotation, SimDef};
+use rtce::simdef::{NumOrExpr, Rotation, SimDef};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -355,6 +355,96 @@ fn main() {
         "the gap must be exactly two surged comets"
     );
     println!("  contrast pins hold: 7 comets / 11670 total — 1800 more, all of it comet ✓");
+
+    // ══════ Contrast: shock on the cast grid — the invisible loss ══════
+    //
+    // This is the measurement behind `sim`'s "a buff expiring on the cast
+    // grid" section and the 0.4.0 ordering question in ROADMAP, pinned
+    // here so the number those docs quote cannot rot.
+    //
+    // Move `shock` from 2.5s to a flat 2.0s and it expires exactly on the
+    // bolt cadence (bolts complete at t = 1,3,…,19; a shock applied at t
+    // then expires at t+2, which is the NEXT bolt's instant). Both events
+    // share that instant, and the `BuffExpire` was scheduled two seconds
+    // earlier — at the previous application — so it holds the lower `seq`
+    // and resolves FIRST. Every bolt from t=3 on therefore measures itself
+    // UNSHOCKED, then immediately re-applies the buff it just lost.
+    //
+    //   bolt t=1     bare, as before                  →       150
+    //   bolt t=3…19  surged but NOT shocked (9 casts) → 9 × 187.5 = 1687.5
+    //   bolt total                                    =      1837.5
+    //
+    // (187.5 = 150 × 1.25: power_surge still applies — it is on a 4.5s
+    // clock off the COMET cadence and never lands on a bolt instant. The
+    // 225 above was 150 × 1.2 × 1.25, so it is exactly the ×1.2 shock that
+    // goes missing, nine times: 9 × 37.5 = 337.5.)
+    //
+    // Nothing else moves. slam casts on EVEN t, where shock is live
+    // (3375), and each comet is free-cast by the proc roll that follows
+    // its bolt's `apply_buff`, so it sees shock back up (4320). Total
+    // 1837.5 + 3375 + 4320 = 9532.5, dps 476.625.
+    //
+    // THE POINT: the gap is zero-width — expiry and reapplication are the
+    // same instant — so every INTEGRATED measurement is unchanged. shock
+    // uptime still 0.9500, `shocked` condition uptime still 0.9500. 15.5%
+    // of bolt damage vanishes and not one uptime column blinks. A config
+    // author who writes "2s shock, refreshed by a bolt every 2s" gets a
+    // plausible-looking report and a wrong number.
+    let on_grid: SimDef =
+        serde_json::from_str(&simdef_json.replace(r#""duration": 2.5"#, r#""duration": 2.0"#))
+            .expect("valid simdef");
+    assert!(
+        matches!(on_grid.buffs["shock"].duration, NumOrExpr::Num(d) if d == 2.0),
+        "the contrast must actually move shock onto the cast grid"
+    );
+    let on_grid_plan = sim_compile(&plan, &on_grid, &rotation).expect("simdef compiles");
+    let grid = run(&plan, &on_grid_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
+
+    println!(
+        "\n  with `shock` at 2.0 (on the bolt cadence): bolt {:.4}, total {:.4}, \
+         dps {:.4} — shock uptime STILL {:.4}",
+        grid.actions["bolt"].damage,
+        grid.total.total_damage,
+        grid.total.dps,
+        grid.buffs["shock"].uptime
+    );
+    assert!(
+        close(grid.actions["bolt"].damage, 1837.5),
+        "bolt on the grid: got {}",
+        grid.actions["bolt"].damage
+    );
+    // The uptimes are the whole point: identical to the 2.5 run.
+    assert!(
+        close(grid.buffs["shock"].uptime, 0.95),
+        "shock uptime must be unchanged: got {}",
+        grid.buffs["shock"].uptime
+    );
+    assert!(
+        close(grid.condition_uptime["shocked"], 0.95),
+        "shocked condition uptime must be unchanged: got {}",
+        grid.condition_uptime["shocked"]
+    );
+    // Everything NOT on the grid is untouched.
+    assert!(
+        close(grid.actions["slam"].damage, 3375.0) && close(grid.actions["comet"].damage, 4320.0),
+        "only bolt may move: slam {} comet {}",
+        grid.actions["slam"].damage,
+        grid.actions["comet"].damage
+    );
+    assert!(
+        close(grid.total.total_damage, 9532.5),
+        "got {}",
+        grid.total.total_damage
+    );
+    // The loss, stated the way the docs state it.
+    assert!(
+        close(
+            report.actions["bolt"].damage - grid.actions["bolt"].damage,
+            337.5
+        ),
+        "the gap must be exactly the nine missing shock multipliers"
+    );
+    println!("  footgun pins hold: 2175 → 1837.5 bolt damage at IDENTICAL 0.95 uptime ✓");
 
     // ── Monte Carlo ───────────────────────────────────────────────────
     //

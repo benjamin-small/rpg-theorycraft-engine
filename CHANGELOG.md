@@ -214,6 +214,30 @@ until then, per semver's "anything goes" pre-1.0 clause).
   0.x, but an upgrader deserves the warning; add `apply_buff: Vec::new()`
   / `actions: None`, or switch to `..Default::default()` on `ActionDef`.
 
+- **Three PoE2 worked examples (P7e)**, plus the committed fixture they
+  run on. If you are upgrading FOR stacks, snapshot DoTs, or action-scoped
+  procs, these are the fastest way in — each is a runnable slice with
+  every pin hand-derived in a comment and asserted in CI, and each carries
+  contrast runs that show what a plausible WRONG spelling of the same
+  config produces:
+
+  | Example | Mechanic | Pins |
+  |---|---|---|
+  | `poe2_charges` | `add_refresh_all`, `max_stacks: 3`, expression `duration`, `stacks.X` gating a rotation rule | 11748 damage / 293.7 dps / 2.25 avg stacks |
+  | `poe2_poison` | `add_independent` unbounded, `snapshot: true`, applied by the skill's own `apply_buff` | 6000 hit + 11625 DoT / 881.25 dps / 3.875 avg stacks |
+  | `poe2_triggers` | `ProcDef::actions` filter + `cast_action`, `apply_buff` on both a primary and a free-cast secondary | 9870 damage / 493.5 dps / 5 triggered casts |
+
+  **Scope, honestly:** `crates/rtce/tests/fixtures/poe2/gamedef.json` is a
+  PoE2-*shaped* demonstration slice — not Path of Exile 2's damage model
+  and not derived from game data. Every coefficient is `representative`,
+  chosen so each pin hand-derives. It exists to exercise the mechanics
+  above end to end, not to price a real character.
+
+  Note also what has NO example: `strongest` is pinned in the test suite
+  only (`sim::exec`'s `mod snapshot`), and it is the reapply policy with
+  the sharpest edge — a losing reapplication changes neither the magnitude
+  nor the expiry.
+
 - **Fixed (behavior): the fight horizon is DRAINED, so a cast completing
   at `t == duration` is never silently dropped.** The run loop processed
   at most ONE event at the horizon: it popped an event, advanced the
@@ -254,19 +278,33 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `seq` rule and is a consequence of draining the instant, not a designed
   statement about what a zero-width phase should own.
 
+  **One NEW failure mode**, from that same edge. The drain must walk every
+  event at the horizon, so a scenario ending in more than
+  `HORIZON_DRAIN_LIMIT` (10,000) zero-weight phases — each of which
+  schedules a boundary at exactly `duration` — now returns a fail-closed
+  `PlanError` naming the offending phase, where 0.2.0 returned a report.
+  Pathological (it takes ten thousand trailing zero-weight phases), but it
+  is a config that used to produce a number and no longer does, so it
+  belongs in an upgrade note and not only in the code. The bound covers
+  the HORIZON INSTANT ONLY — the run loop is deliberately unbounded at
+  every other instant.
+
 - **Docs: a buff expiring on the cast grid.** New `sim` module-docs
   section on a long-standing (0.2.0, unchanged) consequence of `seq`
   ordering that costs damage silently: a `BuffExpire` sharing an instant
   with the `CastComplete` that would refresh it resolves FIRST, so the
-  refreshing cast does not benefit from its own buff. The gap is
-  zero-width, so `uptime`/`avg_stacks`/`condition_uptime` read as if
-  nothing happened and only damage moves — `examples/poe2_triggers.rs` at
-  `shock: 2.0` instead of `2.5` reports the same 0.95 uptime with bolt
-  damage down 2175 → 1837.5. Worth checking whenever a buff duration is an
-  exact multiple of the refreshing action's cadence. Whether the ordering
-  itself should change (a `CastComplete` arguably ought to out-rank a
-  coincident `BuffExpire`) is an open 0.4.0 question in `ROADMAP.md`,
-  explicitly not decided here.
+  refreshing cast does not benefit from its own buff. The integrated
+  column a reader would reach for does not show it. Both effects are now
+  pinned as contrast runs, each changing exactly one duration:
+  `poe2_triggers` at `shock: 2.0` instead of `2.5` reports the same 0.95
+  uptime with bolt damage down 2175 → 1837.5; `poe2_charges` at `"4 +
+  stacks"` instead of `"4.5 + stacks"` reshapes the cycle from 12/28 to
+  15/25 casts and drops the total 11748 → 10875 while `avg_stacks` still
+  reads exactly 2.25. Worth checking whenever a buff duration is an exact
+  multiple of the refreshing action's cadence. Whether the ordering itself
+  should change (a `CastComplete` arguably ought to out-rank a coincident
+  `BuffExpire`) is an open 0.4.0 question in `ROADMAP.md`, explicitly not
+  decided here.
 
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated

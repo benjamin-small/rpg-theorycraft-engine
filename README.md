@@ -212,10 +212,17 @@ config — it FALLS OUT of Frost Nova's 4-second buff window recast every
 A buff in rtce is internally an INSTANCE LIST. Config collapses it per
 mechanic — the binary buff above is the degenerate one-instance case, and
 three more policies cover what an ARPG actually asks for: charges that
-share one expiry clock, ailments that stack independently and each tick
-the magnitude they were born with, and "strongest wins" replacement.
-Three examples exercise them, each with hand-worked pins in comments,
-asserted and run in CI:
+share one expiry clock (`add_refresh_all`), ailments that stack
+independently and each tick the magnitude they were born with
+(`add_independent`), and "strongest wins" replacement (`strongest`).
+
+TWO of those three are carried by worked examples, below, each with
+hand-worked pins in comments, asserted and run in CI. `strongest` is not
+among them: its coverage is the test suite (`sim::exec`'s `mod
+snapshot`), not a runnable slice. Worth knowing before reaching for it,
+because it is also the policy with the sharpest edge — a LOSING
+reapplication changes nothing at all, neither the magnitude nor the
+expiry, so a weak reapplication cannot extend a strong ailment.
 
 | Example | Mechanic | Pins |
 |---|---|---|

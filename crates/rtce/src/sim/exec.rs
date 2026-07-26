@@ -296,14 +296,31 @@ const INSTANT_CHAIN_LIMIT: u32 = 10_000;
 /// either silently retune the other, for no shared reason beyond both
 /// being "some big number".
 ///
-/// Nothing in this executor can currently reach it: the only same-instant
-/// rescheduler is [`Sim::handle_buff_expire`], which retains only
-/// instances with `expire_at > now` and so can never re-arm at `now`, and
-/// [`Sim::attempt_decision`] (the only source of new casts and `Wake`s) is
-/// SKIPPED at the horizon. It is insurance against a future scheduling
-/// policy that can re-arm at the same instant, so such a policy fails
-/// closed with a positioned error naming the looping event instead of
-/// hanging inside the drain.
+/// It bounds the HORIZON INSTANT ONLY. The run loop is deliberately
+/// unbounded at every other instant — it has to be, since a long fight is
+/// legitimately many events — and [`INSTANT_CHAIN_LIMIT`] inside
+/// [`Sim::attempt_decision`] is the only guard there. Do not read this
+/// constant as "the loop is bounded".
+///
+/// It IS reachable, by a config rather than by a livelock:
+/// [`Sim::new`] schedules every inter-phase boundary upfront, and each
+/// TRAILING ZERO-WEIGHT PHASE contributes a boundary at exactly
+/// `acc == duration`. A scenario ending in more than
+/// `HORIZON_DRAIN_LIMIT` zero-weight phases therefore piles that many
+/// `PhaseBoundary` events onto the horizon and trips this bound —
+/// pathological, but constructible, and pinned by
+/// `too_many_zero_weight_phases_at_the_horizon_fails_closed`. Note what
+/// that case is NOT: those events were all scheduled at construction, so
+/// nothing rescheduled anything, which is why the error text names the
+/// pile-up rather than accusing an effect of re-arming.
+///
+/// A genuine same-instant RESCHEDULING loop is a different animal, and no
+/// current code path produces one: [`Sim::handle_buff_expire`] retains
+/// only instances with `expire_at > now`, so it can never re-arm at
+/// `now`, and [`Sim::attempt_decision`] (the only source of new casts and
+/// `Wake`s) is skipped at the horizon. This bound covers that future too
+/// — a policy that CAN re-arm at the same instant fails closed here
+/// instead of hanging.
 const HORIZON_DRAIN_LIMIT: u32 = 10_000;
 
 /// Preallocated executor buffers: a [`Plan`] [`EvalScratch`] (for every
@@ -937,6 +954,33 @@ impl<'a> Sim<'a> {
 
     /// Push `event` at `time`, validating finiteness fail-closed (cast
     /// times/durations are expression-derived, never guessed to be sane).
+    ///
+    /// PRECONDITION: `time >= self.time` — nothing is ever scheduled into
+    /// the past. This is what makes the executor's clock MONOTONE, which
+    /// [`Sim::run_loop`]'s `at_horizon` flag depends on (an event pushed
+    /// behind the clock would sort ahead of it and flip that flag back to
+    /// false mid-drain). It is upheld at every call site rather than
+    /// re-checked here, and the checks that uphold it are load-bearing:
+    ///
+    /// - the phase boundaries in [`Sim::new`] run off a non-decreasing
+    ///   `acc` from `self.time == 0.0`, since a negative phase weight is
+    ///   rejected by [`run`];
+    /// - `now + duration` in [`Sim::apply_buff`] and `now + cooldown`
+    ///   go through [`Sim::eval_quantity`], which is
+    ///   [`Sim::eval_field`] with `nonneg` — a negative buff duration is a
+    ///   fail-closed run error at application, never an expiry behind the
+    ///   clock;
+    /// - `now + ct` in [`Sim::begin_cast`] rejects `ct < 0.0` explicitly;
+    /// - [`Sim::handle_buff_expire`] reschedules only at an `expire_at >
+    ///   now` it just retained;
+    /// - the `Wake` in [`Sim::attempt_decision`] is `max(cd_ready,
+    ///   resource_time)` where `resource_time` is `now` or a future
+    ///   affordability crossing.
+    ///
+    /// So a redundant `time < self.time` check here would be unreachable
+    /// code guarding an invariant already enforced where it can be
+    /// enforced with a MEANINGFUL message (naming the field and the
+    /// instant, rather than "the queue went backwards").
     fn schedule(&mut self, time: f64, event: Event) -> Result<(), PlanError> {
         if !time.is_finite() || time < 0.0 {
             return Err(PlanError {
@@ -2532,40 +2576,20 @@ impl<'a> Sim<'a> {
             }
             let item = self.heap.pop().expect("just peeked Some");
             self.time = item.time.0;
-            // The clock is monotone (the heap pops in `(time, seq)` order),
-            // so once this is true every remaining event that passes the
-            // `> duration` guard above sits at exactly `duration`: this
-            // flag IS "we are draining the horizon instant".
+            // The clock is monotone, so once this is true every remaining
+            // event that passes the `> duration` guard above sits at
+            // exactly `duration`: this flag IS "we are draining the
+            // horizon instant". Monotonicity is a PRECONDITION of
+            // `Sim::schedule` (see its doc comment for why every call site
+            // upholds it), not a property the heap could supply on its
+            // own — the heap orders what it is given, and an event pushed
+            // into the past would sort ahead of `self.time` and flip this
+            // flag back to false.
             let at_horizon = self.time >= self.duration;
             if at_horizon {
                 horizon_events += 1;
                 if horizon_events > HORIZON_DRAIN_LIMIT {
-                    // Name the CONFIG entity, not just the variant — the
-                    // whole point of the bound is to say WHAT looped.
-                    let culprit = match item.event {
-                        Event::CastComplete { action } => {
-                            format!(
-                                "cast completion of action `{}`",
-                                self.sim_plan.actions[action].name
-                            )
-                        }
-                        Event::BuffExpire { buff, .. } => {
-                            format!("expiry of buff `{}`", self.sim_plan.buffs[buff].name)
-                        }
-                        Event::PhaseBoundary { phase } => {
-                            format!("phase boundary into `{}`", self.scenario.phases[phase].name)
-                        }
-                        Event::Wake => "a rotation wake".to_string(),
-                    };
-                    return Err(PlanError {
-                        what: format!(
-                            "horizon drain livelock: {culprit} at t={} — {HORIZON_DRAIN_LIMIT} \
-                             events processed at the fight horizon (duration={}) without the \
-                             queue draining; some effect is rescheduling itself at the same \
-                             instant (see `Sim::run_loop`'s doc comment)",
-                            self.time, self.duration
-                        ),
-                    });
+                    return Err(self.horizon_drain_error(&item));
                 }
             }
             match item.event {
@@ -2588,6 +2612,45 @@ impl<'a> Sim<'a> {
         }
         self.finalize();
         Ok(())
+    }
+
+    /// [`HORIZON_DRAIN_LIMIT`]'s fail-closed error, naming the CONFIG
+    /// entity `item` refers to rather than just its variant — the whole
+    /// point of the bound is to say WHAT is piling up.
+    ///
+    /// The wording is deliberately non-committal about CAUSE. The only
+    /// reachable case today is a scenario ending in more than
+    /// `HORIZON_DRAIN_LIMIT` zero-weight phases, whose boundaries were all
+    /// scheduled at construction — nothing rescheduled anything there, so
+    /// an error accusing an effect of re-arming itself would misdiagnose
+    /// the one case a user can actually hit. Both causes are named, in
+    /// likelihood order.
+    fn horizon_drain_error(&self, item: &QueueItem) -> PlanError {
+        let culprit = match item.event {
+            Event::CastComplete { action } => format!(
+                "cast completion of action `{}`",
+                self.sim_plan.actions[action].name
+            ),
+            Event::BuffExpire { buff, .. } => {
+                format!("expiry of buff `{}`", self.sim_plan.buffs[buff].name)
+            }
+            Event::PhaseBoundary { phase } => {
+                format!("phase boundary into `{}`", self.scenario.phases[phase].name)
+            }
+            Event::Wake => "a rotation wake".to_string(),
+        };
+        PlanError {
+            what: format!(
+                "horizon drain bound exceeded: {culprit} at t={} — more than \
+                 {HORIZON_DRAIN_LIMIT} events are scheduled at the fight horizon \
+                 (duration={}). Either the scenario piles that many events onto the \
+                 last instant (a run of trailing zero-weight phases is the usual way \
+                 — each one schedules a boundary at exactly `duration`), or some \
+                 effect is rescheduling itself there. See `Sim::run_loop`'s doc \
+                 comment.",
+                self.time, self.duration
+            ),
+        }
     }
 
     fn finalize(&mut self) {
@@ -4170,6 +4233,126 @@ mod tests {
                 report.total.total_damage
             );
             assert!(close(report.total.dps, 115.0), "got {}", report.total.dps);
+        }
+
+        /// `main` (10s) followed by `n` zero-weight phases — every one of
+        /// their boundaries is scheduled at construction, at exactly
+        /// `acc == duration == 10`, so `n` controls how many events pile
+        /// onto the horizon instant.
+        fn trailing_zero_weight_phases(n: usize) -> Scenario {
+            let mut phases = String::from(r#"{ "name": "main", "weight": 10 }"#);
+            for i in 0..n {
+                phases.push_str(&format!(r#", {{ "name": "z{i}", "weight": 0 }}"#));
+            }
+            serde_json::from_str(&format!(r#"{{ "phases": [ {phases} ] }}"#)).unwrap()
+        }
+
+        // ------------------------------------------------------------------
+        // The horizon drain's fail-closed bound, on the one case a CONFIG can
+        // actually reach.
+        //
+        // `Sim::new` schedules every inter-phase boundary upfront, and a
+        // TRAILING ZERO-WEIGHT phase's boundary lands at `acc == duration`.
+        // So `n` trailing zero-weight phases put `n` `PhaseBoundary` events
+        // on the horizon, and the drain — which must process every event at
+        // `duration` — walks all of them. Past `HORIZON_DRAIN_LIMIT` it fails
+        // closed instead of grinding.
+        //
+        // Note what this case is NOT: those boundaries were all scheduled at
+        // construction. Nothing rescheduled anything, which is why the error
+        // text names the pile-up as the likely cause rather than accusing an
+        // effect of re-arming itself. The doc comment on the constant
+        // originally claimed this bound was UNREACHABLE — it named
+        // `handle_buff_expire` as the only same-instant scheduler and missed
+        // `Sim::new` entirely. This test is that claim's correction.
+        //
+        // Two-sided on purpose: at the limit the run must still SUCCEED (a
+        // bound that fires early would silently cap legitimate scenarios), and
+        // past it must fail closed naming the phase.
+        //
+        // RED evidence (recorded, not merely asserted): with the
+        // `horizon_events`/`HORIZON_DRAIN_LIMIT` block in `run_loop` deleted
+        // outright — counter, check, and `horizon_drain_error` call — the
+        // `expect_err` arm fails with "the drain must fail closed ... got a
+        // report", while every other test in the crate stays green. That is
+        // the surviving mutation this test kills; see the commit message for
+        // the transcript.
+        // ------------------------------------------------------------------
+        #[test]
+        fn too_many_zero_weight_phases_at_the_horizon_fails_closed() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "filler".to_string(),
+                ActionDef {
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: Some(ActionDamage {
+                        stats: BTreeMap::new(),
+                    }),
+                    apply_buff: Vec::new(),
+                },
+            );
+            let simdef = SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            };
+            let rotation = Rotation {
+                rules: vec![Rule {
+                    action: "filler".into(),
+                    when: None,
+                }],
+            };
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+            // AT the bound: `HORIZON_DRAIN_LIMIT` boundaries plus the 10th
+            // cast's own `CastComplete`. The counter increments once per
+            // horizon event and trips on `> LIMIT`, so exactly `LIMIT` events
+            // must still run — and the 10 casts must all be there, since the
+            // whole point of the drain is that the horizon cast counts.
+            let at_limit = HORIZON_DRAIN_LIMIT as usize - 1;
+            let scenario = trailing_zero_weight_phases(at_limit);
+            let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected)
+                .expect("at the bound the drain must still complete");
+            assert_eq!(report.actions["filler"].casts, 10);
+            assert!(
+                close(report.total.total_damage, 1000.0),
+                "got {}",
+                report.total.total_damage
+            );
+
+            // PAST the bound: one more boundary than the drain will take.
+            let scenario = trailing_zero_weight_phases(HORIZON_DRAIN_LIMIT as usize + 5);
+            // `let else` rather than `expect_err`: the Ok payload is a
+            // `SimReport` carrying 10,006 `PhaseReport`s, and `expect_err`
+            // would `Debug`-print all of it into the failure output.
+            let Err(err) = run(&plan, &sim_plan, &build, &scenario, Mode::Expected) else {
+                panic!("the drain must fail closed past its bound, got a report");
+            };
+            // Names the offending PHASE, not just the event variant.
+            assert!(
+                err.what.contains("phase boundary into `z"),
+                "error must name the phase boundary that piled up, got: {}",
+                err.what
+            );
+            assert!(
+                err.what.contains("horizon"),
+                "error must say where it happened, got: {}",
+                err.what
+            );
+            // And must NOT misdiagnose: nothing rescheduled anything here.
+            assert!(
+                err.what.contains("zero-weight phases"),
+                "error must name the pile-up as a likely cause, got: {}",
+                err.what
+            );
         }
     }
 

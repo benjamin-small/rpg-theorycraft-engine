@@ -30,7 +30,7 @@ use rtce::gamedef::GameDef;
 use rtce::plan::compile as plan_compile;
 use rtce::scenario::Scenario;
 use rtce::sim::{compile as sim_compile, run, Mode};
-use rtce::simdef::{Rotation, SimDef};
+use rtce::simdef::{NumOrExpr, Rotation, SimDef};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -339,6 +339,90 @@ fn main() {
         binary.buffs["frenzy_charge"].uptime
     );
     println!("  contrast pins hold: 0 spender casts / 4626 total / 2.85 avg_stacks ✓");
+
+    // ═══ Contrast: the charge clock ON the cast grid — ∫ goes blind ═══
+    //
+    // Cited by `sim`'s "a buff expiring on the cast grid" section and by
+    // the 0.4.0 ordering question in ROADMAP; pinned here so those numbers
+    // cannot rot. This is the sharper of the two illustrations — the other
+    // is `poe2_triggers`, where damage moves 15.5% at an unchanged uptime.
+    //
+    // Drop the half-second: `"4 + stacks.frenzy_charge"`. The three
+    // applications now ask 4s, 5s, 6s, so the shared clock lands on
+    // 3 + 6 = t=9 — an integer, i.e. exactly a cast instant. The
+    // `BuffExpire` was scheduled back at t=3 and the `CastComplete` at
+    // t=8, so the expiry holds the lower `seq` and resolves FIRST.
+    //
+    // Re-derived cycle (9s, vs 10s above):
+    //   t=1,2,3   frenzy ×3, applications ask 4/5/6 → all reset to t=9
+    //   t=4…8     spender ×5, charged                   → 5 × 390 = 1950
+    //   t=9       the stacks expire FIRST, so this spender — chosen at
+    //             t=8, when the count was still 3 — lands BARE →    300
+    //   t=9       the count is now 0, so the rotation generates again
+    //   per cycle: 3 frenzy (90 + 99 + 108 = 297) + 6 spender (2250)
+    //
+    // 40s is 4 whole cycles (t=0…36) plus a 4-cast tail (frenzy at
+    // t=36,37,38, then one CHARGED spender completing at t=40 — on the
+    // horizon, and it counts; see `sim`'s "fight horizon"):
+    //   frenzy  = 5 × 297           =  1485   (15 casts, vs 12)
+    //   spender = 4 × 2250 + 390    =  9390   (25 casts, vs 28)
+    //   total   =                     10875   (vs 11748)
+    //
+    // THE POINT — `avg_stacks` cannot see any of it:
+    //   ∫ stacks dt per cycle = 0 + 1 + 2 + 3×6   =  21
+    //   4 cycles + tail (0 + 1 + 2 + 3)           =  84 + 6 = 90
+    //   avg_stacks = 90 / 40                      =  2.25
+    // EXACTLY the 2.25 of the 4.5s build above, to the last bit, while
+    // 7.4% of the damage and three casts' worth of rotation shape have
+    // moved. `uptime` does budge here (0.85 → 0.875 — the gap is a full
+    // second, not zero-width); it is `avg_stacks`, the measurement this
+    // slice is actually about, that goes blind.
+    let on_grid: SimDef = serde_json::from_str(&simdef_json.replace(
+        r#""4.5 + stacks.frenzy_charge""#,
+        r#""4 + stacks.frenzy_charge""#,
+    ))
+    .expect("valid simdef");
+    assert!(
+        matches!(&on_grid.buffs["frenzy_charge"].duration,
+                 NumOrExpr::Expr(e) if e == "4 + stacks.frenzy_charge"),
+        "the contrast must actually move the charge clock onto the grid"
+    );
+    let on_grid_plan = sim_compile(&plan, &on_grid, &rotation).expect("simdef compiles");
+    let grid = run(&plan, &on_grid_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
+
+    println!(
+        "\n  with `\"4 + stacks\"` (clock on the cast grid): {} frenzy / {} spender, \
+         {:.4} total — avg_stacks STILL {:.4}",
+        grid.actions["frenzy"].casts,
+        grid.actions["spender"].casts,
+        grid.total.total_damage,
+        grid.buffs["frenzy_charge"].avg_stacks
+    );
+    assert_eq!(grid.actions["frenzy"].casts, 15);
+    assert_eq!(grid.actions["spender"].casts, 25);
+    assert!(
+        close(grid.actions["frenzy"].damage, 1485.0)
+            && close(grid.actions["spender"].damage, 9390.0),
+        "frenzy {} spender {}",
+        grid.actions["frenzy"].damage,
+        grid.actions["spender"].damage
+    );
+    assert!(
+        close(grid.total.total_damage, 10875.0),
+        "got {}",
+        grid.total.total_damage
+    );
+    // The blind integral — identical to the 4.5s run, bit for bit.
+    assert!(
+        close(grid.buffs["frenzy_charge"].avg_stacks, 2.25),
+        "avg_stacks must be unchanged: got {}",
+        grid.buffs["frenzy_charge"].avg_stacks
+    );
+    assert_eq!(
+        grid.buffs["frenzy_charge"].avg_stacks, report.buffs["frenzy_charge"].avg_stacks,
+        "the two builds must agree on avg_stacks EXACTLY — that is the point"
+    );
+    println!("  footgun pins hold: 11748 → 10875 at IDENTICAL 2.25 avg_stacks ✓");
 
     // ── Monte Carlo ───────────────────────────────────────────────────
     //

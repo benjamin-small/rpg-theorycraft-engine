@@ -126,11 +126,13 @@
 //! `duration` is credited its full span, whether it is closed by its own
 //! `BuffExpire` at the horizon or by the end-of-fight flush.
 //!
-//! # A buff expiring on the cast grid (read this one)
+//! # A buff expiring on the cast grid
 //!
 //! Events sharing an instant resolve in SCHEDULING order (the `seq`
 //! tiebreaker), at the horizon and everywhere else alike. One consequence
-//! is worth calling out on its own, because it costs damage silently:
+//! of that is the single most likely way to get a wrong number out of
+//! this executor while every diagnostic looks healthy, so it is worth
+//! reading even if the rest of this page is reference:
 //!
 //! > When a buff's window closes at exactly the instant the cast that
 //! > would refresh it completes, the `BuffExpire` was scheduled EARLIER —
@@ -148,22 +150,30 @@
 //! reapplication share an instant, so the gap is zero-width and every
 //! INTEGRATED measurement — [`BuffReport::uptime`], `avg_stacks`,
 //! `SimReport::condition_uptime` — reads exactly as if nothing happened.
-//! The loss appears only in damage. Measured on
-//! `examples/poe2_triggers.rs`, whose `shock` is refreshed by a bolt every
-//! 2s, changing nothing but the duration:
+//! The loss appears only in damage. Both effects are pinned as contrast
+//! runs in the examples, each changing exactly one duration:
 //!
 //! ```text
-//!     shock duration      shock uptime      bolt damage
-//!                2.5              0.95           2175.0
-//!                2.0              0.95           1837.5
+//!   poe2_triggers  `shock` refreshed by a bolt every 2s
+//!     duration 2.5 →  uptime 0.95      bolt damage 2175.0
+//!     duration 2.0 →  uptime 0.95      bolt damage 1837.5   (−15.5%)
+//!
+//!   poe2_charges   `frenzy_charge` (add_refresh_all) on a 1s cadence
+//!     "4.5 + stacks" →  avg_stacks 2.25   total 11748.0
+//!     "4 + stacks"   →  avg_stacks 2.25   total 10875.0     (−7.4%)
 //! ```
 //!
-//! Identical uptime, 15% less damage. The guidance that falls out of it:
-//! if a buff duration lands exactly on the cast grid, nudge it off — the
-//! examples' half-integer `representative` durations are that nudge, and
-//! say so — or expect the refreshing cast not to benefit from its own
-//! buff. If a damage number looks low while the uptimes look perfect,
-//! this is the first thing to check.
+//! The `poe2_charges` row is the sharper of the two: the stack falls off
+//! on a cast instant, the rotation's `when` reads the lower count and
+//! reshapes the whole cycle (12 generators / 28 spenders becomes 15 / 25)
+//! — and `avg_stacks` still reports 2.25 to the last digit.
+//!
+//! The guidance that falls out of it: if a buff duration lands exactly on
+//! the cast grid, nudge it off — the examples' half-integer
+//! `representative` durations are that nudge, and say so — or expect the
+//! refreshing cast not to benefit from its own buff. If a damage number
+//! looks low while the uptimes look perfect, this is the first thing to
+//! check.
 //!
 //! Whether this ordering is the RIGHT semantics is an open question for a
 //! later version, recorded in `ROADMAP.md`: a `CastComplete` arguably
