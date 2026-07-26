@@ -260,7 +260,7 @@ pub enum ReapplyPolicy {
 ///   LONGEST remaining window across live instances, which under
 ///   [`ReapplyPolicy::AddIndependent`] is the newest instance's, not the
 ///   one that expires next.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuffDef {
     /// Seconds this buff lasts once applied (refresh-on-reapply resets
     /// the remaining duration back to this value).
@@ -554,10 +554,26 @@ mod tests {
             assert_eq!(def.buffs[name].max_stacks, 1, "{name}");
             assert_eq!(def.buffs[name].on_reapply, ReapplyPolicy::Refresh, "{name}");
         }
-        // …and the same for `BuffDef::default()`, which must NOT inherit
-        // `u32`'s `0` (this field spells `0` "unbounded").
-        assert_eq!(BuffDef::default().max_stacks, 1);
-        assert_eq!(BuffDef::default().on_reapply, ReapplyPolicy::Refresh);
+    }
+
+    // STRUCTURAL guard, not a per-field one: serde's `#[serde(default)]`
+    // attributes and the hand-written `impl Default` are two independent
+    // spellings of "what a config that says nothing means", and nothing
+    // in the language ties them together. A struct literal catches a
+    // MISSING field; only this catches a field whose two defaults
+    // DISAGREE — which would silently split Rust-constructed configs from
+    // JSON-parsed ones, exactly the bug `max_stacks` was hand-defaulted
+    // to avoid (`#[serde(default)]` on a `u32` is `0`, which this field
+    // spells "unbounded"). Add every new field to BOTH.
+    #[test]
+    fn serde_defaults_and_impl_default_agree_field_for_field() {
+        let bare: BuffDef = serde_json::from_str(r#"{ "duration": 0.0 }"#).unwrap();
+        assert_eq!(
+            bare,
+            BuffDef::default(),
+            "serde's per-field defaults must agree with `impl Default` — \
+             a new BuffDef field belongs in BOTH"
+        );
     }
 
     #[test]

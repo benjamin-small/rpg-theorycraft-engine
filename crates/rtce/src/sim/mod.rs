@@ -66,4 +66,6 @@ pub use compile::{
     CompiledValue, ProcEffect, SimPlan,
 };
 pub use exec::{run, Mode, SimScratch};
-pub use report::{ActionReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals};
+pub use report::{
+    ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
+};

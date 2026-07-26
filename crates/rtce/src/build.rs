@@ -22,7 +22,11 @@ pub struct BuildState {
 /// `event`-tagged one counts only in branches where that event fired; a
 /// `condition`-tagged one scales by the active phase's uptime for that
 /// condition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `PartialEq` compares the raw `f64` `value` bitwise-per-IEEE (so two
+/// `NaN` values are never equal) — these are config literals, never
+/// computed results, so structural comparison is exactly what a
+/// "did this parse to what I wrote?" test wants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Contribution {
     /// Name of the bucket this value folds into (must exist in the
     /// GameDef's bucket registry).

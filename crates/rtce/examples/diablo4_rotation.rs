@@ -148,7 +148,7 @@ fn main() {
     );
     println!(
         "  vuln_window buff uptime: {:.4}   vulnerable condition uptime: {:.4}",
-        report.buff_uptime["vuln_window"], report.condition_uptime["vulnerable"]
+        report.buffs["vuln_window"].uptime, report.condition_uptime["vulnerable"]
     );
     println!(
         "  mana: {:.4}s starved, {:.4}s capped",
@@ -221,9 +221,9 @@ fn main() {
         report.total.dps
     );
     assert!(
-        close(report.buff_uptime["vuln_window"], 0.4),
+        close(report.buffs["vuln_window"].uptime, 0.4),
         "got {}",
-        report.buff_uptime["vuln_window"]
+        report.buffs["vuln_window"].uptime
     );
     assert!(
         close(report.condition_uptime["vulnerable"], 0.4),

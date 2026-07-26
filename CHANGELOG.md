@@ -66,9 +66,16 @@ until then, per semver's "anything goes" pre-1.0 clause).
   full configured value while ANY instance is live and are never scaled by
   it. New symbol `stacks.<buff>` (the count) joins `buff.<buff>` (`1`
   while any instance is live) and `buff_remaining.<buff>`, which is now
-  the LONGEST remaining window across live instances. `SimReport` gains
-  `avg_stacks` — the time-integrated mean stack count, `buff_uptime`'s
-  counted companion.
+  the LONGEST remaining window across live instances.
+
+  `SimReport::buff_uptime` is REPLACED by `buffs: BTreeMap<String,
+  BuffReport>` carrying `uptime` plus the new `avg_stacks` (the
+  time-integrated mean stack count), matching how `actions`/`resources`
+  have always reported per-entity results — buffs were the last entity
+  with a bare parallel map, and P7c-T2 adds a third per-buff output.
+  Every report type in `sim::report` is now `#[non_exhaustive]`, so
+  later measurements stop being breaking changes for external
+  constructors.
 
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated

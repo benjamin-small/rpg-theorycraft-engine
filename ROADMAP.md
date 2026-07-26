@@ -56,6 +56,16 @@
       longer a second overlay, and it now happens at the cast's own
       instant rather than after the cast's procs — a correctness fix, not
       just a trim (see the 0.3.0 notes).
+- [ ] Cache a buff's `min`/`max` instance expiry on `BuffRt` (P7c-T1
+      review, non-functional). `Sim::earliest_expiry` and
+      `Sim::longest_remaining` each scan the whole instance list, the
+      latter on every `refresh_time_varying_slots` — i.e. before every
+      expression evaluation, for every buff. Irrelevant at the stack
+      counts anything models today (`max_stacks` in the low single
+      digits), and deliberately deferred to P7c-T2, where the unbounded
+      poison fixture is the first config that can make the list long
+      enough to matter. Do it there with that fixture as the witness, not
+      speculatively here.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

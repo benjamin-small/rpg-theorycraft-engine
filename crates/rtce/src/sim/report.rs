@@ -8,7 +8,16 @@ use std::collections::BTreeMap;
 /// One completed `sim::run`: per-phase and total damage/dps, per-action
 /// cast/damage accounting, computed buff/condition uptimes, resource
 /// health, and proc fire counts.
+///
+/// `#[non_exhaustive]`, like every report type in this module and for the
+/// same reason [`crate::sim::CompiledValue`] carries it: what a run has to
+/// SAY about itself is the engine's to extend, and consumers only ever
+/// READ these. Each new measurement the executor learns to take (P7c's
+/// stack count, P7c-T2's snapshot-DoT total) would otherwise be a
+/// breaking change for a caller who constructs one — which nothing
+/// outside this crate has cause to do.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct SimReport {
     /// One entry per scenario phase, in scenario order.
     pub phases: Vec<PhaseReport>,
@@ -16,24 +25,10 @@ pub struct SimReport {
     pub total: Totals,
     /// Per-action cast/damage accounting, keyed by action name.
     pub actions: BTreeMap<String, ActionReport>,
-    /// Computed fraction of the sim's total duration each buff was
-    /// active, keyed by buff name (`active_seconds / total duration`).
-    /// "Active" means AT LEAST ONE live instance — a 3-stack buff and a
-    /// 1-stack buff both read `1.0` here; [`SimReport::avg_stacks`] is
-    /// where the count shows up.
-    pub buff_uptime: BTreeMap<String, f64>,
-    /// Computed TIME-INTEGRATED mean stack count of each buff over the
-    /// sim's total duration, keyed by buff name (`∫ stacks dt / total
-    /// duration`) — the counted companion to [`SimReport::buff_uptime`],
-    /// integrated the same way and over the same whole-sim window (not
-    /// per phase, and not conditioned on the buff being up: seconds at
-    /// zero stacks drag the mean down exactly as they should).
-    ///
-    /// For a buff that never stacks this equals its `buff_uptime`. For a
-    /// stacking one the two answer different questions: a buff up the
-    /// whole fight at 3 stacks reads `buff_uptime` `1.0` and `avg_stacks`
-    /// `3.0`.
-    pub avg_stacks: BTreeMap<String, f64>,
+    /// Per-buff computed uptime and mean stack count, keyed by buff name
+    /// — one entry per buff in the `SimDef`, always present even for a
+    /// buff that never went up.
+    pub buffs: BTreeMap<String, BuffReport>,
     /// Computed fraction-weighted value each condition held over the
     /// sim's total duration, keyed by condition name. While a buff drives
     /// a condition it WINS over the scenario's static uptime for that
@@ -69,6 +64,7 @@ pub struct SimReport {
 /// (which exists to de-bias a SAMPLE drawn from a larger population) does
 /// not apply here.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
+#[non_exhaustive]
 pub struct Distribution {
     /// Arithmetic mean of every iteration's `dps`.
     pub mean: f64,
@@ -118,6 +114,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 /// One scenario phase's damage/dps totals.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct PhaseReport {
     /// This phase's name (matches the `Scenario` phase it came from).
     pub name: String,
@@ -132,6 +129,7 @@ pub struct PhaseReport {
 
 /// Whole-sim totals (all phases combined).
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct Totals {
     /// Sum of every phase's duration — the sim's total simulated time.
     pub duration: f64,
@@ -143,6 +141,7 @@ pub struct Totals {
 
 /// One action's cast/damage accounting over the whole sim.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
 pub struct ActionReport {
     /// Number of times this action was cast (rotation-driven or
     /// proc-driven free casts alike).
@@ -154,8 +153,32 @@ pub struct ActionReport {
     pub share: f64,
 }
 
+/// One buff's computed presence over the whole sim: how much of the
+/// fight it was up at all, and how many instances were up on average.
+///
+/// The two answer different questions and a stacking buff separates them:
+/// a buff held at 3 stacks for the entire fight reads `uptime` `1.0` and
+/// `avg_stacks` `3.0`. For a buff that never stacks (`max_stacks: 1`, the
+/// default) they are the same number.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct BuffReport {
+    /// Fraction of the sim's total duration this buff had AT LEAST ONE
+    /// live instance (`active_seconds / total duration`). A 3-stack buff
+    /// and a 1-stack buff both read `1.0` here — `avg_stacks` is where
+    /// the count shows up.
+    pub uptime: f64,
+    /// TIME-INTEGRATED mean stack count over the sim's total duration
+    /// (`∫ stacks dt / total duration`), integrated the same way as
+    /// `uptime` and over the same whole-sim window — not per phase, and
+    /// not conditioned on the buff being up, so seconds at zero stacks
+    /// drag the mean down exactly as they should.
+    pub avg_stacks: f64,
+}
+
 /// One resource's health over the whole sim.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
 pub struct ResourceReport {
     /// Seconds this resource sat pinned at its cap (regen wasted).
     pub time_capped: f64,
