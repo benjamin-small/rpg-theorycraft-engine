@@ -151,14 +151,14 @@ comments in the example itself). A production rotation would tune these
 from real skill data the same way `diablo4_basics`'s `GameDef` slice was
 transcribed from `diablo4-calc`.
 
-**SimDef** (trimmed — the full version adds Firebolt and a proc wiring
-Frost Nova to the buff; see the example):
+**SimDef** (trimmed — the full version adds Firebolt; see the example):
 
 ```jsonc
 {
   "resources": { "mana": { "max": "100", "regen_per_sec": "0" } },
   "actions": {
-    "frost_nova": { "cast_time": "0", "cooldown": 10.0, "cost": {}, "gain": {} },
+    "frost_nova": { "cast_time": "0", "cooldown": 10.0, "cost": {}, "gain": {},
+                    "apply_buff": ["vuln_window"] },
     "fireball": {
       "cast_time": "1", "cooldown": 0.0,
       "cost": { "mana": 40.0 }, "gain": {},
@@ -167,10 +167,6 @@ Frost Nova to the buff; see the example):
   },
   "buffs": {
     "vuln_window": { "duration": 4.0, "conditions": { "vulnerable": 1.0 } }
-  },
-  "procs": {
-    "nova_pulse": { "trigger": "on_cast", "chance": "1", "icd": 10.0,
-                    "apply_buff": "vuln_window" }
   },
   "damage_objective": "hit_after_dr"
 }
@@ -203,7 +199,7 @@ Diablo 4 rotation (P6 sequencing) — 60s training dummy, EV mode
   EV pins hold: 225199.1088 total / 3753.31848 dps / 0.4 vuln uptime ✓
 
 Diablo 4 rotation — 60s training dummy, Monte Carlo mode (N=1000, seed=42)
-  mean 3743.0759   std 210.1306   p10 3475.5944   p50 3733.9902   p90 4016.3750
+  mean 3746.6413   std 211.4556   p10 3492.7294   p50 3740.1588   p90 4019.8020
   MC sanity holds: mean within 2% of the EV pin, p10 ≤ p50 ≤ p90 ✓
 ```
 

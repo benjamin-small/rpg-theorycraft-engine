@@ -35,16 +35,16 @@
       dev-dependency so `cargo test` also builds from the published
       tarball (path-only today because that version pin can't resolve
       against the registry before the first real publish).
-- [ ] `ActionDef.apply_buff` (or an action-scoped proc) — 0.3.0. Today the
-      only way to apply a buff from a specific action is the "icd equals
-      the gating action's cooldown" trick `examples/diablo4_rotation.rs`'s
-      `nova_pulse` relies on (a proc rolls on EVERY action's on-cast event;
-      matching its icd to one action's cooldown is how the config coerces
-      "only Frost Nova drives this buff" out of a trigger that's really
-      global). That trick is load-bearing for the current example and
-      correct for it, but it's a config-author trap for any other
-      cadence — a first-class per-action buff application removes the
-      need for it entirely.
+- [x] `ActionDef.apply_buff` + action-scoped procs — DONE in P7d
+      (0.3.0). An action applies its own buffs at cast complete, and a
+      `ProcDef` can name the actions its trigger considers, so the "icd
+      equals the gating action's cooldown" trick is no longer the only
+      way to bind an effect to one action. `examples/diablo4_rotation.rs`
+      is off it: `frost_nova` carries `apply_buff: ["vuln_window"]` and
+      the `nova_pulse` proc is deleted, with the EV pins (225199.1088 /
+      3753.31848 / 0.4) byte-identical. (The trick still appears in two
+      `sim::exec` test fixtures, where it is deliberate — those fixtures
+      exist to exercise the PROC path.)
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full

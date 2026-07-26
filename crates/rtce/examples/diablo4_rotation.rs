@@ -60,19 +60,25 @@ fn main() {
     // ── Tier 3: SEQUENCING — mana (max 100, NO passive regen — see the
     //    module doc's "Scope, honestly" note), a Fireball spender (40
     //    mana, 1s cast, coeff 200%), a Firebolt generator (free, +40 mana,
-    //    1s cast, coeff 40%), and Frost Nova (instant, 10s cooldown). A
-    //    buff isn't applied by an action directly — only a PROC can (see
-    //    `simdef::ProcDef`) — so `nova_pulse` (on_cast, chance 1, icd 10)
-    //    is the mechanism: since Frost Nova has top rotation priority and
-    //    is always cast the instant it's off cooldown, and its icd (10)
-    //    matches Frost Nova's own cooldown, `nova_pulse` always rolls on
-    //    Frost Nova's own on-cast event (any Fireball/Firebolt on-cast
-    //    events immediately after find it still in ICD) — the same
-    //    "icd equals the gating action's cooldown" trick `sim::exec`'s own
-    //    `computed_buff_uptime_is_hand_worked` test pins. The buff drives
-    //    `vulnerable` to 1.0 while up; the scenario below sets NO static
-    //    vulnerable uptime at all, so 100% of `vulnerable`'s value here is
-    //    COMPUTED) ─────────────────────────────────────────────────────
+    //    1s cast, coeff 40%), and Frost Nova (instant, 10s cooldown),
+    //    which applies the `vuln_window` buff directly via its own
+    //    `apply_buff` list. That is all it takes to say "only Frost Nova
+    //    drives this window" — a buff application is an effect OF the
+    //    action, landing at its cast-complete instant (see
+    //    `simdef::ActionDef::apply_buff`). This config has NO procs at
+    //    all.
+    //
+    //    (Before rtce 0.3.0 a buff could only be applied by a PROC, and a
+    //    proc rolls on EVERY action's trigger event — so this example used
+    //    to carry a `nova_pulse` proc whose icd (10) was set equal to
+    //    Frost Nova's cooldown, coercing "only Frost Nova" out of a
+    //    globally-triggered roll. It worked here and was a trap
+    //    everywhere else; `apply_buff` replaces it, and the cadence — and
+    //    therefore every EV pin below — is unchanged.)
+    //
+    //    The buff drives `vulnerable` to 1.0 while up; the scenario below
+    //    sets NO static vulnerable uptime at all, so 100% of
+    //    `vulnerable`'s value here is COMPUTED ────────────────────────
     let simdef_json = r#"{
       "resources": {
         "mana": { "max": "100", "regen_per_sec": "0" }
@@ -80,7 +86,8 @@ fn main() {
       "actions": {
         "frost_nova": {
           "cast_time": "0", "cooldown": 10.0,
-          "cost": {}, "gain": {}
+          "cost": {}, "gain": {},
+          "apply_buff": ["vuln_window"]
         },
         "fireball": {
           "cast_time": "1", "cooldown": 0.0,
@@ -95,12 +102,6 @@ fn main() {
       },
       "buffs": {
         "vuln_window": { "duration": 4.0, "conditions": { "vulnerable": 1.0 } }
-      },
-      "procs": {
-        "nova_pulse": {
-          "trigger": "on_cast", "chance": "1", "icd": 10.0,
-          "apply_buff": "vuln_window"
-        }
       },
       "damage_objective": "hit_after_dr"
     }"#;
@@ -260,9 +261,19 @@ fn main() {
     // hand-worked pin like the EV numbers above, since MC's exact seeded
     // output is only reproducible by running the RNG itself):
     //
-    // The rotation's cadence never depends on the RNG (procs are empty,
-    // and mana/cooldowns are deterministic — see `sim::exec`'s module
-    // docs: only per-cast crit OUTCOMES differ from EV), so every one of
+    // NB (0.3.0): this block's numbers MOVED when `nova_pulse` was
+    // deleted in favour of `frost_nova`'s `apply_buff` — mean 3743.0759 /
+    // std 210.1306 became 3746.6413 / 211.4556. Nothing about the
+    // distribution changed: the cadence is still 31/29/6 and each
+    // iteration still makes the same 60 Bernoulli(0.2) crit draws. The
+    // deleted proc used to consume one RNG draw per off-ICD `on_cast`
+    // roll — 6 per iteration, at t=0,10,…,50 — and removing them
+    // re-phases which sample lands on which cast. The EV pins above,
+    // which have no RNG at all, are byte-identical.
+    //
+    // The rotation's cadence never depends on the RNG (there are no procs
+    // at all now, and mana/cooldowns are deterministic — see `sim::exec`'s
+    // module docs: only per-cast crit OUTCOMES differ from EV), so every one of
     // the 1000 iterations casts exactly the same 31/29/6 sequence and
     // differs only in each cast's sampled crit/no-crit branch (crit
     // 20%). Per-cast damage spread runs from ~1000 (firebolt, inactive,

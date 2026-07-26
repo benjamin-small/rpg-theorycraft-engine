@@ -175,6 +175,55 @@ pub struct ActionDef {
     /// This action's damage effect, if any (omit for utility-only casts).
     #[serde(default)]
     pub damage: Option<ActionDamage>,
+    /// Buffs this action applies when its cast COMPLETES — one
+    /// application per entry, routed through each buff's
+    /// [`BuffDef::on_reapply`] policy exactly as a proc application is.
+    /// Empty (the default) means this action applies nothing, which is
+    /// every rtce 0.2.0 config.
+    ///
+    /// This is the first-class replacement for the "icd equals the gating
+    /// action's cooldown" trick a 0.2.0 config needed in order to coerce
+    /// per-action buff application out of a globally-triggered
+    /// [`ProcDef`].
+    ///
+    /// # Where it lands inside the completion instant
+    ///
+    /// AFTER this cast's own damage has been measured and credited, and
+    /// BEFORE any of this cast's proc rolls. Two consequences, both
+    /// deliberate:
+    ///
+    /// - The applying cast does NOT benefit from the buff it applies —
+    ///   the same rule [`ActionDamage::stats`] states for procs ("a proc
+    ///   triggered by a hit cannot change what that hit was").
+    /// - A proc rolled by this cast DOES see it: a `chance` expression
+    ///   naming `buff.<applied>` reads `1`. Intrinsic effects resolve
+    ///   before triggered ones, so the whole `apply_buff` list precedes
+    ///   the whole proc batch and never interleaves with it (a proc-
+    ///   applied buff at the same instant therefore always lands second,
+    ///   whatever the procs' name order).
+    ///
+    /// Entries are applied in LIST order, and a name repeated in the list
+    /// is applied that many times — under `add_independent` that is two
+    /// instances; under `refresh` the second application simply replaces
+    /// the first.
+    ///
+    /// A SNAPSHOT [`TickObjective`] captures under the CASTING ACTION'S
+    /// overlay — the effective build with this action's
+    /// [`ActionDamage::stats`] applied — so an ailment inherits the
+    /// magnitude of the hit that applied it. A utility action (no
+    /// `damage`) has no overlay and captures the plain effective build.
+    /// The PROC path is deliberately unchanged: a proc-applied buff still
+    /// captures the effective build, with no action's overlay on it.
+    ///
+    /// Applied by a proc-triggered FREE cast of this action
+    /// ([`ProcDef::cast_action`]) too — `apply_buff` is an effect OF the
+    /// action, like `gain` and `damage`, not part of the cast pipeline
+    /// (cost, cooldown, further proc rolls) that the free-cast path
+    /// deliberately skips.
+    ///
+    /// Fail-closed at `sim::compile`: a name that is not a defined buff.
+    #[serde(default)]
+    pub apply_buff: Vec<String>,
 }
 
 /// Per-cast stat overrides folded onto the `Plan`'s `BuildState` before the
@@ -555,6 +604,28 @@ pub struct ProcDef {
     /// `cast_action` must be set — zero or both is a compile error.
     #[serde(default)]
     pub cast_action: Option<String>,
+    /// Trigger filter: this proc's [`ProcDef::trigger`] only considers
+    /// casts of the LISTED actions. `None` (the default) means every
+    /// action — rtce 0.2.0's behavior, and what every 0.2.0 config gets
+    /// without naming the field.
+    ///
+    /// Applies to all three triggers alike, because all three are events
+    /// of a cast: the filter names the action whose cast produced the
+    /// event, so `on_hit`/`on_crit` are filtered by the action that HIT.
+    /// A filtered-out cast contributes NOTHING — in [`Trigger::OnHit`]'s
+    /// EV accumulator it is not banked any more than an ICD-gated roll
+    /// is, and in Monte Carlo mode it consumes no RNG draw.
+    ///
+    /// A proc-triggered free cast ([`ProcDef::cast_action`]) rolls no
+    /// procs at all, so no event this filter could match ever originates
+    /// there.
+    ///
+    /// Fail-closed at `sim::compile`: an unknown action name, and an
+    /// EMPTY list — `actions: []` describes a proc that can never fire,
+    /// which is a config mistake rather than a way to disable one. Write
+    /// `None` (omit the key) for "every action".
+    #[serde(default)]
+    pub actions: Option<Vec<String>>,
 }
 
 /// A priority-list rotation (SimC-style): pure config, drivers may search
@@ -860,6 +931,87 @@ mod tests {
         assert!(
             e.to_string().contains("TickObjectiveRepr") && e.to_string().contains("line 4"),
             "expected a positioned no-variant-matched error, got: {e}"
+        );
+    }
+
+    // P7d backward-compatibility contract at the parse layer: a 0.2.0
+    // config names neither new field, and must come out as exactly the
+    // 0.2.0 behavior — an action that applies nothing, and a proc that
+    // considers EVERY action.
+    #[test]
+    fn omitted_action_scoping_fields_default_to_the_020_behavior() {
+        let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
+        assert!(
+            def.actions["fireball"].apply_buff.is_empty(),
+            "an action that names no apply_buff applies nothing"
+        );
+        assert_eq!(
+            def.procs["conflagrate"].actions, None,
+            "a proc that names no `actions` filter considers every action"
+        );
+    }
+
+    #[test]
+    fn action_scoping_fields_parse_and_round_trip() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "actions": {
+                "nova": { "cast_time": "0", "cooldown": 10.0,
+                          "apply_buff": ["vuln_window", "chill"] },
+                "bolt": { "cast_time": "1" }
+              },
+              "buffs": { "vuln_window": { "duration": 4.0 },
+                         "chill":       { "duration": 2.0 } },
+              "procs": {
+                "scoped": { "trigger": "on_hit", "chance": "1",
+                            "apply_buff": "chill", "actions": ["bolt"] },
+                "global": { "trigger": "on_hit", "chance": "1",
+                            "apply_buff": "chill" }
+              },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        // Source ORDER is preserved (it is the application order — see
+        // `ActionDef::apply_buff`), so this is a Vec comparison, not a set
+        // one.
+        assert_eq!(def.actions["nova"].apply_buff, ["vuln_window", "chill"]);
+        assert!(def.actions["bolt"].apply_buff.is_empty());
+        assert_eq!(
+            def.procs["scoped"].actions.as_deref(),
+            Some(["bolt".to_string()].as_slice())
+        );
+        assert_eq!(def.procs["global"].actions, None);
+
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(
+            round.actions["nova"].apply_buff,
+            def.actions["nova"].apply_buff
+        );
+        assert_eq!(round.procs["scoped"].actions, def.procs["scoped"].actions);
+        assert_eq!(round.procs["global"].actions, None);
+    }
+
+    // The same STRUCTURAL guard `BuffDef` carries, for the type P7d gave a
+    // new field to. `ActionDef` derives `Default`, so its two spellings of
+    // "what a config that says nothing means" are serde's `#[serde(default)]`
+    // attributes and that derive — independent, and nothing in the language
+    // ties them together. Add every new field to BOTH. (`ProcDef` has no
+    // `Default` at all — `trigger`/`chance` are required — so there is no
+    // second spelling of its defaults to disagree with.)
+    #[test]
+    fn action_def_serde_defaults_and_derived_default_agree_field_for_field() {
+        let bare: ActionDef = serde_json::from_str(r#"{ "cast_time": "" }"#).unwrap();
+        let derived = ActionDef::default();
+        assert_eq!(bare.cast_time, derived.cast_time);
+        assert_eq!(bare.cooldown, derived.cooldown);
+        assert_eq!(bare.cost, derived.cost);
+        assert_eq!(bare.gain, derived.gain);
+        assert!(bare.damage.is_none() && derived.damage.is_none());
+        assert_eq!(
+            bare.apply_buff, derived.apply_buff,
+            "serde's per-field defaults must agree with the derived \
+             `Default` — a new ActionDef field belongs in BOTH"
         );
     }
 

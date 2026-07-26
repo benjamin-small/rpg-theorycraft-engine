@@ -44,6 +44,16 @@
 //! ([`crate::simdef::NumOrExpr`], untagged) — every rtce 0.2.0 config,
 //! which only ever wrote numbers there, parses and behaves unchanged.
 //!
+//! Two further fields are cross-REFERENCES rather than expressions, and
+//! `sim::compile` resolves both to indices, fail-closed (P7d):
+//! [`crate::simdef::ActionDef::apply_buff`] (buffs the action applies at
+//! cast complete, before any of that cast's proc rolls) and
+//! [`crate::simdef::ProcDef::actions`] (a trigger filter naming the
+//! actions whose casts this proc considers; `None` = all of them, the
+//! 0.2.0 behavior). An unknown name in either — or an EMPTY `actions`
+//! list, which would describe a proc that can never fire — is a compile
+//! error.
+//!
 //! Pipeline STAGES and buckets are deliberately absent from this space —
 //! a sim expression referencing one is a fail-closed "unknown identifier"
 //! compile error, the same as any other unresolved name. Resource/action/

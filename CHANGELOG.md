@@ -126,6 +126,61 @@ until then, per semver's "anything goes" pre-1.0 clause).
   totals — they differ in when instances are applied, never in what each
   captures.
 
+- **Action-scoped effects (P7d).** `ActionDef` gains `apply_buff:
+  Vec<String>` — buffs the action itself applies when its cast COMPLETES,
+  one application per list entry, each routed through the buff's own
+  `on_reapply` policy exactly like a proc application. `ProcDef` gains
+  `actions: Option<Vec<String>>` — a trigger filter naming the actions
+  whose casts this proc considers; `None` (the default, and every 0.2.0
+  config) is every action. Between them they retire the "icd equals the
+  gating action's cooldown" trick that was previously the ONLY way to
+  bind an effect to one action.
+
+  The completion instant now has this fixed internal order: `gain` →
+  `casts += 1` → measure and credit damage → `apply_buff` (list order) →
+  proc rolls. So the applying cast never benefits from the buff it
+  applies (the rule `damage.stats` already stated for procs), and a proc
+  rolled by that cast always SEES it — an action's intrinsic effects
+  resolve before the effects it merely triggers, so the whole
+  `apply_buff` list precedes the whole proc batch and never interleaves
+  with the procs' name order. A repeated name in `apply_buff` is applied
+  that many times. A proc-triggered FREE cast applies its action's
+  `apply_buff` too: it is an effect OF the action, like `gain` and
+  `damage`, not part of the cast pipeline the free-cast path skips.
+
+  A SNAPSHOT `tick_objective` applied by `apply_buff` captures under the
+  CASTING ACTION's overlay — the effective build with that action's
+  `damage.stats` folded on — so an ailment inherits the magnitude of the
+  hit that applied it (a utility action has no overlay and captures the
+  plain effective build). The PROC application path is deliberately
+  UNCHANGED and still captures the ambient effective build; the two are
+  pinned against each other as controls.
+
+  Fail-closed at `sim::compile`: an unknown buff in `apply_buff`, an
+  unknown action in an `actions` filter, and an EMPTY `actions: []` —
+  which describes a proc that could never fire, and reads like `None`
+  while meaning the opposite. A filtered-out cast is skipped before the
+  ICD gate, before the `chance` evaluation and before any RNG draw, so in
+  Monte Carlo mode a filter genuinely removes rolls from the stream
+  rather than rolling and discarding.
+
+  `examples/diablo4_rotation.rs` is rewritten off the trick — `frost_nova`
+  carries `apply_buff: ["vuln_window"]` and the `nova_pulse` proc is
+  DELETED, leaving the example with no procs at all. The cadence is
+  unchanged and the EV pins are byte-identical (225199.1088 /
+  3753.31848 / 0.4, and each action's own damage). Its Monte Carlo block
+  DID move — mean 3743.0759 / std 210.1306 → 3746.6413 / 211.4556 —
+  because the deleted proc used to consume one RNG draw per off-ICD
+  `on_cast` roll (6 per iteration), and removing them re-phases which
+  crit sample lands on which cast. Same distribution, different phase:
+  both means sit within 0.2% of the EV pin.
+
+  New public API: `CompiledAction::apply_buff` (`Vec<usize>`) and
+  `CompiledProc::actions` (`Option<Vec<usize>>`), both resolved to
+  indices. Every 0.2.0 config parses and behaves unchanged — an action
+  that names no `apply_buff` applies nothing, and a proc that names no
+  `actions` considers every action.
+
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated
   against a slot array whose time-varying tail (`buff.*`,

@@ -119,6 +119,12 @@ pub struct CompiledAction {
     /// out of this map by the executor rather than fed into the `Plan` as
     /// a stat — see `simdef::ActionDamage` docs.
     pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
+    /// Buffs this action applies at cast complete, resolved to indices
+    /// into [`SimPlan::buffs`] and kept in the CONFIG's list order, which
+    /// is the application order (see
+    /// [`crate::simdef::ActionDef::apply_buff`] for where in the
+    /// completion instant they land and what a repeat means).
+    pub apply_buff: Vec<usize>,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -188,6 +194,12 @@ pub struct CompiledProc {
     pub icd: f64,
     /// What firing this proc does, resolved to an index.
     pub effect: ProcEffect,
+    /// Trigger filter, resolved to indices into [`SimPlan::actions`]:
+    /// `None` = every action (the 0.2.0 behavior), `Some(list)` = only
+    /// casts of those actions produce a qualifying event. Never
+    /// `Some(empty)` — [`compile`] rejects that (see
+    /// [`crate::simdef::ProcDef::actions`]).
+    pub actions: Option<Vec<usize>>,
 }
 
 /// One compiled [`crate::simdef::Rule`]: the action index it casts and its
@@ -404,12 +416,20 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
-    // Actions: cost/gain resource references must be defined.
+    // Actions: cost/gain resource references and `apply_buff` targets
+    // must be defined.
     for (name, action) in &simdef.actions {
         for r in action.cost.keys().chain(action.gain.keys()) {
             if !simdef.resources.contains_key(r) {
                 return Err(PlanError {
                     what: format!("action `{name}`: unknown resource `{r}` in cost/gain"),
+                });
+            }
+        }
+        for b in &action.apply_buff {
+            if !simdef.buffs.contains_key(b) {
+                return Err(PlanError {
+                    what: format!("action `{name}`: unknown buff `{b}` in apply_buff"),
                 });
             }
         }
@@ -500,6 +520,33 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             }
             _ => {}
         }
+        // The trigger filter. `None` is "every action" (0.2.0); an EMPTY
+        // list is the config mistake that reads like `None` and means the
+        // opposite — a proc that can never fire.
+        match &p.actions {
+            None => {}
+            Some(list) if list.is_empty() => {
+                return Err(PlanError {
+                    what: format!(
+                        "proc `{name}`: the `actions` trigger filter is empty, so this \
+                         proc could never fire — omit the key (or write null) for \
+                         `every action`"
+                    ),
+                })
+            }
+            Some(list) => {
+                for a in list {
+                    if !simdef.actions.contains_key(a) {
+                        return Err(PlanError {
+                            what: format!(
+                                "proc `{name}`: unknown action `{a}` in the `actions` \
+                                 trigger filter"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // Every cross-reference is validated — build the extended sim symbol
@@ -572,6 +619,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             cost,
             gain,
             damage,
+            apply_buff: a.apply_buff.iter().map(|b| buff_index(b)).collect(),
         });
     }
 
@@ -616,6 +664,10 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             chance,
             icd: p.icd,
             effect,
+            actions: p
+                .actions
+                .as_ref()
+                .map(|list| list.iter().map(|a| action_index(a)).collect()),
         });
     }
 
@@ -701,6 +753,7 @@ mod tests {
         actions.insert(
             "fireball".to_string(),
             ActionDef {
+                apply_buff: Vec::new(),
                 cast_time: "1.0 / base_aps".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost,
@@ -711,6 +764,7 @@ mod tests {
         actions.insert(
             "frost_nova".to_string(),
             ActionDef {
+                apply_buff: Vec::new(),
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
@@ -765,6 +819,7 @@ mod tests {
         procs.insert(
             "conflagrate".to_string(),
             ProcDef {
+                actions: None,
                 trigger: Trigger::OnCrit,
                 chance: "lucky_hit_chance / 100 * 0.3".into(),
                 icd: 2.0,
@@ -901,6 +956,75 @@ mod tests {
         simdef.procs.get_mut("conflagrate").unwrap().cast_action = Some("fireball".into());
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("conflagrate"), "got: {}", e.what);
+    }
+
+    // ==================================================================
+    // P7d — action-scoped effects: `ActionDef::apply_buff` and the
+    // `ProcDef::actions` trigger filter. Both are cross-references, so
+    // both resolve to indices here and both fail closed on a name that
+    // does not exist.
+    // ==================================================================
+
+    #[test]
+    fn action_apply_buff_referencing_an_unknown_buff_is_rejected() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.actions.get_mut("frost_nova").unwrap().apply_buff =
+            vec!["vuln_window".into(), "nope".into()];
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("frost_nova"), "got: {}", e.what);
+        assert!(e.what.contains("nope"), "got: {}", e.what);
+        assert!(e.what.contains("apply_buff"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn proc_actions_filter_referencing_an_unknown_action_is_rejected() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.procs.get_mut("conflagrate").unwrap().actions =
+            Some(vec!["fireball".into(), "nope".into()]);
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("conflagrate"), "got: {}", e.what);
+        assert!(e.what.contains("nope"), "got: {}", e.what);
+        assert!(e.what.contains("actions"), "got: {}", e.what);
+    }
+
+    // `actions: []` describes a proc that can NEVER fire. That is a config
+    // mistake, not a supported way to switch one off — and it is exactly
+    // the shape that reads like `None` at a glance while meaning the
+    // opposite.
+    #[test]
+    fn proc_with_an_empty_actions_filter_is_rejected() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.procs.get_mut("conflagrate").unwrap().actions = Some(Vec::new());
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("conflagrate"), "got: {}", e.what);
+        assert!(e.what.contains("empty"), "got: {}", e.what);
+    }
+
+    // The positive case: both resolve to INDICES into `SimPlan`'s
+    // name-sorted `buffs`/`actions`, keeping the SOURCE list's order —
+    // which for `apply_buff` is the application order (see
+    // `simdef::ActionDef::apply_buff`).
+    #[test]
+    fn action_scoping_resolves_to_indices_in_source_order() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        // buffs sort "burning"(0) < "combustion"(1) < "vuln_window"(2);
+        // actions sort "fireball"(0) < "frost_nova"(1).
+        simdef.actions.get_mut("frost_nova").unwrap().apply_buff =
+            vec!["vuln_window".into(), "burning".into()];
+        simdef.procs.get_mut("conflagrate").unwrap().actions = Some(vec!["frost_nova".into()]);
+        let sp = compile(&plan, &simdef, &valid_rotation()).unwrap();
+        assert_eq!(sp.actions[1].name, "frost_nova");
+        assert_eq!(
+            sp.actions[1].apply_buff,
+            vec![2, 0],
+            "list order is application order, NOT the buffs' sorted order"
+        );
+        assert!(sp.actions[0].apply_buff.is_empty());
+        assert_eq!(sp.procs[0].actions.as_deref(), Some([1].as_slice()));
     }
 
     #[test]
@@ -1140,6 +1264,7 @@ mod tests {
         simdef.actions.insert(
             "basic_bolt".to_string(),
             ActionDef {
+                apply_buff: Vec::new(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
