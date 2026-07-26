@@ -227,8 +227,8 @@ pub struct CompiledRule {
 /// A `SimDef` + `Rotation` compiled once against a [`Plan`]: every
 /// expression parsed and slot-resolved over the extended sim symbol space,
 /// every cross-reference validated fail-closed (see `sim` module docs),
-/// ready for a future executor to drive. Inert data — no execution logic
-/// lives here (that's P6c).
+/// ready for [`crate::sim::run`] to drive. Inert data — no execution logic
+/// lives here.
 #[derive(Debug)]
 pub struct SimPlan {
     /// The slot offset where the sim-state segment begins — equal to the

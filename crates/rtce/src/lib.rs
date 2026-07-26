@@ -10,6 +10,23 @@
 //! per second: the expensive parsing/compiling work happens once, and the
 //! hot path (`Plan::evaluate`) allocates nothing.
 //!
+//! # Three fidelity levels
+//!
+//! One config family answers the same question at three costs, all on the
+//! same compiled [`plan::Plan`]:
+//!
+//! | | What it computes | Uptimes | Cost |
+//! |---|---|---|---|
+//! | [`plan::Plan::evaluate`] | closed-form average | inputs (asserted) | ~µs |
+//! | [`sim::run`] + [`sim::Mode::Expected`] | one deterministic, branch-blended timeline | COMPUTED | ~ms |
+//! | [`sim::run`] + [`sim::Mode::MonteCarlo`] | N seeded sampled timelines + a `dps` distribution | COMPUTED | ~ms×N |
+//!
+//! Where they overlap they are required to agree: `sim::exec`'s keystone
+//! test reproduces `evaluate`'s number EXACTLY on a degenerate config with
+//! nothing for the timeline to add. Levels 1 and 2 are described below;
+//! see the [`sim`] module docs for the executor's own rules (the
+//! cast-complete order, the fight horizon, `seq` ordering).
+//!
 //! # The three config tiers
 //!
 //! An `rtce` game is described by three separate pieces of configuration,
@@ -59,14 +76,70 @@
 //! answer a related question over an actual TIMELINE instead: given a
 //! priority-list rotation, resources, cooldowns, buff windows, and procs,
 //! what really happens over N seconds, and what uptimes does that produce?
-//! [`sim::Mode::Expected`] walks one deterministic branch-blended timeline
-//! (agrees with `evaluate` EXACTLY when there's nothing for the timeline
-//! to add — see `sim::exec`'s keystone test); [`sim::Mode::MonteCarlo`]
-//! runs many seeded timelines and reports the `dps` distribution. See
-//! `examples/diablo4_rotation.rs` for a full walkthrough (mana, a
-//! spender/generator pair, a cooldown-gated buff, computed uptimes, both
-//! modes, hand-worked pins) — run it with
-//! `cargo run -p rtce --example diablo4_rotation`.
+//!
+//! Those are the two further config tiers, compiled by [`sim::compile`]
+//! against an existing `Plan`:
+//!
+//! 4. [`simdef::SimDef`] — resources (capped pools with regen),
+//!    [`simdef::ActionDef`]s (cast time, cooldown, resource cost/gain, an
+//!    optional per-cast `damage.stats` overlay, and
+//!    [`simdef::ActionDef::apply_buff`]), [`simdef::BuffDef`]s (timed
+//!    contribution/condition windows, stack policies, optional DoT ticks),
+//!    and [`simdef::ProcDef`]s (chance-triggered, ICD-gated, optionally
+//!    filtered to named actions).
+//! 5. [`simdef::Rotation`] — a SimC-style priority list; the first
+//!    eligible [`simdef::Rule`] wins. Hard gates (off cooldown, cost
+//!    payable, not mid-cast) are automatic; a rule's `when` predicate adds
+//!    strategy on top.
+//!
+//! [`sim::run`]'s [`sim::SimReport`] reports COMPUTED
+//! buff/condition uptimes, per-buff `avg_stacks`, per-action
+//! casts/damage/share, per-resource starvation and cap time, and proc fire
+//! counts — with a `dps` [`sim::Distribution`] added in
+//! [`sim::Mode::MonteCarlo`].
+//!
+//! # Counted and snapshotted state
+//!
+//! A buff is internally an INSTANCE LIST, collapsed per mechanic by
+//! [`simdef::BuffDef::max_stacks`] (default `1`; `0` = unbounded) and
+//! [`simdef::ReapplyPolicy`] — `refresh` (the degenerate binary buff, and
+//! every pre-0.3.0 config), `add_refresh_all` (counted, one shared expiry
+//! clock), `add_independent` (each instance its own duration, evicting the
+//! earliest-expiring at the cap), or `strongest` (replace only on a
+//! strictly higher magnitude). A [`simdef::TickObjective`] DoT is either
+//! LIVE (re-evaluated on every state change, × the count) or
+//! `snapshot: true`, in which case each instance captures its rate at its
+//! own application and ticks it unchanged to expiry. What a stack count
+//! does and does not scale is documented on [`simdef::BuffDef`].
+//!
+//! # Examples
+//!
+//! Six runnable walkthroughs, each with hand-worked pins in comments,
+//! asserted and run in CI. Run any with
+//! `cargo run -p rtce --example <name>`:
+//!
+//! - `your_own_game` — the smallest starting point: all three evaluation
+//!   tiers on a made-up archer game, two scenarios, `explain()` output.
+//! - `diablo4_basics` — one build priced against two fights on a real
+//!   game's damage slice, plus the branch table behind the crit
+//!   expectation.
+//! - `diablo4_rotation` — sequencing end to end: mana, a spender/generator
+//!   pair, a cooldown-gated buff window whose `vulnerable` uptime falls
+//!   OUT of the timeline, in both EV and Monte Carlo mode. The one example
+//!   that exercises sampling.
+//! - `poe2_charges` — `add_refresh_all` at `max_stacks: 3`, an expression
+//!   `duration`, and `stacks.<buff>` gating a rotation rule.
+//! - `poe2_poison` — unbounded `add_independent` snapshot DoTs applied by
+//!   the skill's own `apply_buff`, re-run via a proc as a contrast.
+//! - `poe2_triggers` — a [`simdef::ProcDef::actions`] trigger filter plus
+//!   `cast_action`, with `apply_buff` on both a primary and the free-cast
+//!   secondary.
+//!
+//! The `diablo4_*` examples run on a thin SLICE of Diablo 4's damage
+//! formula, not the game, and `diablo4_rotation`'s cadence is a
+//! demonstration rather than real skill data; the `poe2_*` examples run on
+//! a PoE2-*shaped* fixture whose every coefficient is `representative`,
+//! not Path of Exile 2's damage model. What they demonstrate is the shape.
 //!
 //! # Example
 //!

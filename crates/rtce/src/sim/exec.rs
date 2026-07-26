@@ -375,8 +375,9 @@ impl SimScratch {
 /// would legitimately recast it infinitely many times without time ever
 /// advancing. This function does not hang on such a config; it fails
 /// closed with a [`PlanError`] naming the offending action and instant
-/// once [`Sim::attempt_decision`]'s per-instant chain bound is exceeded
-/// (P6 review/C1 — see that method's doc comment).
+/// once the executor's per-instant decision-chain bound is exceeded
+/// (P6 review/C1 — see `Sim::attempt_decision`'s doc comment in the
+/// source).
 pub fn run(
     plan: &Plan,
     sim_plan: &SimPlan,

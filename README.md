@@ -20,14 +20,15 @@ Crates: `rtce` (engine), `rtce-testkit` (fixture harness, dev-dependency).
 To be clear about scope: this is a **thin slice** of Diablo 4 — the core
 damage formula (crit/overpower branching, the shared additive pool, summed
 multiplier groups, vulnerable, DoT, attack speed) — not the game. There is
-no resource model, no proc system, no defenses, no buff timelines here;
-those are future config tiers (see the design spec's Level-2 scenarios) or
-resolver-side concerns in the consumer. What the slice demonstrates is the
-*shape*: a real game's damage algorithm expressed entirely as data, exact
-enough that a production calculator runs on it.
+no resource model, no proc system, no buff timeline in the `GameDef`
+below; those live one tier up, in the `SimDef` covered under "Sequencing".
+Defenses are a resolver-side concern in the consumer and are not modeled
+at all. What the slice demonstrates is the *shape*: a real game's damage
+algorithm expressed entirely as data, exact enough that a production
+calculator runs on it.
 
-Three tiers of configuration, nothing else. **Tier 1 — the GameDef** is the
-slice's algorithm. This is the (abridged) real one from
+Three tiers of configuration and nothing else answer the closed-form
+question. **Tier 1 — the GameDef** is the slice's algorithm. This is the (abridged) real one from
 [`crates/rtce/tests/fixtures/d4/gamedef.json`](crates/rtce/tests/fixtures/d4/gamedef.json),
 the same file the test suite pins against the `diablo4-calc` production
 calculator:
@@ -278,20 +279,32 @@ Monte Carlo (N=128, seed=5): mean 881.2500  std 0.0000
 
 Nothing in these three configs samples — the fixture's crit is closed
 form (`1 + c·(m−1)`, the same choice poe2-calcs' generated gamedef makes)
-and the one proc is certain — so Monte Carlo mode is asserted to
-reproduce EV *exactly*, with zero spread, rather than within a tolerance
-band. That is the stronger claim: it fails if an RNG draw ever appears on
-a path that must stay deterministic.
+and every proc they define is `chance: "1"` — so Monte Carlo mode is
+asserted to reproduce EV *exactly*, with zero spread, rather than within a
+tolerance band. That is the stronger claim: it fails if an RNG draw ever
+appears on a path that must stay deterministic. But it is a claim about
+exactness, not about MC's distribution machinery: `diablo4_rotation`
+remains the only example that actually samples.
 
 ## Status
 
-Parity-proven against its first consumer, `../diablo4-calc`: all 7 of its
-archetype builds reproduced to <1e-9 relative during the P4 cross-engine
-proof through rtce (the standing numbers 8,096.02 … 6,769.10). As of the
-P4c switchover, diablo4-calc runs
+Parity-proven against two independent consumers.
+
+**`../diablo4-calc`** — all 7 of its archetype builds reproduced to <1e-9
+relative during the P4 cross-engine proof through rtce (the standing
+numbers 8,096.02 … 6,769.10). As of the P4c switchover, diablo4-calc runs
 **solely** on rtce in production — its native damage math is deleted, and
 `calc::evaluate` is a thin shim over an rtce-compiled plan (including in
 the browser, via WASM).
+
+**`../poe2-calcs`** — a GENERATED `gamedef/poe2.gamedef.json` (67 stats,
+73 buckets, 209 pipeline stages, 80 objectives) plus an adapter reproduce
+that calculator's native math to 1e-9 across 63 parity tests, standing
+references 124.53 / 129.51 / 793.76 dps, with a 156-pair
+`(StatId, ModKind)` sweep guarding against silent routing drift. Its
+native math is deliberately UNTOUCHED: this is a proof that the engine
+generalizes past one game, not a second switchover. The harness lives in
+that repo.
 
 ## License
 

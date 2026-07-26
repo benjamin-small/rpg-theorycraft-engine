@@ -25,67 +25,80 @@
   asserted ones; `examples/diablo4_rotation.rs` (mana, a spender/generator
   pair, a proc-gated buff window, hand-worked EV + Monte Carlo pins),
   CI-run. Published at `rtce` 0.2.0 (`cargo publish --dry-run` clean).
+- **P7 — PoE2 test bed + instance mechanics, DONE (0.3.0).** A SECOND
+  consumer proves the engine is not shaped around one game: `poe2-calcs`
+  carries a generated 209-stage `GameDef` + adapter reproducing its native
+  calculator to 1e-9 across 63 parity tests (124.53 / 129.51 / 793.76),
+  with a 156-pair `(StatId, ModKind)` sweep against silent routing drift.
+  That harness lives in THAT repo and its native math is untouched — a
+  proof, not a switchover (P7a).
+
+  Engine growth, all of it config-visible: `NumOrExpr` expression-valued
+  sim fields with documented evaluation instants (P7b); buffs as INSTANCE
+  LISTS — `max_stacks`, `on_reapply` (`refresh` / `add_refresh_all` /
+  `add_independent` / `strongest`), the `stacks.<buff>` symbol, and
+  `SimReport::buffs` carrying `uptime` + `avg_stacks` (P7c-T1); snapshot
+  DoTs, where an instance captures its rate at application and ticks it
+  unchanged to expiry (P7c-T2); `ActionDef::apply_buff` and
+  `ProcDef::actions` trigger filters, which together retire the "icd
+  equals the gating action's cooldown" trick the ROADMAP itself had called
+  a config-author trap — `examples/diablo4_rotation.rs` is off it with EV
+  pins byte-identical (P7d); and three PoE2 slices on a committed trimmed
+  PoE2-shaped fixture, `poe2_charges` / `poe2_poison` / `poe2_triggers`,
+  each with hand-derived pins and contrast runs (P7e).
+
+  Five behavior fixes, all CHANGELOG'd with what kind of config each can
+  move numbers for: the horizon drain (below), EV's `on_crit` weight
+  measured before the cast's own procs, per-proc slot refresh, resource
+  `max`/`regen_per_sec` re-derived at every refold, and the `apply_buff`
+  snapshot overlay frozen on both action paths. 176 tests green (168 in
+  the `rtce` lib), `cargo publish -p rtce --dry-run` clean at 0.3.0.
+
+  **The horizon-drain bug (found P7e, fixed P7e-T2).**
+  `sim::exec::run_loop` processed at most ONE event at `t == duration`: it
+  popped an event, set `self.time`, handled it, then broke on
+  `self.time >= self.duration` — so any OTHER event already queued for
+  that instant was silently discarded, and which one survived was decided
+  by the heap's `(time, seq)` tie-break. In practice a `BuffExpire`
+  scheduled at the fight's end swallowed the `CastComplete` there,
+  dropping that cast whole: its count, its damage, and its `apply_buff`. A
+  cast completing at `duration` DID count when it was alone on the instant
+  (`diablo4_rotation`'s 60th cast is), so this was never "the horizon
+  excludes its boundary" — it was order-dependent silent damage loss.
+
+  Repro, now the regression pin — one 1s filler applying a `refresh` buff,
+  10s fight: 9 casts at buff durations 2 / 5 / 9, 10 at 9.5. (An earlier
+  wording of this entry said "9 casts for ANY integer duration", which was
+  never right: at a duration ≥ 10 no expiry lands on t=10 at all, and the
+  count is a correct 10.)
+
+  OUTCOME: the horizon is now DRAINED — no cast BEGINS at or after
+  `duration`, every event already scheduled AT `duration` is processed, so
+  a cast completing exactly at `duration` counts. Zero pins moved anywhere
+  in the repo, `diablo4_rotation` byte-identical (225199.1088 /
+  3753.31848 / 0.4, MC block included), both consumers byte-identical.
+  Mutation evidence: reinstating the break drops both horizon pins to 9
+  casts; removing the "no cast begins at the horizon" guard fails three
+  pre-existing pins. The drain's bound (`HORIZON_DRAIN_LIMIT`) is
+  reachable via trailing zero-weight phases and pinned by
+  `too_many_zero_weight_phases_at_the_horizon_fails_closed`.
+
+  The three PoE2 slices KEEP their half-integer buff durations, but for
+  the OTHER reason: measurement showed the rationale was the mid-fight
+  `seq` ordering (see the 0.4.0 question below), not this bug. Integer
+  durations would reshape `poe2_charges`' cycle and cost `poe2_triggers`
+  15.5% of bolt damage — three lessons in event ordering instead of three
+  lessons in charges/poison/triggers.
 
 ## Next
-- [x] **BUG: `sim::exec::run_loop` processed at most ONE event at `t ==
-      duration`** — found in P7e, FIXED in P7e-T2 (0.3.0). The loop popped
-      an event, set `self.time`, handled it, then broke on `self.time >=
-      self.duration` — so any OTHER event already queued for that same
-      instant was silently discarded, and which one survived was decided
-      by the heap's `(time, seq)` tie-break (first scheduled wins). In
-      practice a `BuffExpire` scheduled at exactly the fight's end
-      swallowed the `CastComplete` there, dropping that cast whole: its
-      `casts` count, its damage, and its `apply_buff`. A cast completing
-      at `duration` DID count when it was the only event there
-      (`diablo4_rotation`'s 60th cast is), so this was never "the horizon
-      excludes its boundary" — it was order-dependent silent damage loss.
-
-      Repro, now the regression pin — one 1s filler applying a `refresh`
-      buff, 10s fight: 9 casts at buff durations 2 / 5 / 9, 10 at 9.5.
-      (The earlier wording here said "9 casts for ANY integer duration",
-      which was never right: at a duration ≥ 10 no expiry lands on t=10 at
-      all, and the count is a correct 10.)
-
-      OUTCOME: the horizon is now DRAINED — no cast BEGINS at or after
-      `duration`, every event already scheduled AT `duration` is
-      processed, so a cast completing exactly at `duration` counts. Zero
-      pins moved anywhere in the repo, `diablo4_rotation` byte-identical
-      (225199.1088 / 3753.31848 / 0.4, MC block included), both consumers
-      byte-identical. Mutation evidence: reinstating the break drops both
-      horizon pins to 9 casts; removing the "no cast begins at the
-      horizon" guard fails three pre-existing pins. The drain's bound
-      (`HORIZON_DRAIN_LIMIT`) is reachable via trailing zero-weight phases
-      and pinned by
-      `too_many_zero_weight_phases_at_the_horizon_fails_closed`.
-
-      The three PoE2 slices KEEP their half-integer buff durations, but
-      for the other reason: measurement showed the rationale was the
-      mid-fight `seq` ordering below, not this bug. Integer durations
-      would reshape `poe2_charges`' cycle and cost `poe2_triggers` 15.5%
-      of bolt damage — three lessons in event ordering instead of three
-      lessons in charges/poison/triggers.
-- [ ] Publish: GitHub repo, then crates.io (`rtce`, `rtce-testkit`) — the
-      API survived the P4c switchover; semver honesty: 0.x until publish.
-      Publish `rtce-testkit` first (no rtce-workspace deps of its own);
-      once it exists on crates.io, consider pinning
-      `rtce-testkit = { path = ..., version = "0.1.0" }` as rtce's
-      dev-dependency so `cargo test` also builds from the published
-      tarball (path-only today because that version pin can't resolve
-      against the registry before the first real publish).
-- [x] `ActionDef.apply_buff` + action-scoped procs — DONE in P7d
-      (0.3.0). An action applies its own buffs at cast complete, and a
-      `ProcDef` can name the actions its trigger considers, so the "icd
-      equals the gating action's cooldown" trick is no longer the only
-      way to bind an effect to one action. `examples/diablo4_rotation.rs`
-      is off it: `frost_nova` carries `apply_buff: ["vuln_window"]` and
-      the `nova_pulse` proc is deleted, with the EV pins (225199.1088 /
-      3753.31848 / 0.4) byte-identical, and the trick's own leak
-      documented (its icd let a SEVENTH application through at the fight
-      boundary, on an action that was never Frost Nova). Two `sim::exec`
-      fixture BUILDERS still apply their buff from a proc, deliberately —
-      they are about stacks/DoTs, `apply_buff` cannot express their
-      varying `chance`, and keeping them keeps the proc application path
-      covered.
+- [ ] **Publish 0.3.0** to crates.io. `rtce` 0.2.0 and `rtce-testkit`
+      0.1.0 are both live on the registry, and rtce's dev-dependency
+      already carries the `version = "0.1.0"` pin alongside its path, so
+      the PUBLISHED tarball's tests resolve testkit from the registry
+      rather than a path that isn't there (locally the path still wins).
+      `rtce-testkit` is UNTOUCHED this phase — no commit under
+      `crates/rtce-testkit/` since before P7 — and stays at 0.1.0; only
+      `rtce` bumps.
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full
@@ -115,6 +128,15 @@
       high-frequency stack (hundreds of instances). Measure first: there
       is no bench harness in this repo yet, so the first step is a
       `benches/` entry, not an optimization.
+
+## Open for 0.4.0
+These accumulated during P7 and were deliberately NOT decided in 0.3.0.
+The first three are config-compatibility changes and want to land
+together, in one slice with a migration note. The last two are open
+design questions: today's behavior is documented and pinned, which is not
+the same as being right, and neither should be guessed at without a
+config that needs the answer.
+
 - [ ] Harmonize `apply_buff`'s ARITY between `ActionDef` (a
       `Vec<String>` list) and `ProcDef` (a single `Option<String>`) —
       0.4.0, alongside the `deny_unknown_fields` sweep below, since both
@@ -185,6 +207,20 @@
       `CastComplete`-before-`BuffExpire` cannot be expressed by `seq`
       alone and needs a second ordering key on the queue, the same
       machinery the P6 design notes declined for `End`.
+- [ ] **A per-stack `product` fold mode** (P7c-T1/P7e) — 0.4.0 candidate,
+      and only if a real config asks. Today a stacked contribution scales
+      its VALUE by the count, so 3 stacks of `+10` in a `product` bucket
+      fold as `×1.30`, not `×1.10³`. That is CORRECT for "increased damage
+      per charge" and it is documented on `BuffDef` and pinned by
+      `poe2_charges` precisely so it stays a stated choice — but it
+      linearizes a genuinely multiplicative per-charge effect (PoE2 would
+      call three 10% frenzy charges `×1.331`), and such an effect is not
+      expressible as one per-stack contribution at all. The workaround is
+      to write it as a `sum` bucket, where linear IS the correct fold. A
+      real fix means a fold mode that raises a member to the stack power,
+      which is a `GameDef`-level addition (new `FoldKind`, or a per-
+      contribution flag) rather than a `SimDef` one — so the shape should
+      be chosen by a config that actually needs `×1.331`, not guessed at.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

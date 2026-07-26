@@ -7,8 +7,75 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-**P7 — PoE2 test bed + instance mechanics** (in progress; folded into the
-0.3.0 entry when the phase closes).
+Nothing yet.
+
+## [0.3.0] — 2026-07-26
+
+**P7 — PoE2 test bed + instance mechanics.** A second, independent
+consumer proves the engine is not shaped around one game, and the
+sequencing tier grows the counted/snapshotted state an ARPG actually asks
+for: buff stacks with reapply policies, snapshot DoTs, action-scoped
+buffs and procs, and expression-valued sim fields.
+
+`poe2-calcs` is that second consumer (the harness lives in that repo, not
+this one): a generated 209-stage `GameDef` + adapter reproduces its native
+calculator to 1e-9 across 63 parity tests — standing references 124.53 /
+129.51 / 793.76 dps — with a 156-pair `(StatId, ModKind)` sweep guarding
+against silent routing drift. Its native math is untouched; this is a
+proof, not a switchover.
+
+### Upgrading from 0.2.0 — read this first
+
+Every 0.2.0 JSON config parses unchanged, and a field that only ever held
+a number still reaches the executor as the identical `f64`. Two things
+can still surprise you:
+
+**Four behavior fixes can move numbers**, each for a narrow class of
+config. Full detail in "Fixed" below; the short form:
+
+| Fix | Moves numbers for |
+|---|---|
+| the fight horizon is DRAINED | any config where a `BuffExpire` can land on the fight's exact end instant — in practice, INTEGER buff durations against an integer `duration`. The final cast was being dropped whole. |
+| EV `on_crit` weight measured before the cast's own procs | configs with an `on_cast`/`on_hit` proc that changes crit chance, run under `Mode::Expected`. |
+| a proc's effect is visible to a later proc in the same batch | configs whose proc `chance` reads sim state (`casts.*`, resources, `buff*.*`) that another proc mutates in the same trigger batch. |
+| a resource's `max`/`regen_per_sec` re-derived against the state that caused the refold | configs whose resource `max`/`regen_per_sec` names sim state rather than plain stats/conditions. |
+
+(A fifth fix, the frozen `apply_buff` overlay, is listed too — but it
+lives entirely on `apply_buff`, which is new in 0.3.0, so no 0.2.0 config
+can have been measuring it.)
+
+Nothing in this repo moved: `examples/diablo4_rotation.rs` holds byte for
+byte at 225199.1088 total / 3753.31848 dps / 0.4 vuln uptime, and both
+downstream consumers are byte-identical.
+
+**Rust source-breaking (permitted under 0.x, but you deserve the
+warning).** New fields on `ActionDef` (`apply_buff`), `ProcDef`
+(`actions`) and `BuffDef` (`max_stacks`, `on_reapply`) break any
+exhaustive struct literal constructing them in Rust — this repo's own
+53-literal churn is the proof. JSON is unaffected. The fix: add the new
+fields explicitly with their 0.2.0-equivalent values —
+`apply_buff: Vec::new()` on `ActionDef`, `actions: None` on `ProcDef`,
+`max_stacks: 1` and `on_reapply: ReapplyPolicy::Refresh` on `BuffDef` —
+or stop writing them exhaustively (`ActionDef` derives `Default`, so
+`ActionDef { cast_time: "1".into(), ..Default::default() }` works;
+`BuffDef` and `ProcDef` do not).
+
+Field TYPES also changed. `BuffDef::tick_objective` is now
+`Option<TickObjective>` rather than `Option<String>`, and the five newly
+expression-capable fields — `BuffDef::duration`, `ActionDef::cooldown`,
+and the values of `cost` / `gain` / `ActionDamage::stats` — hold
+`NumOrExpr` where they held `f64` (both spellings still deserialize;
+`NumOrExpr: From<f64>` covers Rust constructors). On the compiled
+side, `CompiledBuff::tick_objective` is `Option<CompiledTick>` rather
+than `Option<usize>`, and `SimReport::buff_uptime` is REPLACED by
+`buffs: BTreeMap<String, BuffReport>` (`.uptime` plus the new
+`.avg_stacks`). `CompiledAction`, `CompiledProc`, `CompiledValue` and
+every `sim::report` type are now `#[non_exhaustive]`, so later
+measurements stop being breaking changes for external constructors; the
+CONFIG types are deliberately NOT marked, so a caller building a `SimDef`
+in Rust can still write a struct literal.
+
+### Added
 
 - **Expression-valued sim fields (P7b).** `BuffDef::duration`,
   `ActionDef::cooldown`, the `cost`/`gain` amounts, and the
@@ -238,8 +305,21 @@ until then, per semver's "anything goes" pre-1.0 clause).
   the sharpest edge — a losing reapplication changes neither the magnitude
   nor the expiry.
 
-- **Fixed (behavior): the fight horizon is DRAINED, so a cast completing
-  at `t == duration` is never silently dropped.** The run loop processed
+  And note what these three do NOT exercise: **sampling.** Nothing in
+  their configs samples — the fixture's crit is closed form
+  (`1 + c·(m−1)`, the same choice `poe2-calcs`' generated gamedef makes)
+  and every proc they define is `chance: "1"` — so each asserts that
+  `Mode::MonteCarlo` reproduces its EV number EXACTLY, with zero spread,
+  rather than within a tolerance band. That is deliberately the STRONGER claim (it fails if an
+  RNG draw ever appears on a path that must stay deterministic), but it is
+  a claim about exactness, not about Monte Carlo's distribution machinery.
+  `examples/diablo4_rotation.rs` remains the only example that actually
+  samples, and the only one reporting a non-degenerate spread.
+
+### Fixed
+
+- **The fight horizon is DRAINED, so a cast completing at
+  `t == duration` is never silently dropped.** The run loop processed
   at most ONE event at the horizon: it popped an event, advanced the
   clock, handled it, then broke on `time >= duration` — so any other event
   already queued at that same instant was discarded, and WHICH one
@@ -289,7 +369,53 @@ until then, per semver's "anything goes" pre-1.0 clause).
   the HORIZON INSTANT ONLY — the run loop is deliberately unbounded at
   every other instant.
 
-- **Docs: a buff expiring on the cast grid.** New `sim` module-docs
+- **A proc's effect is now visible to a later proc in
+  the same trigger batch.** Proc `chance` expressions were evaluated
+  against a slot array whose time-varying tail (`buff.*`,
+  `buff_remaining.*`, resource amounts, `casts.*`) was refreshed once per
+  BATCH, while the stat/condition prefix already refolded whenever an
+  effect fired — so a chance could read `casts.x == 0` for an action a
+  previous proc in the same batch had just free-cast, while a condition
+  driven by that same effect already read its new value. The tail is now
+  refreshed per proc. Affects only configs whose proc `chance` reads sim
+  state another proc mutates in the same batch.
+
+- **EV mode's `on_crit` weight is measured before the
+  cast's own procs.** `Mode::Expected` weights `on_crit` accumulation by
+  the probability the hit crit; that query used to be deferred to its
+  point of use, i.e. AFTER this cast's `on_cast`/`on_hit` procs had
+  already fired — so a proc triggered BY a hit could retroactively raise
+  that hit's crit weight even though its DAMAGE had been computed off the
+  pre-proc build. One cast is now measured once, up front:
+  `damage.stats`, `hits_per_use`, and the crit weight all come from the
+  same overlay and the same effective phase. Affects only configs with an
+  `on_cast`/`on_hit` proc that changes crit chance.
+
+- **A resource's `max`/`regen_per_sec` is re-derived
+  against the state that caused the refold.** Those expressions were
+  evaluated against a slot tail whose freshness depended on which caller
+  last happened to update it; `refresh_effective_state` now refreshes it
+  itself, uniformly at every call site (buff applied, buff expired, phase
+  boundary, initial fold). Affects only configs whose resource `max`/
+  `regen_per_sec` names sim state rather than plain stats/conditions.
+
+- **An `apply_buff` snapshot capture is frozen on BOTH action paths.**
+  Found by the P7d review, and entirely within 0.3.0's own new surface —
+  no 0.2.0 config can have been measuring it. A DAMAGING action froze its
+  `damage.stats` overlay before running its `apply_buff` list, but a
+  UTILITY action resolved the live effective build per entry, so the same
+  two-entry list captured a different rate on each path and
+  `TickObjective::snapshot`'s "before this application's own effects fold
+  in" was false on the damaging one. The effective build is now captured
+  ONCE before the list on both paths, and the clone is paid only when the
+  list is non-empty. The asymmetry that REMAINS is deliberate and pinned
+  both ways: within one list a `duration` EXPRESSION is sequential (it
+  reads sim state, so a later entry sees earlier entries' stack counts)
+  while a snapshot MAGNITUDE is frozen (it reads a build, captured once).
+
+### Docs
+
+- **A buff expiring on the cast grid.** New `sim` module-docs
   section on a long-standing (0.2.0, unchanged) consequence of `seq`
   ordering that costs damage silently: a `BuffExpire` sharing an instant
   with the `CastComplete` that would refresh it resolves FIRST, so the
@@ -306,35 +432,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `BuffExpire`) is an open 0.4.0 question in `ROADMAP.md`, explicitly not
   decided here.
 
-- **Fixed (behavior): a proc's effect is now visible to a later proc in
-  the same trigger batch.** Proc `chance` expressions were evaluated
-  against a slot array whose time-varying tail (`buff.*`,
-  `buff_remaining.*`, resource amounts, `casts.*`) was refreshed once per
-  BATCH, while the stat/condition prefix already refolded whenever an
-  effect fired — so a chance could read `casts.x == 0` for an action a
-  previous proc in the same batch had just free-cast, while a condition
-  driven by that same effect already read its new value. The tail is now
-  refreshed per proc. Affects only configs whose proc `chance` reads sim
-  state another proc mutates in the same batch.
-
-- **Fixed (behavior): EV mode's `on_crit` weight is measured before the
-  cast's own procs.** `Mode::Expected` weights `on_crit` accumulation by
-  the probability the hit crit; that query used to be deferred to its
-  point of use, i.e. AFTER this cast's `on_cast`/`on_hit` procs had
-  already fired — so a proc triggered BY a hit could retroactively raise
-  that hit's crit weight even though its DAMAGE had been computed off the
-  pre-proc build. One cast is now measured once, up front:
-  `damage.stats`, `hits_per_use`, and the crit weight all come from the
-  same overlay and the same effective phase. Affects only configs with an
-  `on_cast`/`on_hit` proc that changes crit chance.
-
-- **Fixed (behavior): a resource's `max`/`regen_per_sec` is re-derived
-  against the state that caused the refold.** Those expressions were
-  evaluated against a slot tail whose freshness depended on which caller
-  last happened to update it; `refresh_effective_state` now refreshes it
-  itself, uniformly at every call site (buff applied, buff expired, phase
-  boundary, initial fold). Affects only configs whose resource `max`/
-  `regen_per_sec` names sim state rather than plain stats/conditions.
+- **The crate README describes the engine that exists.** It had not moved
+  since 0.1.0: it presented `rtce` as evaluate-only, named three config
+  tiers, and linked one example. It now covers all three fidelity levels,
+  the sequencing tier, stacks/snapshot DoTs, and all six examples — the
+  page crates.io and docs.rs actually render. The crate-level rustdoc
+  gained the same material, and two module docs stopped describing the
+  executor as future work.
 
 ## [0.2.0] — 2026-07-22
 

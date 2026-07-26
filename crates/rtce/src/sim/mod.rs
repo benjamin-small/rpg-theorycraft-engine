@@ -1,8 +1,8 @@
-//! Sequencing: `SimDef` + `Rotation` compiled once into an inert
-//! [`compile::SimPlan`] — the timeline simulator's config, ready for a
-//! future discrete-event executor (P6c) to drive. `sim::compile` is the
-//! ONLY place sim expressions are parsed, mirroring `plan::compile`'s
-//! "compile once, evaluate fast" contract.
+//! Sequencing: `SimDef` + `Rotation` compiled once by [`compile()`] into
+//! an inert [`SimPlan`], which [`run`] then drives as a discrete-event
+//! timeline under either [`Mode`]. `sim::compile` is the ONLY place sim
+//! expressions are parsed, mirroring `plan::compile`'s "compile once,
+//! evaluate fast" contract.
 //!
 //! # The extended sim symbol space
 //!
