@@ -27,6 +27,28 @@
   CI-run. Published at `rtce` 0.2.0 (`cargo publish --dry-run` clean).
 
 ## Next
+- [ ] **BUG (found in P7e, UNFIXED — decide before 0.3.0 ships):
+      `sim::exec::run_loop` processes at most ONE event at `t ==
+      duration`.** The loop pops an event, sets `self.time`, handles it,
+      then breaks on `self.time >= self.duration` — so any OTHER event
+      already queued for that same instant is silently discarded, and
+      which one survives is decided by the heap's `(time, seq)` tie-break
+      (first scheduled wins). In practice a `BuffExpire` scheduled at
+      exactly the fight's end swallows the `CastComplete` there, dropping
+      that cast whole: its `casts` count, its damage, and its
+      `apply_buff`. Minimal repro — one 1s filler applying a `refresh`
+      buff, 10s fight: 10 casts when the buff duration is 9.5s, but 9
+      casts (and 9/10 of the damage) for ANY integer duration, because
+      some application then lands an expiry exactly on t=10. A cast
+      completing at `duration` DOES count when it is the only event there
+      (`diablo4_rotation`'s 60th cast is), so this is not "the horizon
+      excludes its boundary" — it is order-dependent. Left unfixed in
+      P7e: it is a core-loop change with the whole pin suite downstream,
+      and "does a cast completing exactly at the horizon count?" is a
+      semantics decision rather than a typo. The three PoE2 slices work
+      AROUND it with half-integer buff durations (which also keeps their
+      expiries off the cast grid), and `diablo4_rotation` never hits it
+      (its `vuln_window` expiries land at 4, 14, …, 54, never at 60).
 - [ ] Publish: GitHub repo, then crates.io (`rtce`, `rtce-testkit`) — the
       API survived the P4c switchover; semver honesty: 0.x until publish.
       Publish `rtce-testkit` first (no rtce-workspace deps of its own);

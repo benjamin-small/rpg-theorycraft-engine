@@ -41,6 +41,12 @@ jobs:
         run: cargo run -p rtce --example diablo4_basics
       - name: cargo run -p rtce --example diablo4_rotation
         run: cargo run -p rtce --example diablo4_rotation
+      - name: cargo run -p rtce --example poe2_charges
+        run: cargo run -p rtce --example poe2_charges
+      - name: cargo run -p rtce --example poe2_poison
+        run: cargo run -p rtce --example poe2_poison
+      - name: cargo run -p rtce --example poe2_triggers
+        run: cargo run -p rtce --example poe2_triggers
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings

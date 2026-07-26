@@ -207,6 +207,75 @@ The `vulnerable` uptime (0.4) was never asserted anywhere in the
 config — it FALLS OUT of Frost Nova's 4-second buff window recast every
 10 seconds. That's Level-2's whole point.
 
+## Counted and snapshotted state: three PoE2 slices
+
+A buff in rtce is internally an INSTANCE LIST. Config collapses it per
+mechanic — the binary buff above is the degenerate one-instance case, and
+three more policies cover what an ARPG actually asks for: charges that
+share one expiry clock, ailments that stack independently and each tick
+the magnitude they were born with, and "strongest wins" replacement.
+Three examples exercise them, each with hand-worked pins in comments,
+asserted and run in CI:
+
+| Example | Mechanic | Pins |
+|---|---|---|
+| `poe2_charges` | `add_refresh_all`, `max_stacks: 3`, expression `duration`, `stacks.X` in a rotation `when` | 11748 damage / 293.7 dps / 2.25 avg stacks |
+| `poe2_poison` | `add_independent`, unbounded, `snapshot: true`, applied by the skill's own `apply_buff` | 6000 hit + 11625 DoT / 881.25 dps / 3.875 avg stacks |
+| `poe2_triggers` | `ProcDef::actions` filter + `cast_action`, `apply_buff` on a primary and on the free-cast secondary | 9870 damage / 493.5 dps / 5 triggered casts |
+
+**Scope, honestly** — and this disclaimer is doing more work than the D4
+one. `crates/rtce/tests/fixtures/poe2/gamedef.json` is a PoE2-*shaped*
+demonstration slice, not Path of Exile 2's damage model and not derived
+from any game data: two damage types with their own scaling chains,
+PoE2's `increased`(additive pool)/`more`(independent multiplier) split,
+per-type resistance with penetration, an ailment as a condition, and a DoT
+objective derived from the same pre-mitigation magnitude as the hit. Every
+coefficient in it is `representative`, chosen so each pin hand-derives in
+a comment. The real thing lives in `../poe2-calcs` as a GENERATED
+`gamedef/poe2.gamedef.json` — 67 stats, 73 buckets, 209 pipeline stages,
+80 objectives, pinned to that repo's native `calc.rs` at 1e-9, standing
+reference 124.53 dps for a default Monk build. A 209-stage pipeline is not
+hand-derivable, which is exactly why the fixture here is trimmed rather
+than vendored.
+
+Two things the slices teach that are easy to get wrong, and both are RUN
+as contrasts rather than merely asserted in prose:
+
+- **An action-applied snapshot inherits the applying hit; a proc-applied
+  one does not.** `poe2_poison` runs the identical config both ways: via
+  `apply_buff` on the skill the poison captures under that cast's
+  `damage.stats` overlay (rate 150/s), via a proc it captures the ambient
+  build (75/s) — same cast count, same hit damage, same stack trajectory,
+  exactly half the DoT.
+- **A per-stack contribution is LINEAR in the count.** Three charges of
+  `+10` in a `product` bucket fold as ×1.30, not ×1.10³. That is correct
+  for "increased damage per charge" and a deliberate linearization of a
+  true "more" multiplier; `poe2_charges` pins the 1.30 so it stays a
+  stated choice.
+
+```
+$ cargo run -p rtce --example poe2_poison
+PoE2 poison (P7e slice 2) — 20s dummy, EV mode
+  viper_strike: 20 casts, 6000.0000 hit damage
+  poison: uptime 0.9500, avg_stacks 3.8750, 11625.0000 DoT damage
+  total: 17625.0000 damage over 20s = 881.2500 dps
+
+  EV pins hold: 6000 hit + 11625 DoT = 17625 / 881.25 dps / 3.875 stacks ✓
+
+Monte Carlo (N=128, seed=5): mean 881.2500  std 0.0000
+  MC reproduces EV exactly (std 0) ✓
+
+  applied by a PROC instead: 5812.5000 DoT (11812.5000 total, 590.6250 dps), avg_stacks 3.8750
+  contrast pins hold: 5812.5 DoT — exactly half the action-applied 11625 ✓
+```
+
+Nothing in these three configs samples — the fixture's crit is closed
+form (`1 + c·(m−1)`, the same choice poe2-calcs' generated gamedef makes)
+and the one proc is certain — so Monte Carlo mode is asserted to
+reproduce EV *exactly*, with zero spread, rather than within a tolerance
+band. That is the stronger claim: it fails if an RNG draw ever appears on
+a path that must stay deterministic.
+
 ## Status
 
 Parity-proven against its first consumer, `../diablo4-calc`: all 7 of its
