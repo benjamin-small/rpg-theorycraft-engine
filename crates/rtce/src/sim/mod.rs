@@ -28,6 +28,14 @@
 //!   when inactive). The counted companion to `buff.<buff>`; see
 //!   [`crate::simdef::BuffDef`] for what a stack count scales.
 //!
+//! A buff's [`crate::simdef::BuffDef::tick_objective`] names a `Plan`
+//! objective rather than an expression, and takes either of two shapes: a
+//! bare name (LIVE — re-evaluated on every state change, × the stack
+//! count) or `{ "objective": …, "snapshot": true }` (each instance
+//! captures the rate at its own application and ticks it unchanged to
+//! expiry; the buff's rate is the SUM over instances). See
+//! [`crate::simdef::TickObjective`].
+//!
 //! Five further fields are expression-valued (P7b) and compile against
 //! this SAME space, each evaluated at its own documented instant rather
 //! than once up front: `BuffDef::duration`, `ActionDef::cooldown`, the
@@ -63,7 +71,7 @@ mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledProc, CompiledResource, CompiledRule,
-    CompiledValue, ProcEffect, SimPlan,
+    CompiledTick, CompiledValue, ProcEffect, SimPlan,
 };
 pub use exec::{run, Mode, SimScratch};
 pub use report::{

@@ -228,11 +228,132 @@ pub enum ReapplyPolicy {
     /// instance is evicted to make room.
     AddIndependent,
     /// A new instance replaces the incumbent only if its snapshot rate is
-    /// higher (PoE2 ignite). Needs a magnitude to compare, so it requires
-    /// a snapshot `tick_objective` — NOT YET IMPLEMENTED (P7c-T2): naming
-    /// it is a fail-closed compile error today, so the vocabulary is
-    /// complete without the engine pretending to honor it.
+    /// STRICTLY higher (PoE2 ignite). It needs a magnitude to compare, so
+    /// it requires a `tick_objective` with [`TickObjective::snapshot`] set
+    /// — and, being a replacement rather than a stack, a
+    /// [`BuffDef::max_stacks`] of `1`. Both are fail-closed compile
+    /// errors, never silently-borrowed behavior from another policy.
+    ///
+    /// A LOSING application is discarded WHOLE: it changes neither the
+    /// live instance's rate nor its expiry. A weak reapplication cannot
+    /// extend a strong ailment — which is the mechanic's whole point, and
+    /// the one place `strongest` differs observably from "replace and
+    /// refresh, but keep the higher rate".
     Strongest,
+}
+
+/// Which `Plan` objective a buff DoT-ticks, and HOW each instance samples
+/// that objective's rate.
+///
+/// Two JSON shapes, both accepted (untagged):
+///
+/// ```json
+/// "tick_objective": "dot_dps"
+/// "tick_objective": { "objective": "dot_dps", "snapshot": true }
+/// ```
+///
+/// The bare string is rtce 0.2.0's form and means `snapshot: false` — so
+/// every 0.2.0 config parses and behaves unchanged. An object with
+/// `snapshot: false` means exactly the same thing as the bare string and
+/// SERIALIZES back to it; the object form only carries information when
+/// `snapshot` is `true`. An unrecognized key inside the object form is
+/// rejected rather than ignored (a typo'd `"snapshots": true` silently
+/// meaning "live" is precisely the silent wrong answer this crate refuses
+/// to give).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TickObjectiveRepr", into = "TickObjectiveRepr")]
+pub struct TickObjective {
+    /// The `Plan` objective whose value is this buff's DoT rate. Must name
+    /// an objective of the plan the sim compiles against.
+    pub objective: String,
+    /// How the rate is sampled while the buff is live:
+    ///
+    /// - `false` (LIVE, the 0.2.0 behavior) — the objective is
+    ///   re-evaluated on every state change and the buff ticks that value
+    ///   × its live instance count. A stat or phase change moves the rate
+    ///   of every live instance retroactively-from-now.
+    /// - `true` (SNAPSHOT) — each instance CAPTURES the objective's value
+    ///   at its own application instant and ticks that value unchanged to
+    ///   expiry, whatever happens to the state afterwards. The buff's
+    ///   total rate is the SUM over live instances, so the stack count is
+    ///   already inherent in it and is never multiplied in a second time.
+    ///   This is PoE2 ailment semantics, and what
+    ///   [`ReapplyPolicy::Strongest`] compares instances by.
+    pub snapshot: bool,
+}
+
+impl TickObjective {
+    /// A LIVE tick objective (`snapshot: false`) — the 0.2.0 semantics,
+    /// and what a bare `"name"` in JSON parses to.
+    #[must_use]
+    pub fn live(objective: impl Into<String>) -> Self {
+        TickObjective {
+            objective: objective.into(),
+            snapshot: false,
+        }
+    }
+
+    /// A SNAPSHOT tick objective (`snapshot: true`) — each instance ticks
+    /// the rate it captured at its own application.
+    #[must_use]
+    pub fn snapshot(objective: impl Into<String>) -> Self {
+        TickObjective {
+            objective: objective.into(),
+            snapshot: true,
+        }
+    }
+}
+
+/// The two JSON shapes [`TickObjective`] accepts, as an untagged enum —
+/// the serde-only representation `TickObjective` converts through, so the
+/// struct itself stays a plain two-field record everywhere else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TickObjectiveRepr {
+    /// `"dot_dps"` — the 0.2.0 shape, always live.
+    Name(String),
+    /// `{ "objective": "dot_dps", "snapshot": true }`.
+    Object(TickObjectiveObj),
+}
+
+/// The object arm of [`TickObjectiveRepr`], as its own struct because
+/// `deny_unknown_fields` is a struct-level serde attribute — it does not
+/// exist on an enum VARIANT, and silently accepting a typo'd key is not an
+/// option here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TickObjectiveObj {
+    objective: String,
+    #[serde(default)]
+    snapshot: bool,
+}
+
+impl From<TickObjectiveRepr> for TickObjective {
+    fn from(r: TickObjectiveRepr) -> Self {
+        match r {
+            TickObjectiveRepr::Name(objective) => TickObjective::live(objective),
+            TickObjectiveRepr::Object(o) => TickObjective {
+                objective: o.objective,
+                snapshot: o.snapshot,
+            },
+        }
+    }
+}
+
+impl From<TickObjective> for TickObjectiveRepr {
+    /// A live objective serializes back to the BARE STRING it most likely
+    /// came from, so round-tripping a 0.2.0 config never rewrites its
+    /// `tick_objective` into the object form.
+    fn from(t: TickObjective) -> Self {
+        if t.snapshot {
+            TickObjectiveRepr::Object(TickObjectiveObj {
+                objective: t.objective,
+                snapshot: true,
+            })
+        } else {
+            TickObjectiveRepr::Name(t.objective)
+        }
+    }
 }
 
 /// One buff/debuff: a timed window that, while active, contributes to
@@ -254,7 +375,10 @@ pub enum ReapplyPolicy {
 ///   quantity, so "3 stacks of vulnerable" has no meaning; the precedence
 ///   rule (an active buff wins over the scenario's static uptime) is
 ///   unchanged from 0.2.0.
-/// - **`tick_objective`** — the DoT rate is multiplied by the stack count.
+/// - **`tick_objective`** — a LIVE one ticks at its re-evaluated rate
+///   multiplied by the stack count; a SNAPSHOT one ticks the SUM of the
+///   rates its instances captured at their own applications, where the
+///   count is already inherent in the sum. See [`TickObjective`].
 /// - **`buff.<name>`** — `1` while ANY instance is live (never the count;
 ///   `stacks.<name>` is the count). **`buff_remaining.<name>`** — the
 ///   LONGEST remaining window across live instances, which under
@@ -303,11 +427,17 @@ pub struct BuffDef {
     /// applies again once the buff expires.
     #[serde(default)]
     pub conditions: BTreeMap<String, f64>,
-    /// A `Plan` objective name: while this buff is active, its value ×
-    /// active-seconds × STACK COUNT accrues into the sim's damage total
-    /// (DoT ticking).
+    /// The `Plan` objective this buff DoT-ticks, if any: while it is
+    /// active, that objective's value × active-seconds accrues into the
+    /// sim's damage total.
+    ///
+    /// Written either as a bare objective name (LIVE — the rate is
+    /// re-evaluated on every state change and multiplied by the STACK
+    /// COUNT) or as `{ "objective": …, "snapshot": true }` (each instance
+    /// ticks the rate it captured at its own application, and the buff's
+    /// rate is the SUM over instances). See [`TickObjective`].
     #[serde(default)]
-    pub tick_objective: Option<String>,
+    pub tick_objective: Option<TickObjective>,
     /// How many instances may be live at once. `0` means UNBOUNDED (a
     /// poison stream that only expiry ever trims). Defaults to `1`, which
     /// with the default [`ReapplyPolicy::Refresh`] is exactly rtce
@@ -485,9 +615,12 @@ mod tests {
         assert_eq!(def.buffs["combustion"].contributions.len(), 1);
         assert_eq!(def.buffs["combustion"].contributions[0].bucket, "indep");
         assert_eq!(def.buffs["combustion"].contributions[0].value, 25.0);
+        // P7c-T2: `tick_objective` became an object, and the spec's BARE
+        // STRING must still mean exactly what it meant in 0.2.0 — the
+        // live rate, never a snapshot.
         assert_eq!(
-            def.buffs["burning"].tick_objective.as_deref(),
-            Some("dot_dps")
+            def.buffs["burning"].tick_objective,
+            Some(TickObjective::live("dot_dps"))
         );
 
         let proc = &def.procs["conflagrate"];
@@ -609,6 +742,83 @@ mod tests {
             ReapplyPolicy::AddRefreshAll
         );
         assert_eq!(round.buffs["poison"].max_stacks, 0);
+    }
+
+    // P7c-T2: the two `tick_objective` shapes. The bare string is the
+    // 0.2.0 form and MUST stay live; the object form is the only way to
+    // ask for snapshot semantics, and `snapshot` defaults to `false`
+    // there too, so the two spellings of "live" agree.
+    #[test]
+    fn tick_objective_parses_both_the_bare_name_and_the_object_form() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "buffs": {
+                "burning": { "duration": 6.0, "tick_objective": "dot_dps" },
+                "poison":  { "duration": 8.0,
+                             "tick_objective": { "objective": "dot_dps",
+                                                 "snapshot": true } },
+                "bleed":   { "duration": 5.0,
+                             "tick_objective": { "objective": "dot_dps" } }
+              },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            def.buffs["burning"].tick_objective,
+            Some(TickObjective::live("dot_dps"))
+        );
+        assert_eq!(
+            def.buffs["poison"].tick_objective,
+            Some(TickObjective::snapshot("dot_dps"))
+        );
+        assert_eq!(
+            def.buffs["bleed"].tick_objective,
+            Some(TickObjective::live("dot_dps")),
+            "`snapshot` omitted inside the object form must default to false"
+        );
+
+        // Round-trip: a LIVE objective goes back out as the bare string it
+        // came from (a 0.2.0 config is never rewritten into the object
+        // form), and a snapshot one keeps its object.
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            json.contains(r#""tick_objective":"dot_dps""#),
+            "a live tick_objective must serialize back to the bare string: {json}"
+        );
+        let round: SimDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.buffs["poison"].tick_objective,
+            def.buffs["poison"].tick_objective
+        );
+        assert_eq!(
+            round.buffs["bleed"].tick_objective,
+            def.buffs["bleed"].tick_objective
+        );
+    }
+
+    // Fail-closed: `"snapshots": true` is a typo, not a config that means
+    // "live". Silently ignoring the key would silently give the WRONG DoT
+    // semantics — the exact class of quiet wrong answer this crate exists
+    // to refuse.
+    #[test]
+    fn an_unknown_key_inside_the_tick_objective_object_is_rejected() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{
+              "buffs": { "poison": { "duration": 8.0,
+                                     "tick_objective": { "objective": "dot_dps",
+                                                         "snapshots": true } } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        // An untagged enum reports "no variant matched" rather than the
+        // inner `deny_unknown_fields` message — but it is POSITIONED at
+        // the offending value, which is what makes it actionable.
+        assert!(
+            e.to_string().contains("TickObjectiveRepr") && e.to_string().contains("line 4"),
+            "expected a positioned no-variant-matched error, got: {e}"
+        );
     }
 
     #[test]

@@ -138,16 +138,30 @@ pub struct CompiledBuff {
     /// scenario's static uptime for that condition while active). NOT
     /// scaled by the stack count — see [`crate::simdef::BuffDef`].
     pub conditions: std::collections::BTreeMap<String, f64>,
-    /// Resolved index into the `Plan`'s objective slice for
-    /// `tick_objective`, if this buff DoT-ticks.
-    pub tick_objective: Option<usize>,
+    /// The resolved `tick_objective`, if this buff DoT-ticks.
+    pub tick_objective: Option<CompiledTick>,
     /// Maximum live instances; `0` = unbounded (see
     /// [`crate::simdef::BuffDef::max_stacks`]).
     pub max_stacks: u32,
     /// What an application does when this buff is already active (see
-    /// [`ReapplyPolicy`]). [`ReapplyPolicy::Strongest`] never reaches
-    /// here — [`compile`] rejects it (P7c-T2).
+    /// [`ReapplyPolicy`]). [`ReapplyPolicy::Strongest`] reaching here
+    /// implies a snapshot `tick_objective` and `max_stacks == 1` —
+    /// [`compile`] rejects it otherwise.
     pub on_reapply: ReapplyPolicy,
+}
+
+/// One compiled [`crate::simdef::TickObjective`]: the objective RESOLVED
+/// to its index in the `Plan`'s objective slice, plus how the executor
+/// samples it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledTick {
+    /// Index into the `Plan`'s objective slice.
+    pub objective: usize,
+    /// `true` — each instance ticks the rate it captured at its own
+    /// application, and the buff's rate is the SUM over instances;
+    /// `false` — the rate is re-evaluated live and multiplied by the
+    /// instance count. See [`crate::simdef::TickObjective::snapshot`].
+    pub snapshot: bool,
 }
 
 /// What a firing [`crate::simdef::ProcDef`] does, resolved to an index —
@@ -405,19 +419,44 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
     // policy must be one this engine actually honors.
     for (name, buff) in &simdef.buffs {
         if let Some(t) = &buff.tick_objective {
-            if !objective_names.iter().any(|o| o == t) {
+            if !objective_names.iter().any(|o| *o == t.objective) {
                 return Err(PlanError {
-                    what: format!("buff `{name}`: tick_objective `{t}` is not a plan objective"),
+                    what: format!(
+                        "buff `{name}`: tick_objective `{}` is not a plan objective",
+                        t.objective
+                    ),
                 });
             }
         }
+        // `strongest` compares candidate instances BY THEIR SNAPSHOT RATE,
+        // and replaces rather than stacks. Both preconditions are checked
+        // here so the executor's arm can rely on them: a live
+        // `tick_objective` has a rate but not a per-INSTANCE one, and a cap
+        // above 1 would describe a stack this policy never builds.
         if buff.on_reapply == ReapplyPolicy::Strongest {
-            return Err(PlanError {
-                what: format!(
-                    "buff `{name}`: on_reapply `strongest` requires a snapshot \
-                     tick_objective (see P7c-T2)"
-                ),
-            });
+            if !buff.tick_objective.as_ref().is_some_and(|t| t.snapshot) {
+                return Err(PlanError {
+                    what: format!(
+                        "buff `{name}`: on_reapply `strongest` compares instances by \
+                         their snapshot rate, so it requires a tick_objective with \
+                         `snapshot: true` (got {})",
+                        match &buff.tick_objective {
+                            None => "none".to_string(),
+                            Some(t) => format!("the live objective `{}`", t.objective),
+                        }
+                    ),
+                });
+            }
+            if buff.max_stacks != 1 {
+                return Err(PlanError {
+                    what: format!(
+                        "buff `{name}`: on_reapply `strongest` REPLACES the live \
+                         instance, so max_stacks must be 1 (got {}) — use \
+                         `add_independent` to stack independently-expiring instances",
+                        buff.max_stacks
+                    ),
+                });
+            }
         }
         // `refresh` keeps exactly one instance by construction, so any
         // other `max_stacks` alongside it is a config the author got
@@ -538,11 +577,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
 
     let mut buffs = Vec::new();
     for (name, b) in &simdef.buffs {
-        let tick_objective = b.tick_objective.as_ref().map(|t| {
-            objective_names
+        let tick_objective = b.tick_objective.as_ref().map(|t| CompiledTick {
+            objective: objective_names
                 .iter()
-                .position(|o| o == t)
-                .expect("tick_objective validated above")
+                .position(|o| *o == t.objective)
+                .expect("tick_objective validated above"),
+            snapshot: t.snapshot,
         });
         let duration = compile_value(&b.duration, &syms, || format!("buff `{name}` duration"))?;
         buffs.push(CompiledBuff {
@@ -612,6 +652,7 @@ mod tests {
     use crate::plan;
     use crate::simdef::{
         ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ReapplyPolicy, ResourceDef, Rule,
+        TickObjective,
     };
     use std::collections::BTreeMap;
 
@@ -716,7 +757,7 @@ mod tests {
                 on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
-                tick_objective: Some("dot_dps".into()),
+                tick_objective: Some(TickObjective::live("dot_dps")),
             },
         );
 
@@ -786,7 +827,13 @@ mod tests {
         assert_eq!(sp.buffs.len(), 3);
         // BTreeMap order: "burning" < "combustion" < "vuln_window".
         assert_eq!(sp.buffs[0].name, "burning");
-        assert_eq!(sp.buffs[0].tick_objective, Some(1)); // "dot_dps" index
+        assert_eq!(
+            sp.buffs[0].tick_objective,
+            Some(CompiledTick {
+                objective: 1, // "dot_dps"
+                snapshot: false,
+            })
+        );
         assert_eq!(sp.buffs[1].name, "combustion");
         assert_eq!(sp.buffs[2].name, "vuln_window");
 
@@ -893,19 +940,71 @@ mod tests {
         assert!(e.what.contains("hidden_stage"), "got: {}", e.what);
     }
 
-    // P7c: `strongest` needs a magnitude to compare instances by, which
-    // is the snapshot `tick_objective` P7c-T2 adds. Until then the
-    // vocabulary is complete but honest — naming it is a positioned
-    // compile error, never a silent fallback to another policy.
+    // P7c-T2: `strongest` compares instances by their SNAPSHOT rate, so a
+    // buff without one gives it nothing to compare — including a buff
+    // whose `tick_objective` is live, which has a rate but not a
+    // per-instance one. Both are rejected rather than silently falling
+    // back to another policy.
     #[test]
-    fn on_reapply_strongest_is_rejected_until_snapshot_ticks_land() {
+    fn strongest_without_a_snapshot_tick_objective_is_rejected() {
         let plan = toy_plan();
+        // No `tick_objective` at all.
         let mut simdef = valid_simdef();
-        simdef.buffs.get_mut("burning").unwrap().on_reapply = ReapplyPolicy::Strongest;
+        simdef.buffs.get_mut("combustion").unwrap().on_reapply = ReapplyPolicy::Strongest;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("combustion"), "got: {}", e.what);
+        assert!(e.what.contains("strongest"), "got: {}", e.what);
+        assert!(e.what.contains("snapshot"), "got: {}", e.what);
+
+        // A LIVE `tick_objective` is not enough either: its rate belongs to
+        // the buff, not to an instance, so there is nothing to compare.
+        let mut simdef = valid_simdef();
+        let b = simdef.buffs.get_mut("burning").unwrap();
+        assert_eq!(b.tick_objective, Some(TickObjective::live("dot_dps")));
+        b.on_reapply = ReapplyPolicy::Strongest;
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("burning"), "got: {}", e.what);
-        assert!(e.what.contains("strongest"), "got: {}", e.what);
-        assert!(e.what.contains("P7c-T2"), "got: {}", e.what);
+        assert!(e.what.contains("snapshot"), "got: {}", e.what);
+    }
+
+    // `strongest` REPLACES the incumbent, so like `refresh` it keeps
+    // exactly one instance — a `max_stacks` other than 1 alongside it is a
+    // config mistake, not a number to ignore.
+    #[test]
+    fn strongest_with_a_max_stacks_other_than_one_is_rejected() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        let b = simdef.buffs.get_mut("burning").unwrap();
+        b.tick_objective = Some(TickObjective::snapshot("dot_dps"));
+        b.on_reapply = ReapplyPolicy::Strongest;
+        b.max_stacks = 2;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("burning"), "got: {}", e.what);
+        assert!(e.what.contains("max_stacks"), "got: {}", e.what);
+        // `0` (unbounded) is no more honorable than 2.
+        simdef.buffs.get_mut("burning").unwrap().max_stacks = 0;
+        assert!(compile(&plan, &simdef, &valid_rotation()).is_err());
+    }
+
+    // The positive case: with both preconditions met, `strongest` compiles
+    // and the snapshot flag reaches the executor.
+    #[test]
+    fn strongest_with_a_snapshot_tick_objective_compiles() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        let b = simdef.buffs.get_mut("burning").unwrap();
+        b.tick_objective = Some(TickObjective::snapshot("dot_dps"));
+        b.on_reapply = ReapplyPolicy::Strongest;
+        let sp = compile(&plan, &simdef, &valid_rotation()).unwrap();
+        assert_eq!(sp.buffs[0].name, "burning");
+        assert_eq!(sp.buffs[0].on_reapply, ReapplyPolicy::Strongest);
+        assert_eq!(
+            sp.buffs[0].tick_objective,
+            Some(CompiledTick {
+                objective: 1, // "dot_dps"
+                snapshot: true,
+            })
+        );
     }
 
     // `refresh` keeps exactly one instance by construction, so a
@@ -961,7 +1060,8 @@ mod tests {
     fn tick_objective_not_a_plan_objective_is_rejected() {
         let plan = toy_plan();
         let mut simdef = valid_simdef();
-        simdef.buffs.get_mut("burning").unwrap().tick_objective = Some("hidden_stage".into());
+        simdef.buffs.get_mut("burning").unwrap().tick_objective =
+            Some(TickObjective::live("hidden_stage"));
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("hidden_stage"), "got: {}", e.what);
     }

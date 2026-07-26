@@ -54,14 +54,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `add_refresh_all` counts up to the cap and resets EVERY instance's
   expiry (one shared clock — PoE2 charges); `add_independent` gives each
   instance its own duration and, at the cap, evicts the earliest-expiring
-  one (PoE2 poison). `strongest` parses but is a fail-closed compile error
-  until snapshot ticks land (P7c-T2), and `refresh` alongside a
-  `max_stacks` other than `1` is likewise rejected rather than silently
+  one (PoE2 poison). `strongest` landed in P7c-T2 (below), and `refresh`
+  alongside a `max_stacks` other than `1` is rejected rather than silently
   ignored.
 
   What a stack count scales, and what it deliberately does not:
   `contributions` fold with their VALUE multiplied by the count (3 stacks
-  of `+10` in a `product` bucket read `×1.30`, not `×1.10³`) and a
+  of `+10` in a `product` bucket read `×1.30`, not `×1.10³`) and a live
   `tick_objective` ticks at rate × count; `conditions` are driven at their
   full configured value while ANY instance is live and are never scaled by
   it. New symbol `stacks.<buff>` (the count) joins `buff.<buff>` (`1`
@@ -72,10 +71,41 @@ until then, per semver's "anything goes" pre-1.0 clause).
   BuffReport>` carrying `uptime` plus the new `avg_stacks` (the
   time-integrated mean stack count), matching how `actions`/`resources`
   have always reported per-entity results — buffs were the last entity
-  with a bare parallel map, and P7c-T2 adds a third per-buff output.
-  Every report type in `sim::report` is now `#[non_exhaustive]`, so
-  later measurements stop being breaking changes for external
-  constructors.
+  with a bare parallel map. Every report type in `sim::report` is now
+  `#[non_exhaustive]`, so later measurements stop being breaking changes
+  for external constructors.
+
+- **Snapshot DoTs and `strongest` (P7c-T2).** `BuffDef::tick_objective`
+  becomes `Option<TickObjective>` and accepts two JSON shapes: the 0.2.0
+  bare name (LIVE — re-evaluated on every state change, × the stack
+  count, and what a live objective serializes back to) or
+  `{ "objective": …, "snapshot": true }`. A SNAPSHOT instance captures the
+  objective's value at its own application and ticks that rate unchanged
+  to expiry; the buff's total rate is the SUM over live instances, with
+  the stack count inherent in the sum rather than multiplied in again.
+  Nothing re-reads the `Plan` for such a buff, so an instance is immune to
+  every later stat, phase and buff change — PoE2 ailment semantics.
+
+  A captured rate belongs to the APPLICATION and is never re-captured:
+  `add_refresh_all` pushes an existing instance's EXPIRY out onto the
+  shared clock while leaving its rate alone, and only a new instance
+  (`refresh`'s replacement, an `add_independent` push, a `strongest`
+  win) ever carries a new one.
+
+  `on_reapply: strongest` (PoE2 ignite) is now honored: the incoming
+  instance replaces the incumbent only when its snapshot rate is STRICTLY
+  higher, and a losing application is discarded whole — it moves neither
+  the rate nor the expiry, so a weak reapplication cannot extend a strong
+  ailment. It requires `snapshot: true` and `max_stacks: 1`; both are
+  positioned, fail-closed compile errors otherwise (a LIVE tick objective
+  is not enough — its rate belongs to the buff, not to an instance).
+
+  Backward compatibility is unchanged: a 0.2.0 config writes a bare name,
+  gets live semantics, and skips the fold transaction on a refresh exactly
+  as before — the `diablo4_rotation` pins hold byte for byte, MC block
+  included. New public API: `simdef::TickObjective` and
+  `sim::CompiledTick`; `CompiledBuff::tick_objective` is now
+  `Option<CompiledTick>` rather than `Option<usize>`.
 
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated

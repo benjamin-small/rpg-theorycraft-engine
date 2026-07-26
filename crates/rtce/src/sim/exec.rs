@@ -79,11 +79,22 @@
 //! its [`crate::simdef::ReapplyPolicy`]; a binary buff is the degenerate
 //! one-instance `refresh` case and takes the same path it always did. The
 //! count drives three things and deliberately not a fourth: bucket
-//! contributions fold with their VALUE × the count, a `tick_objective`
-//! ticks at rate × the count, and `stacks.<buff>` reads the count — while
-//! `conditions` stay at their full configured value for as long as ANY
-//! instance is live (a condition is an uptime fraction, not a quantity,
-//! so scaling it by a stack count has no meaning).
+//! contributions fold with their VALUE × the count, a LIVE
+//! `tick_objective` ticks at rate × the count, and `stacks.<buff>` reads
+//! the count — while `conditions` stay at their full configured value for
+//! as long as ANY instance is live (a condition is an uptime fraction, not
+//! a quantity, so scaling it by a stack count has no meaning).
+//!
+//! A SNAPSHOT `tick_objective` (P7c-T2) is the exception to the first
+//! rule: each instance CAPTURES the objective's value at its own
+//! application into [`BuffInstance::snapshot_rate`] and ticks that
+//! unchanged to expiry, so the buff's rate is the plain SUM over
+//! instances — the count is inherent in it and is never multiplied in
+//! again. Nothing re-reads the `Plan` for such a buff, which is precisely
+//! what makes an instance immune to every later stat, phase and buff
+//! change (PoE2 ailment semantics), and what gives
+//! [`crate::simdef::ReapplyPolicy::Strongest`] a per-instance magnitude to
+//! compare candidates by.
 //!
 //! Expiry keeps the generation self-cancel pattern, with one event per
 //! BUFF rather than per instance. The invariant: **at most one non-stale
@@ -97,11 +108,15 @@
 //! any survive — see [`Sim::handle_buff_expire`].
 //!
 //! The effective-fold transaction (flush the integrators → mutate →
-//! refold) runs exactly when the COUNT moves. A reapplication that leaves
-//! the count where it was — a `refresh`, or an `add_refresh_all` already
-//! at `max_stacks` — moves only expiries, and the fold's own inputs
-//! (contributions, conditions, tick rate) are all count-driven, so it
-//! skips the transaction entirely. ONE caveat, inherited unchanged from
+//! refold) runs when the COUNT moves, and — for a snapshot
+//! `tick_objective` only — also when the instance SET moves under a
+//! standing count, since that moves the summed rate: a `refresh`
+//! re-capture, an `add_independent` eviction at the cap, a `strongest`
+//! replacement. A reapplication that changes neither — a live buff's
+//! `refresh`, or any `add_refresh_all` already at `max_stacks` — moves
+//! only expiries, and every remaining fold input is count-driven, so it
+//! skips the transaction entirely (the 0.2.0 path, byte for byte). ONE
+//! caveat, inherited unchanged from
 //! 0.2.0's refresh path rather than introduced here: `resource_max`/
 //! `resource_regen` are CACHED at fold points, so a resource whose
 //! `max`/`regen_per_sec` expression names `buff_remaining.<b>` keeps the
@@ -604,16 +619,25 @@ struct ResourceRt {
 /// holds. A binary (non-stacking) buff is the degenerate case: at most one
 /// of these, replaced in place on every reapplication.
 struct BuffInstance {
-    /// The instant this instance was applied (or, for a refresh-in-place,
-    /// last reapplied).
-    #[allow(dead_code)] // read by P7c-T2's snapshot tick_objective.
-    applied_at: f64,
     /// The instant this instance expires.
+    ///
+    /// It MOVES for an instance that is refreshed in place under
+    /// [`ReapplyPolicy::AddRefreshAll`] (the shared clock) — which is
+    /// exactly why it is the only mutable half of an instance: an expiry
+    /// is a property of the WINDOW, and a window can be extended.
     expire_at: f64,
-    /// P7c-T2 (snapshot DoTs): the `tick_objective` rate captured at THIS
-    /// instance's application, ticked unchanged to expiry. Carried but
-    /// never read yet — every buff still ticks the live, re-evaluated rate.
-    #[allow(dead_code)] // read by P7c-T2's snapshot tick_objective.
+    /// The `tick_objective` rate this instance captured at ITS OWN
+    /// application, ticked unchanged to expiry — the DoT half of PoE2
+    /// ailment semantics (see [`crate::simdef::TickObjective::snapshot`]).
+    ///
+    /// Immutable for the life of the instance, including across an
+    /// `add_refresh_all` refresh that moves `expire_at`: a captured rate
+    /// belongs to the APPLICATION, and no later event re-captures it. The
+    /// only way to get a new rate is a new instance.
+    ///
+    /// `0.0`, and never read, for a live `tick_objective` or a buff that
+    /// does not tick at all — [`Sim::snapshot_total`] is the sole reader
+    /// and only a snapshot buff reaches it.
     snapshot_rate: f64,
 }
 
@@ -1010,24 +1034,53 @@ impl<'a> Sim<'a> {
         }
         let active = self.active_buff_set.clone();
         for bi in active {
-            if let Some(obj) = self.sim_plan.buffs[bi].tick_objective {
-                let build = self.effective_damage_build.clone();
-                let phase = self.effective_phase.clone();
-                let objs = self
-                    .plan
-                    .evaluate_phase(&build, &phase, &mut self.scratch.eval)?;
-                let val = objs[obj];
+            if let Some(tick) = self.sim_plan.buffs[bi].tick_objective {
+                let rate = if tick.snapshot {
+                    // Each instance ticks the rate IT captured, so the
+                    // buff's rate is the plain SUM — the stack count is
+                    // already inherent in it, and multiplying by the count
+                    // again would integrate `∫ stacks² dt`. Nothing here
+                    // touches the `Plan`: that is the whole point of a
+                    // snapshot, and it is what makes this refold (driven by
+                    // a phase boundary or some OTHER buff) leave a snapshot
+                    // DoT's rate exactly where it was.
+                    self.snapshot_total(bi)
+                } else {
+                    // × stack count: k independent instances of a LIVE DoT
+                    // tick the same re-evaluated rate k times over.
+                    let val = self.eval_objective(tick.objective)?;
+                    val * self.buffs[bi].instances.len() as f64
+                };
                 let b = &mut self.buffs[bi];
-                // × stack count: k independent instances of a DoT tick k
-                // times over. (A `snapshot: true` tick_objective — where
-                // each instance ticks the rate it captured — is P7c-T2;
-                // today every instance ticks the same live rate, so the
-                // total is a plain multiple.)
-                b.tick_rate = val * b.instances.len() as f64;
+                b.tick_rate = rate;
                 b.tick_last_eval = now;
             }
         }
         Ok(())
+    }
+
+    /// Evaluate the `Plan` objective at index `obj` against the CURRENT
+    /// effective state (this fold's build and phase) — the one place a
+    /// tick objective is read, so a live rate and a freshly-captured
+    /// snapshot rate are always sampled the same way.
+    fn eval_objective(&mut self, obj: usize) -> Result<f64, PlanError> {
+        let build = self.effective_damage_build.clone();
+        let phase = self.effective_phase.clone();
+        let objs = self
+            .plan
+            .evaluate_phase(&build, &phase, &mut self.scratch.eval)?;
+        Ok(objs[obj])
+    }
+
+    /// Σ of `bi`'s live instances' captured rates — a SNAPSHOT buff's total
+    /// tick rate. `0.0` when inactive, and meaningless (never read) for a
+    /// buff whose `tick_objective` is live.
+    fn snapshot_total(&self, bi: usize) -> f64 {
+        self.buffs[bi]
+            .instances
+            .iter()
+            .map(|i| i.snapshot_rate)
+            .sum()
     }
 
     /// ONE application of `bi`: pay-free, instantaneous, and collapsed
@@ -1042,22 +1095,36 @@ impl<'a> Sim<'a> {
     ///   together.
     /// - `add_independent` — push an instance with its own expiry; at
     ///   `max_stacks` the earliest-expiring one is evicted first.
-    /// - `strongest` — rejected at compile (P7c-T2); a fail-closed run
-    ///   error here for a hand-assembled `SimPlan`.
+    /// - `strongest` — replace the single incumbent, but ONLY if the
+    ///   incoming instance's snapshot rate is strictly higher. A losing
+    ///   application is discarded whole: it moves neither the rate nor the
+    ///   expiry. (`sim::compile` guarantees such a buff has a snapshot
+    ///   `tick_objective` and `max_stacks == 1`.)
     ///
     /// No policy ever closes the active span: `activated_at` is set only
     /// on the 0→1 transition, and only a drop to ZERO instances (in
     /// [`Sim::handle_buff_expire`]) closes it. The flush/refold
-    /// transaction runs exactly when the instance COUNT moves — that is
-    /// what the effective fold, the condition integrators and the tick
-    /// rate all read — so a `refresh` of an already-active buff still
-    /// does no work at all beyond resetting its expiry.
+    /// transaction runs when the instance COUNT moves — that is what the
+    /// effective fold and the condition integrators read — and, for a
+    /// SNAPSHOT `tick_objective` only, also when the instance SET moves
+    /// under a standing count (a `refresh` re-capture, an
+    /// `add_independent` eviction at the cap, a `strongest` replacement),
+    /// since that moves the summed tick rate. A `refresh` of an
+    /// already-active buff with no snapshot tick therefore still does no
+    /// work at all beyond resetting its expiry.
     ///
     /// The buff's `duration` is evaluated HERE — at the application
     /// instant — and SNAPSHOTTED onto the instance this call starts (or,
     /// for `refresh`/`add_refresh_all`, onto the window(s) it resets):
     /// nothing later reads the field again for it, so a stat/phase change
     /// afterwards cannot retroactively move an expiry already on the heap.
+    ///
+    /// A snapshot `tick_objective`'s RATE is captured at the same instant,
+    /// in the same way, against the same state — and, unlike the expiry,
+    /// is never moved by any later application: `add_refresh_all` pushes
+    /// an existing instance's expiry out while leaving the rate it
+    /// captured alone (pinned by
+    /// `add_refresh_all_moves_the_expiry_but_never_the_snapshot_rate`).
     ///
     /// It is evaluated against the LIVE state at that instant, whatever
     /// that state happens to be — there is no special-casing, and in
@@ -1096,22 +1163,40 @@ impl<'a> Sim<'a> {
         })?;
         let expire_at = now + duration;
 
+        // The incoming instance's SNAPSHOT rate, captured here — at the
+        // same instant, and against the same live state, as `duration`
+        // above (see this method's docs for what "live state" means on
+        // each application path; in particular, on a REAPPLICATION the
+        // buff's own currently-live instances are still folded in, so a
+        // poison whose contributions feed its own tick objective captures
+        // a rate that includes its outgoing stacks).
+        //
+        // `0.0` for a live tick objective and for a buff that does not
+        // tick at all: `snapshot_rate` is only ever READ through
+        // `Sim::snapshot_total`, which only a snapshot buff reaches.
+        let tick = self.sim_plan.buffs[bi].tick_objective;
+        let snapshot = tick.is_some_and(|t| t.snapshot);
+        let incoming_rate = match tick {
+            Some(t) if t.snapshot => self.eval_objective(t.objective)?,
+            _ => 0.0,
+        };
+
         let policy = self.sim_plan.buffs[bi].on_reapply;
         let max_stacks = self.sim_plan.buffs[bi].max_stacks;
         let before = self.buffs[bi].instances.len();
-        // `sim::compile` rejects `strongest` outright (P7c-T2), so this is
-        // reachable only from a hand-assembled `SimPlan` — fail closed
-        // rather than silently borrow some other policy's behavior. This
-        // guard is what makes the two `unreachable!` arms below true.
-        if policy == ReapplyPolicy::Strongest {
-            return Err(PlanError {
-                what: format!(
-                    "buff `{}`: on_reapply `strongest` is not implemented (see P7c-T2) \
-                     — `sim::compile` rejects it, so this `SimPlan` did not come from there",
-                    self.sim_plan.buffs[bi].name
-                ),
-            });
-        }
+        // `strongest`'s whole decision, taken BEFORE anything mutates:
+        // the incoming instance lands only if it is STRICTLY stronger than
+        // the incumbent (a tie leaves the incumbent alone — an equal
+        // reapplication is not an improvement). Meaningless for the other
+        // policies, which never consult it.
+        //
+        // `sim::compile` guarantees a `strongest` buff has `max_stacks ==
+        // 1` and a snapshot `tick_objective`, so `first()` IS the
+        // incumbent and `incoming_rate` is a real captured rate.
+        let strongest_wins = match self.buffs[bi].instances.first() {
+            None => true,
+            Some(incumbent) => incoming_rate > incumbent.snapshot_rate,
+        };
         // Two SEPARATE questions, deliberately not one flag:
         //
         // `at_cap` is a property of the instance list, and it is what the
@@ -1133,11 +1218,34 @@ impl<'a> Sim<'a> {
         let count_changes = match policy {
             ReapplyPolicy::Refresh => before != 1,
             ReapplyPolicy::AddRefreshAll | ReapplyPolicy::AddIndependent => !at_cap,
-            ReapplyPolicy::Strongest => {
-                unreachable!("`strongest` is rejected at sim::compile (P7c-T2)")
-            }
+            // A replacement: the count moves only on the FIRST application.
+            ReapplyPolicy::Strongest => before == 0,
         };
-        if count_changes {
+        // A SNAPSHOT buff has a second way for its total tick rate to move:
+        // the instance SET can change under a standing COUNT, and the two
+        // instances swapped will not in general carry the same captured
+        // rate. A live buff cannot hit this — its rate is a function of the
+        // count and the world, both of which the gate above already covers
+        // — so this is `false` for every 0.2.0 config, and the refresh path
+        // stays byte-for-byte what it was.
+        let snapshot_set_changes = snapshot
+            && match policy {
+                // The one instance is REPLACED, so it re-captures.
+                ReapplyPolicy::Refresh => before == 1,
+                // At the cap nothing is added or removed — only expiries
+                // move, and an expiry never moves a captured rate.
+                ReapplyPolicy::AddRefreshAll => false,
+                // At the cap: evict one, push one.
+                ReapplyPolicy::AddIndependent => at_cap,
+                // A winner replaces; a loser changes nothing at all.
+                ReapplyPolicy::Strongest => before == 1 && strongest_wins,
+            };
+        // The flush/refold transaction runs when EITHER can move the
+        // effective state. `count_changes` alone still decides what the
+        // `debug_assert`s below check, because it alone is a statement
+        // about the count.
+        let transaction = count_changes || snapshot_set_changes;
+        if transaction {
             self.flush_before_change();
         }
         self.flush_stacks(bi);
@@ -1145,9 +1253,8 @@ impl<'a> Sim<'a> {
         let generation = self.buffs[bi].generation;
 
         let fresh = BuffInstance {
-            applied_at: now,
             expire_at,
-            snapshot_rate: 0.0,
+            snapshot_rate: incoming_rate,
         };
         match policy {
             // One instance, its expiry reset — the binary buff.
@@ -1179,8 +1286,22 @@ impl<'a> Sim<'a> {
                 }
                 self.buffs[bi].instances.push(fresh);
             }
+            // The incumbent is REPLACED — window and all — only by a
+            // strictly stronger application. A LOSING application leaves
+            // the instance list untouched: not the rate, and NOT the
+            // expiry. That is the mechanic (a weak reapplication cannot
+            // extend a strong ailment), and it is what separates
+            // `strongest` from "replace but keep the higher rate".
+            //
+            // It still takes the uniform tail below — generation bump and
+            // reschedule — which is a no-op in effect: the rescheduled
+            // `BuffExpire` lands at the same instant the cancelled one
+            // did, since the earliest expiry did not move.
             ReapplyPolicy::Strongest => {
-                unreachable!("`strongest` is rejected at sim::compile (P7c-T2)")
+                if strongest_wins {
+                    self.buffs[bi].instances.clear();
+                    self.buffs[bi].instances.push(fresh);
+                }
             }
         }
         // The fold gate is a PREDICTION made before the mutation; these
@@ -1197,13 +1318,23 @@ impl<'a> Sim<'a> {
             "a 0→n application must refold: it is what puts `bi` into \
              `active_buff_set`"
         );
+        // The snapshot half of the same honesty check: when the
+        // transaction is SKIPPED, the buff's total tick rate must be
+        // exactly what the last refold left in `tick_rate` — otherwise the
+        // integrator would keep billing a rate the instance list no longer
+        // supports, silently. (Only meaningful while active, and `before ==
+        // 0` always runs the transaction.)
+        debug_assert!(
+            transaction || !snapshot || self.snapshot_total(bi) == self.buffs[bi].tick_rate,
+            "a snapshot buff's total tick rate moved without a refold"
+        );
 
         if before == 0 {
             self.buffs[bi].activated_at = now;
             self.active_buff_set.push(bi);
             self.active_buff_set.sort_unstable();
         }
-        if count_changes {
+        if transaction {
             // The instances are committed BEFORE the refold, so anything
             // the refold evaluates (a resource `max`/`regen_per_sec`,
             // notably) sees `buff.<this>`/`stacks.<this>` and a
@@ -2251,7 +2382,7 @@ mod tests {
     use crate::sim::CompiledValue;
     use crate::simdef::{
         ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ReapplyPolicy, ResourceDef, Rotation,
-        Rule, SimDef,
+        Rule, SimDef, TickObjective,
     };
     use std::collections::BTreeMap;
 
@@ -5176,7 +5307,8 @@ mod tests {
             let plan = stack_plan();
             let build = stack_build();
             let mut simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
-            simdef.buffs.get_mut("charge").unwrap().tick_objective = Some("dot".into());
+            simdef.buffs.get_mut("charge").unwrap().tick_objective =
+                Some(TickObjective::live("dot"));
             let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
 
             let report = run(
@@ -5500,6 +5632,663 @@ mod tests {
                 report.buffs["proc_buff"].avg_stacks,
                 report.buffs["proc_buff"].uptime
             ));
+        }
+    }
+
+    /// P7c-T2 — snapshot DoTs, `strongest`, and EV/MC agreement on
+    /// instance TOTALS (the stack-count agreement lives in `stacks`).
+    mod snapshot {
+        use super::*;
+
+        // ══════════════════════════════════════════════════════════════════
+        // The shared snapshot fixture, hand-traced once here.
+        //
+        //   plan    `hit = dmg × boost`, `dot = dmg × 0.5 × boost × dot_scale`
+        //           — TWO independent handles on the DoT rate, because the
+        //           fixtures below need to move it two different ways.
+        //           `boost` is a PRODUCT bucket, so a `+100` CONTRIBUTION
+        //           doubles it (what a buff can do mid-fight); `dot_scale` is
+        //           a stat a PHASE can override, and it appears in the `dot`
+        //           stage ONLY. That last part is deliberate: a phase `stats`
+        //           override wins over an action's `damage.stats` overlay, so
+        //           overriding a stat the HIT reads would un-zero the
+        //           filler's damage (it did, in the first draft of this
+        //           fixture — 1200 of hit damage where the fixture promises
+        //           0).
+        //   build   `dmg = 100`, `dot_scale = 1` → the dot objective is 50/s
+        //           at boost 1. R = 50 is the per-instance snapshot rate
+        //           every pin below is quoted in.
+        //   opener  cast_time 0, cooldown 1000 — one instant cast at t=0,
+        //           whose only job is to put an application AT t=0.
+        //   filler  cast_time 1, `damage.stats { dmg: 0 }` — one cast per
+        //           second completing at t=1,2,…, and its hit damage is ZERO
+        //           by construction. `damage_objective` is `hit`, so
+        //           `total_damage` IS the DoT total and every pin is a pure
+        //           DoT number. (The overlay is per-cast: it zeroes the
+        //           HIT's `dmg`, never the buff's tick objective, which reads
+        //           the un-overlaid effective build.)
+        //   poison_proc  on_cast, icd 0, `chance` per fixture — applies the
+        //           buff under test. icd 0 + chance 1 = one application per
+        //           cast: t=0 (opener) and t=1…20 (filler).
+        // icd==cooldown trick; Task 6 replaces this with ActionDef.apply_buff
+        // ══════════════════════════════════════════════════════════════════
+
+        fn dot_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "dot_scale"],
+                     "buckets": { "boost": { "fold": "product" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * boost" },
+                                   { "name": "dot", "expr": "dmg * 0.5 * boost * dot_scale" } ],
+                     "objectives": ["hit", "dot"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        fn dot_build() -> BuildState {
+            serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "dot_scale": 1.0 } }"#).unwrap()
+        }
+
+        /// The fixture described above. `tick` is the buff's
+        /// `tick_objective`, so one call site can run the SAME layout live
+        /// and snapshotted and pin the difference.
+        fn dot_simdef(
+            on_reapply: ReapplyPolicy,
+            max_stacks: u32,
+            duration: f64,
+            chance: &str,
+            tick: Option<TickObjective>,
+        ) -> SimDef {
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "opener".to_string(),
+                ActionDef {
+                    cast_time: "0".into(),
+                    cooldown: NumOrExpr::Num(1000.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: None,
+                },
+            );
+            let mut filler_stats = BTreeMap::new();
+            filler_stats.insert("dmg".to_string(), NumOrExpr::Num(0.0));
+            actions.insert(
+                "filler".to_string(),
+                ActionDef {
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: Some(ActionDamage {
+                        stats: filler_stats,
+                    }),
+                },
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "poison".to_string(),
+                BuffDef {
+                    duration: NumOrExpr::Num(duration),
+                    max_stacks,
+                    on_reapply,
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: tick,
+                },
+            );
+            let mut procs = BTreeMap::new();
+            procs.insert(
+                "poison_proc".to_string(),
+                ProcDef {
+                    trigger: Trigger::OnCast,
+                    chance: chance.into(),
+                    icd: 0.0,
+                    apply_buff: Some("poison".into()),
+                    cast_action: None,
+                },
+            );
+            SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs,
+                procs,
+                damage_objective: "hit".into(),
+            }
+        }
+
+        fn dot_rotation() -> Rotation {
+            Rotation {
+                rules: vec![
+                    Rule {
+                        action: "opener".into(),
+                        when: None,
+                    },
+                    Rule {
+                        action: "filler".into(),
+                        when: None,
+                    },
+                ],
+            }
+        }
+
+        /// Add an `empower` buff that DOUBLES the tick objective (a `+100`
+        /// contribution to the `product` bucket `boost`), applied from t=10
+        /// onwards and lasting past the end of the fight.
+        ///
+        /// Proc ORDER matters at t=10, and is deterministic: `SimDef::procs`
+        /// is a `BTreeMap` and `sim::compile` preserves its (name) order, so
+        /// `empower_proc` rolls BEFORE `poison_proc` at every cast. The t=10
+        /// poison application therefore lands in a world where `empower` is
+        /// already live, and snapshots the DOUBLED rate.
+        fn with_empower(simdef: &mut SimDef) {
+            simdef.buffs.insert(
+                "empower".to_string(),
+                BuffDef {
+                    duration: NumOrExpr::Num(100.0),
+                    contributions: vec![Contribution {
+                        bucket: "boost".into(),
+                        value: 100.0,
+                        event: None,
+                        condition: None,
+                    }],
+                    ..BuffDef::default()
+                },
+            );
+            simdef.procs.insert(
+                "empower_proc".to_string(),
+                ProcDef {
+                    trigger: Trigger::OnCast,
+                    chance: "time >= 10".into(),
+                    icd: 0.0,
+                    apply_buff: Some("empower".into()),
+                    cast_action: None,
+                },
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // The poison-cadence pin: a snapshot DoT accrues one instance-second
+        // of its CAPTURED rate per instance-second live, and the stack count
+        // is inherent in the sum of the instances' rates — never multiplied
+        // in a second time.
+        //
+        // `add_independent`, UNBOUNDED (max_stacks 0), duration 4, chance 1
+        // with no icd, over a 20s fight: one application per cast, at
+        // t=0 (opener) and t=1…20 (filler). Nothing moves the rate, so every
+        // instance captures the same R = dmg × 0.5 × boost = 100 × 0.5 × 1
+        // = 50/s.
+        //
+        // Instance-seconds (an instance applied at `a` is live on
+        // `[a, a+4)`, clipped at the 20s end):
+        //   a = 0…16   17 instances × 4s = 68
+        //   a = 17,18,19            3 + 2 + 1 = 6
+        //   a = 20     lands exactly at the end and integrates to ZERO
+        //   ∫ stacks dt = 74  →  avg_stacks = 74/20 = 3.7
+        //   DoT total   = 74 × R = 74 × 50 = 3700, dps = 185
+        //
+        // The mutation this catches beyond the cadence: a total tick rate of
+        // Σ(snapshot rates) × len — the "× stack count" a LIVE objective
+        // legitimately needs — would integrate R × ∫ stacks² dt instead.
+        // The count is 1, 2, 3 on the first three seconds and a flat 4 from
+        // t=3 on, so ∫ stacks² dt = 1 + 4 + 9 + 16×17 = 286 → 14300.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_snapshot_dot_accrues_74_instance_seconds_of_its_captured_rate() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let simdef = dot_simdef(
+                ReapplyPolicy::AddIndependent,
+                0,
+                4.0,
+                "1",
+                Some(TickObjective::snapshot("dot")),
+            );
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+
+            let report = run(
+                &plan,
+                &sim_plan,
+                &build,
+                &twenty_second_dummy(),
+                Mode::Expected,
+            )
+            .unwrap();
+
+            assert!(
+                close(report.actions["filler"].damage, 0.0),
+                "the filler's own hit damage must be 0 — got {}, which would \
+                 mean `total_damage` is not the DoT alone",
+                report.actions["filler"].damage
+            );
+            assert!(
+                close(report.buffs["poison"].avg_stacks, 3.7),
+                "avg_stacks: got {} — want 74/20 = 3.7",
+                report.buffs["poison"].avg_stacks
+            );
+            assert!(
+                close(report.total.total_damage, 3700.0),
+                "DoT total: got {} — want 74 instance-seconds × R=50 = 3700 \
+                 (14300 would mean the summed rate was ALSO multiplied by the \
+                 stack count)",
+                report.total.total_damage
+            );
+            assert!(
+                close(report.total.dps, 185.0),
+                "dps: got {} — want 3700/20 = 185",
+                report.total.dps
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // Snapshot IMMUNITY, against its live control — the pair that proves
+        // the flag changes exactly this and nothing else. Same fixture as the
+        // 74-instance-second pin, plus `empower` (× 2 on the tick objective)
+        // live from t=10.
+        //
+        // SNAPSHOT — an instance ticks the rate it captured, for ever:
+        //   a = 0…9   (10 instances) × 4s × R    = 40 R
+        //   a = 10…16  (7 instances) × 4s × 2R   = 56 R
+        //   a = 17,18,19  (3+2+1 = 6s) × 2R      = 12 R
+        //   total = 108 R = 108 × 50 = 5400
+        //
+        // LIVE — every live instance ticks the CURRENT rate from t=10 on, so
+        // the split is by TIME rather than by instance:
+        //   ∫ stacks dt over [0,10)  = 7×4 + 3 + 2 + 1 = 34
+        //   ∫ stacks dt over [10,20] = 74 − 34         = 40
+        //   total = 34 R + 40 × 2R = 114 R = 5700
+        //
+        // The two differ by exactly 114 R − 108 R = 6 R — the doubling that
+        // instances applied before t=10 collect from t=10 on under live
+        // semantics and refuse under snapshot ones. BOTH totals are pinned:
+        // either one alone could equally be produced by a fixture that
+        // simply never changed the rate.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_snapshot_instance_ignores_a_later_rate_change_and_the_live_one_does_not() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let run_with = |tick: TickObjective| {
+                let mut simdef = dot_simdef(ReapplyPolicy::AddIndependent, 0, 4.0, "1", Some(tick));
+                with_empower(&mut simdef);
+                let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+                run(
+                    &plan,
+                    &sim_plan,
+                    &build,
+                    &twenty_second_dummy(),
+                    Mode::Expected,
+                )
+                .unwrap()
+            };
+
+            let snap = run_with(TickObjective::snapshot("dot"));
+            let live = run_with(TickObjective::live("dot"));
+
+            assert!(
+                close(snap.total.total_damage, 5400.0),
+                "snapshot total: got {} — want 40R + 56R + 12R = 108 × 50 = \
+                 5400 (5700 would mean instances applied before t=10 were \
+                 retroactively doubled)",
+                snap.total.total_damage
+            );
+            assert!(
+                close(live.total.total_damage, 5700.0),
+                "live total: got {} — want 34R + 40×2R = 114 × 50 = 5700 \
+                 (5400 would mean the LIVE rate stopped being re-evaluated)",
+                live.total.total_damage
+            );
+            // Same instance trajectory in both: only the RATE differs.
+            assert!(
+                close(snap.buffs["poison"].avg_stacks, 3.7)
+                    && close(live.buffs["poison"].avg_stacks, 3.7),
+                "the flag must not move the cadence: {} vs {}",
+                snap.buffs["poison"].avg_stacks,
+                live.buffs["poison"].avg_stacks
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // Design decision, pinned: under `add_refresh_all` an existing
+        // instance's EXPIRY moves to the shared clock but its SNAPSHOT RATE
+        // does not. A snapshot rate is captured once, with the window it was
+        // captured for, and "ticks unchanged to expiry" means unchanged even
+        // when that expiry is later pushed out.
+        //
+        // `add_refresh_all`, cap 3, duration 100 (nothing expires inside the
+        // fight), snapshot dot, applications at t=1 and t=6 only
+        // (`chance: "or(time == 1, time == 6)"`). A 10s fight in TWO phases:
+        // `early` (5s, the build's `dot_scale` = 1) then `late` (5s, phase
+        // stat override `dot_scale` = 2) — so the tick objective is 50/s
+        // before t=5 and 100/s after.
+        //
+        //   t=1  push instance A, rate R = 50            → total rate 50
+        //   t=5  phase boundary: the objective is now 2R. A is IMMUNE.
+        //   t=6  push instance B, rate 2R = 100, and reset BOTH expiries to
+        //        106 — A keeps its 50                    → total rate 150
+        //   total = 50 × (6−1) + 150 × (10−6) = 250 + 600 = 850
+        //
+        // Mutation contrasts: re-snapshotting a refreshed instance would read
+        // 100 + 100 = 200/s after t=6 → 1050; live semantics → 200 + 100 +
+        // 800 = 1100; Σ(rates) × len → 250 + 1200 = 1450.
+        // ------------------------------------------------------------------
+        #[test]
+        fn add_refresh_all_moves_the_expiry_but_never_the_snapshot_rate() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let simdef = dot_simdef(
+                ReapplyPolicy::AddRefreshAll,
+                3,
+                100.0,
+                "or(time == 1, time == 6)",
+                Some(TickObjective::snapshot("dot")),
+            );
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+            let scenario: Scenario = serde_json::from_str(
+                r#"{ "phases": [ { "name": "early", "weight": 5 },
+                                 { "name": "late",  "weight": 5,
+                                   "stats": { "dot_scale": 2.0 } } ] }"#,
+            )
+            .unwrap();
+
+            let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+            assert!(
+                close(
+                    report.buffs["poison"].avg_stacks,
+                    (1.0 * 5.0 + 2.0 * 4.0) / 10.0
+                ),
+                "avg_stacks: got {} — 1 instance on [1,6), 2 on [6,10]",
+                report.buffs["poison"].avg_stacks
+            );
+            assert!(
+                close(report.total.total_damage, 850.0),
+                "DoT total: got {} — want 50×5 + 150×4 = 850 (1050 would mean \
+                 the refreshed instance re-snapshotted; 1100 live semantics)",
+                report.total.total_damage
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // `refresh` — the 0.2.0 binary buff — with a SNAPSHOT tick objective:
+        // the single instance is REPLACED on every application, so it
+        // re-captures the rate, up or down. This is the fold-gate case a
+        // count-only gate misses: the count stands still at 1 while the
+        // summed rate moves.
+        //
+        // Duration 8, applications at t=1 and t=6, the same two 5s phases
+        // whose `dot_scale` override sets what each application captures:
+        //   RISING  (1 → 2): 50 × (6−1) + 100 × (10−6) = 250 + 400 = 650
+        //   FALLING (2 → 1): 100 × 5    + 50 × 4       = 500 + 200 = 700
+        //
+        // Mutations:
+        //   650 → 450  the instance-SET change went unrefolded, so the
+        //              integrator keeps billing the old 50/s to the end.
+        //              (In a debug build the `snapshot buff's total tick
+        //              rate moved without a refold` assertion in
+        //              `apply_buff` fires first; 450 is what a release
+        //              build reads.)
+        //   700 → 800  `refresh` kept the incumbent's higher rate — i.e. it
+        //              had quietly become `strongest`, which is exactly the
+        //              number that policy's FALLING pin reads on this very
+        //              layout
+        // ------------------------------------------------------------------
+        #[test]
+        fn refresh_recaptures_the_snapshot_rate_on_every_reapplication() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let simdef = dot_simdef(
+                ReapplyPolicy::Refresh,
+                1,
+                8.0,
+                "or(time == 1, time == 6)",
+                Some(TickObjective::snapshot("dot")),
+            );
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+            let total = |early: f64, late: f64| {
+                let scenario: Scenario = serde_json::from_str(&format!(
+                    r#"{{ "phases": [ {{ "name": "early", "weight": 5,
+                                         "stats": {{ "dot_scale": {early} }} }},
+                                      {{ "name": "late",  "weight": 5,
+                                         "stats": {{ "dot_scale": {late} }} }} ] }}"#
+                ))
+                .unwrap();
+                run(&plan, &sim_plan, &build, &scenario, Mode::Expected)
+                    .unwrap()
+                    .total
+                    .total_damage
+            };
+
+            let rising = total(1.0, 2.0);
+            let falling = total(2.0, 1.0);
+            assert!(
+                close(rising, 650.0),
+                "rising: got {rising} — want 50×5 + 100×4 = 650 (450 would \
+                 mean the re-capture never reached the tick integrator)"
+            );
+            assert!(
+                close(falling, 700.0),
+                "falling: got {falling} — want 100×5 + 50×4 = 700; `refresh` \
+                 replaces UNCONDITIONALLY (800 would mean it kept the higher \
+                 rate, i.e. behaved like `strongest`)"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // `add_independent` AT THE CAP with a snapshot tick: the eviction
+        // swaps one captured rate for another while the COUNT stands still —
+        // the second fold-gate case, and the one where WHICH instance is
+        // evicted becomes visible in the damage total rather than only in
+        // `avg_stacks`.
+        //
+        // Cap 2, duration 8, applications at t=1, t=2 and t=6; two 5s phases
+        // (`dot_scale` 1 → 2, so applications before t=5 capture R=50 and
+        // after it 2R=100):
+        //   t=1  push A(rate 50, expires 9)                 → rate  50
+        //   t=2  push B(rate 50, expires 10) — now AT CAP    → rate 100
+        //   t=6  at the cap: evict the EARLIEST-EXPIRING (A, at 9), push
+        //        C(rate 100, expires 14)                     → rate 150
+        //   total = 50×(2−1) + 100×(6−2) + 150×(10−6)
+        //         = 50 + 400 + 600 = 1050
+        //
+        // Mutations:
+        //   1050 → 850   the eviction went unrefolded (rate stuck at 100)
+        //   1050 → 1000  evicting the NEWEST (B) instead of the
+        //                earliest-expiring: the summed rate is the same 150
+        //                (A and B both captured 50), but A then falls off at
+        //                its own expiry of 9 and the last second ticks 100
+        //                rather than 150.
+        // ------------------------------------------------------------------
+        #[test]
+        fn add_independent_refolds_the_summed_rate_when_it_evicts_at_the_cap() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let simdef = dot_simdef(
+                ReapplyPolicy::AddIndependent,
+                2,
+                8.0,
+                "or(time == 1, or(time == 2, time == 6))",
+                Some(TickObjective::snapshot("dot")),
+            );
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+            let scenario: Scenario = serde_json::from_str(
+                r#"{ "phases": [ { "name": "early", "weight": 5 },
+                                 { "name": "late",  "weight": 5,
+                                   "stats": { "dot_scale": 2.0 } } ] }"#,
+            )
+            .unwrap();
+
+            let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+            assert!(
+                close(report.total.total_damage, 1050.0),
+                "DoT total: got {} — want 50 + 400 + 600 = 1050 (850 would \
+                 mean the eviction at the cap never refolded the summed rate)",
+                report.total.total_damage
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // `strongest` (PoE2 ignite): an application replaces the incumbent
+        // only when its snapshot rate is STRICTLY higher; a loser is
+        // discarded whole — rate AND expiry.
+        //
+        // One layout, three scenarios. Duration 8, applications at t=1 and
+        // t=6 (`chance: "or(time == 1, time == 6)"`), a 10s fight in two 5s
+        // phases whose `dmg` override sets what each application captures:
+        //
+        //   RISING  (100 → 200): t=1 captures R=50 (expires 9); at t=6 the
+        //     incoming 2R=100 wins and REPLACES — new window, expires 14.
+        //     total = 50×(6−1) + 100×(10−6) = 250 + 400 = 650
+        //   FALLING (200 → 100): t=1 captures 2R=100 (expires 9); at t=6 the
+        //     incoming 50 LOSES and is discarded — the incumbent keeps both
+        //     its rate and its expiry, so it falls off at 9 and the last
+        //     second of the fight has no DoT at all.
+        //     total = 100 × (9−1) = 800
+        //   TIE     (no change):  both applications capture R=50. "Strictly
+        //     higher" fails on a tie, so the t=6 application loses and the
+        //     window still ends at 9.
+        //     total = 50 × (9−1) = 400
+        //
+        // Each pin discriminates one mutation the others do not:
+        //   FALLING = 900  → a losing application refreshed the expiry
+        //                    (window to 14, clipped at the 10s end)
+        //   FALLING = 700  → the loser replaced anyway (100×5 + 50×4)
+        //   TIE     = 450  → the comparison is `>=`, not `>`
+        //   RISING  = 400  → the winner did NOT replace either, leaving the
+        //                    t=1 instance to tick 50 to its own expiry at 9
+        // ------------------------------------------------------------------
+        #[test]
+        fn strongest_replaces_only_on_a_strictly_higher_rate_and_a_loser_keeps_nothing() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let simdef = dot_simdef(
+                ReapplyPolicy::Strongest,
+                1,
+                8.0,
+                "or(time == 1, time == 6)",
+                Some(TickObjective::snapshot("dot")),
+            );
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+            let two_phases = |early: &str, late: &str| -> Scenario {
+                serde_json::from_str(&format!(
+                    r#"{{ "phases": [ {{ "name": "early", "weight": 5, "stats": {early} }},
+                                      {{ "name": "late",  "weight": 5, "stats": {late} }} ] }}"#
+                ))
+                .unwrap()
+            };
+            let total = |scenario: &Scenario| {
+                run(&plan, &sim_plan, &build, scenario, Mode::Expected)
+                    .unwrap()
+                    .total
+                    .total_damage
+            };
+
+            let rising = total(&two_phases(
+                r#"{ "dot_scale": 1.0 }"#,
+                r#"{ "dot_scale": 2.0 }"#,
+            ));
+            let falling = total(&two_phases(
+                r#"{ "dot_scale": 2.0 }"#,
+                r#"{ "dot_scale": 1.0 }"#,
+            ));
+            let tie = total(&two_phases(
+                r#"{ "dot_scale": 1.0 }"#,
+                r#"{ "dot_scale": 1.0 }"#,
+            ));
+
+            assert!(
+                close(rising, 650.0),
+                "rising: got {rising} — want 50×5 + 100×4 = 650 (400 would \
+                 mean the stronger application did not replace)"
+            );
+            assert!(
+                close(falling, 800.0),
+                "falling: got {falling} — want 100×8 = 800, the incumbent's \
+                 ORIGINAL window (900 would mean the losing application \
+                 refreshed the expiry; 700 that it replaced anyway)"
+            );
+            assert!(
+                close(tie, 400.0),
+                "tie: got {tie} — want 50×8 = 400; a tie is not STRICTLY \
+                 higher, so the incumbent stands (450 would mean `>=`)"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // EV/MC agreement on instance TOTALS (the P6 discipline, and the P7
+        // spec's gate for snapshot DoTs). Unbounded `add_independent`,
+        // duration 4, snapshot dot, applied by an `on_hit` proc at chance 0.5
+        // against the filler's 1 hit/s cadence over 40s.
+        //
+        // EV, exactly — the accumulator crosses on every second hit, so
+        // applications land at t=2,4,…,40 and an instance applied at `a` is
+        // live on `[a, a+4)`:
+        //   a = 2…36 (18 instances) × 4s = 72, a = 38 → 2, a = 40 → 0
+        //   ∫ stacks dt = 74  →  avg_stacks 1.85 (the same 74 the P7c-T1
+        //   steady-state pin hand-works), total = 74 × R = 74 × 50 = 3700.
+        //
+        // MC rolls each hit exactly and ramps in faster (its first
+        // application can land at t=1), so its expected integral is 75 →
+        // 3750, 1.35% above EV. The gate is 3%: a real divergence of the
+        // kind the P6 review's ICD-bound regime showed (+48%) fails it.
+        //
+        // The rate never moves here, so EV/MC agreement on the TOTAL is
+        // agreement on the instance trajectory times a constant — which is
+        // exactly the claim, and it is checked in the mode where the
+        // instances are rolled rather than accumulated.
+        // ------------------------------------------------------------------
+        #[test]
+        fn snapshot_dot_totals_agree_between_ev_and_monte_carlo() {
+            let plan = dot_plan();
+            let build = dot_build();
+            let scenario: Scenario =
+                serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 40 } ] }"#).unwrap();
+            let mut simdef = dot_simdef(
+                ReapplyPolicy::AddIndependent,
+                0,
+                4.0,
+                "0.5",
+                Some(TickObjective::snapshot("dot")),
+            );
+            simdef.procs.get_mut("poison_proc").unwrap().trigger = Trigger::OnHit;
+            let sim_plan = sim_compile(&plan, &simdef, &dot_rotation()).unwrap();
+            let mc = || {
+                run(
+                    &plan,
+                    &sim_plan,
+                    &build,
+                    &scenario,
+                    Mode::MonteCarlo {
+                        iterations: 2_000,
+                        seed: 7,
+                    },
+                )
+                .unwrap()
+            };
+
+            let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+            let a = ev.total.total_damage;
+            assert!(
+                close(a, 3700.0) && close(ev.buffs["poison"].avg_stacks, 1.85),
+                "EV total {a} / avg_stacks {} — want the hand-worked 74 \
+                 instance-seconds × R=50 = 3700 at 74/40 = 1.85",
+                ev.buffs["poison"].avg_stacks
+            );
+
+            let first = mc();
+            let b = first.total.total_damage;
+            let rel_err = (b - a).abs() / a;
+            assert!(
+                rel_err < 0.03,
+                "EV total {a} vs MC mean {b}, relative error {rel_err} — the \
+                 modes must agree on the snapshot-DoT total"
+            );
+            // Same seed, byte-identical: no RNG draw was reordered.
+            assert_eq!(
+                b,
+                mc().total.total_damage,
+                "same-seed MC must be byte-identical"
+            );
         }
     }
 }

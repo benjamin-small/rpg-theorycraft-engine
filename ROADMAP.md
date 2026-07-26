@@ -60,12 +60,17 @@
       review, non-functional). `Sim::earliest_expiry` and
       `Sim::longest_remaining` each scan the whole instance list, the
       latter on every `refresh_time_varying_slots` — i.e. before every
-      expression evaluation, for every buff. Irrelevant at the stack
-      counts anything models today (`max_stacks` in the low single
-      digits), and deliberately deferred to P7c-T2, where the unbounded
-      poison fixture is the first config that can make the list long
-      enough to matter. Do it there with that fixture as the witness, not
-      speculatively here.
+      expression evaluation, for every buff. Deferred out of P7c-T1 to
+      P7c-T2 on the theory that the unbounded poison fixture would be the
+      witness that made it matter. **It was not.** That fixture applies
+      one instance per second against a 4s duration, so the list never
+      holds more than 4: the length is bounded by duration ÷ application
+      cadence, and `max_stacks: 0` does not by itself make a list long.
+      P7c-T2 added a third whole-list scan (`Sim::snapshot_total`, once
+      per refold) on the same tiny lists. Left deferred, and now
+      deliberately WITHOUT a nominated witness — revisit when a config
+      actually drives a long-duration, high-frequency stack (hundreds of
+      instances), and measure first.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;
