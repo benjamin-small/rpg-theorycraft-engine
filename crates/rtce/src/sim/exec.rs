@@ -73,6 +73,33 @@
 //!   phase change afterwards never retroactively moves an expiry already
 //!   on the heap. (This is also what makes P7c's snapshot DoTs coherent.)
 //!
+//! # The buff instance runtime (P7c)
+//!
+//! Every buff is an INSTANCE LIST ([`BuffRt`]), collapsed per mechanic by
+//! its [`crate::simdef::ReapplyPolicy`]; a binary buff is the degenerate
+//! one-instance `refresh` case and takes the same path it always did. The
+//! count drives three things and deliberately not a fourth: bucket
+//! contributions fold with their VALUE × the count, a `tick_objective`
+//! ticks at rate × the count, and `stacks.<buff>` reads the count — while
+//! `conditions` stay at their full configured value for as long as ANY
+//! instance is live (a condition is an uptime fraction, not a quantity,
+//! so scaling it by a stack count has no meaning).
+//!
+//! Expiry keeps the generation self-cancel pattern, with one event per
+//! BUFF rather than per instance: at most one non-stale
+//! [`Event::BuffExpire`] is on the heap per buff, scheduled at the
+//! EARLIEST live expiry, and any instance-set mutation bumps the
+//! generation so whatever was pending self-cancels. The handler sweeps
+//! every instance whose window closed at `now` (`retain(expire_at > now)`,
+//! so a reschedule can never land at or before `now`) and reschedules at
+//! the new earliest if any survive — see [`Sim::handle_buff_expire`].
+//!
+//! The effective-fold transaction (flush the integrators → mutate →
+//! refold) runs exactly when the COUNT moves. A reapplication that leaves
+//! the count where it was — a `refresh`, or an `add_refresh_all` already
+//! at `max_stacks` — changes only expiries, which nothing the fold reads
+//! depends on, so it does no fold work at all.
+//!
 //! # Event queue and the spec's named event kinds
 //!
 //! The design spec names six event kinds (`CastComplete`, `BuffExpire`,
@@ -158,7 +185,7 @@ use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
 use crate::rng::{mix_seed, Pcg32};
 use crate::scenario::{Phase, Scenario};
-use crate::simdef::Trigger;
+use crate::simdef::{ReapplyPolicy, Trigger};
 
 /// Execution fidelity for [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +349,7 @@ fn run_monte_carlo(
     let mut action_casts_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut action_damage_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut buff_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut avg_stacks_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut condition_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut resource_capped_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut resource_starved_sum: BTreeMap<String, f64> = BTreeMap::new();
@@ -354,6 +382,9 @@ fn run_monte_carlo(
         }
         for (name, v) in &report.buff_uptime {
             *buff_uptime_sum.entry(name.clone()).or_insert(0.0) += v;
+        }
+        for (name, v) in &report.avg_stacks {
+            *avg_stacks_sum.entry(name.clone()).or_insert(0.0) += v;
         }
         for (name, v) in &report.condition_uptime {
             *condition_uptime_sum.entry(name.clone()).or_insert(0.0) += v;
@@ -414,6 +445,10 @@ fn run_monte_carlo(
     for (name, v) in &buff_uptime_sum {
         buff_uptime.insert(name.clone(), v / n);
     }
+    let mut avg_stacks = BTreeMap::new();
+    for (name, v) in &avg_stacks_sum {
+        avg_stacks.insert(name.clone(), v / n);
+    }
     let mut condition_uptime = BTreeMap::new();
     for (name, v) in &condition_uptime_sum {
         condition_uptime.insert(name.clone(), v / n);
@@ -439,6 +474,7 @@ fn run_monte_carlo(
         total,
         actions,
         buff_uptime,
+        avg_stacks,
         condition_uptime,
         resources,
         proc_counts,
@@ -586,6 +622,11 @@ struct BuffRt {
     /// `tick_objective` integration: the value/time last flushed.
     tick_last_eval: f64,
     tick_rate: f64,
+    /// `∫ stacks dt` over every span already absorbed — the numerator of
+    /// the report's `avg_stacks` (see [`Sim::flush_stacks`]).
+    stack_seconds: f64,
+    /// Start of the span `stack_seconds` has not yet absorbed.
+    stack_since: f64,
 }
 
 /// Per-proc runtime state. `acc` is EV-accumulator-only (untouched in MC
@@ -748,6 +789,8 @@ impl<'a> Sim<'a> {
                     active_seconds: 0.0,
                     tick_last_eval: 0.0,
                     tick_rate: 0.0,
+                    stack_seconds: 0.0,
+                    stack_since: 0.0,
                 })
                 .collect(),
             active_buff_set: Vec::new(),
@@ -879,7 +922,20 @@ impl<'a> Sim<'a> {
 
         let mut contributions = self.build.contributions.clone();
         for &bi in &self.active_buff_set {
-            contributions.extend(self.sim_plan.buffs[bi].contributions.iter().cloned());
+            // Per-stack: the VALUE is scaled by the live instance count,
+            // rather than the contribution being repeated `stacks` times.
+            // The two agree in a `sum`/`summed_group` bucket and differ in
+            // a `product` one — 3 stacks of `+10` fold as `×1.30`, not
+            // `×1.10³` — and scaling the value is the reading a config
+            // author gets by writing the per-stack magnitude once (see
+            // `simdef::BuffDef`). A one-instance buff multiplies by
+            // exactly `1.0`, which is the identity on every `f64`.
+            let stacks = self.buffs[bi].instances.len() as f64;
+            contributions.extend(self.sim_plan.buffs[bi].contributions.iter().map(|c| {
+                let mut c = c.clone();
+                c.value *= stacks;
+                c
+            }));
         }
         self.effective_damage_build = BuildState {
             stats: self.build.stats.clone(),
@@ -945,39 +1001,63 @@ impl<'a> Sim<'a> {
                     .evaluate_phase(&build, &phase, &mut self.scratch.eval)?;
                 let val = objs[obj];
                 let b = &mut self.buffs[bi];
-                b.tick_rate = val;
+                // × stack count: k independent instances of a DoT tick k
+                // times over. (A `snapshot: true` tick_objective — where
+                // each instance ticks the rate it captured — is P7c-T2;
+                // today every instance ticks the same live rate, so the
+                // total is a plain multiple.)
+                b.tick_rate = val * b.instances.len() as f64;
                 b.tick_last_eval = now;
             }
         }
         Ok(())
     }
 
-    /// Apply (or refresh, if already active) `bi`: pay-free, instantaneous.
-    /// Refresh-on-reapply resets `expire_at` but leaves the active span's
-    /// `activated_at`/effective-state untouched (see [`BuffRt`] docs).
+    /// ONE application of `bi`: pay-free, instantaneous, and collapsed
+    /// into the instance list by the buff's
+    /// [`crate::simdef::ReapplyPolicy`]:
+    ///
+    /// - `refresh` — one instance, its expiry reset. rtce 0.2.0's binary
+    ///   buff, and the path every existing pin exercises.
+    /// - `add_refresh_all` — push (up to `max_stacks`; AT the cap no new
+    ///   instance is added), then reset EVERY instance's expiry to
+    ///   `now + duration`: one shared clock, so the whole stack falls off
+    ///   together.
+    /// - `add_independent` — push an instance with its own expiry; at
+    ///   `max_stacks` the earliest-expiring one is evicted first.
+    /// - `strongest` — rejected at compile (P7c-T2); a fail-closed run
+    ///   error here for a hand-assembled `SimPlan`.
+    ///
+    /// No policy ever closes the active span: `activated_at` is set only
+    /// on the 0→1 transition, and only a drop to ZERO instances (in
+    /// [`Sim::handle_buff_expire`]) closes it. The flush/refold
+    /// transaction runs exactly when the instance COUNT moves — that is
+    /// what the effective fold, the condition integrators and the tick
+    /// rate all read — so a `refresh` of an already-active buff still
+    /// does no work at all beyond resetting its expiry.
     ///
     /// The buff's `duration` is evaluated HERE — at the application
-    /// instant — and SNAPSHOTTED onto the window this call starts or
-    /// refreshes: nothing later reads the field again for this window, so
-    /// a stat/phase change afterwards cannot retroactively move the expiry
-    /// already on the heap.
+    /// instant — and SNAPSHOTTED onto the instance this call starts (or,
+    /// for `refresh`/`add_refresh_all`, onto the window(s) it resets):
+    /// nothing later reads the field again for it, so a stat/phase change
+    /// afterwards cannot retroactively move an expiry already on the heap.
     ///
     /// It is evaluated against the LIVE state at that instant, whatever
     /// that state happens to be — there is no special-casing, and in
     /// particular no attempt to un-fold this buff's own effects. That
-    /// means the two application paths legitimately see DIFFERENT worlds,
-    /// and the `if !active` split below is what decides which:
+    /// means the two application paths legitimately see DIFFERENT worlds:
     ///
     /// - **First application** (buff inactive): `buff.<self>` reads `0`,
     ///   `buff_remaining.<self>` reads `0`, and any condition this buff
     ///   drives reads its non-buff value. The expression sees the world
     ///   the buff is landing on.
-    /// - **Refresh** (buff already active): the previous window is still
-    ///   fully in force, so `buff.<self>` reads `1`, any condition this
-    ///   buff drives reads its BUFF-DRIVEN value, and
-    ///   `buff_remaining.<self>` reads the remaining time of the window
-    ///   being replaced (the OLD expiry — `expire_at` is not committed
-    ///   until after this).
+    /// - **Reapplication** (buff already active): the existing instances
+    ///   are still fully in force, so `buff.<self>` reads `1`,
+    ///   `stacks.<self>` the count BEFORE this application, any condition
+    ///   this buff drives reads its BUFF-DRIVEN value, and
+    ///   `buff_remaining.<self>` the longest remaining of the windows
+    ///   about to be replaced or joined (the OLD expiries — nothing is
+    ///   committed until after this).
     ///
     /// The refresh reading is the deliberate one, not an accident of
     /// ordering: it is what makes pandemic-style refreshes expressible as
@@ -998,40 +1078,127 @@ impl<'a> Sim<'a> {
             )
         })?;
         let expire_at = now + duration;
-        let was_active = !self.buffs[bi].instances.is_empty();
+
+        let policy = self.sim_plan.buffs[bi].on_reapply;
+        let max_stacks = self.sim_plan.buffs[bi].max_stacks;
+        let before = self.buffs[bi].instances.len();
+        // `sim::compile` rejects `strongest` outright (P7c-T2), so this is
+        // reachable only from a hand-assembled `SimPlan` — fail closed
+        // rather than silently borrow some other policy's behavior. This
+        // guard is what makes the two `unreachable!` arms below true.
+        if policy == ReapplyPolicy::Strongest {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{}`: on_reapply `strongest` is not implemented (see P7c-T2) \
+                     — `sim::compile` rejects it, so this `SimPlan` did not come from there",
+                    self.sim_plan.buffs[bi].name
+                ),
+            });
+        }
+        // Whether the COUNT will move — decided before the mutation
+        // because the fold/tick transaction has to bracket it (flush the
+        // old count's elapsed seconds, mutate, refold at the new one).
+        // When it does not move, nothing the effective fold reads has
+        // changed and the whole transaction is skipped: that is the
+        // 0.2.0 refresh path, byte for byte.
+        let will_change = match policy {
+            ReapplyPolicy::Refresh => before != 1,
+            ReapplyPolicy::AddRefreshAll | ReapplyPolicy::AddIndependent => {
+                max_stacks == 0 || before < max_stacks as usize
+            }
+            ReapplyPolicy::Strongest => {
+                unreachable!("`strongest` is rejected at sim::compile (P7c-T2)")
+            }
+        };
+        if will_change {
+            self.flush_before_change();
+        }
+        self.flush_stacks(bi);
         self.buffs[bi].generation += 1;
         let generation = self.buffs[bi].generation;
-        if !was_active {
-            self.flush_before_change();
+
+        let fresh = BuffInstance {
+            applied_at: now,
+            expire_at,
+            snapshot_rate: 0.0,
+        };
+        match policy {
+            // One instance, its expiry reset — the binary buff.
+            ReapplyPolicy::Refresh => {
+                self.buffs[bi].instances.clear();
+                self.buffs[bi].instances.push(fresh);
+            }
+            // Count +1 up to the cap, then ONE shared clock: every
+            // instance's expiry is reset, including at the cap (where no
+            // new instance is added but the stack still refreshes).
+            ReapplyPolicy::AddRefreshAll => {
+                if will_change {
+                    self.buffs[bi].instances.push(fresh);
+                }
+                for inst in self.buffs[bi].instances.iter_mut() {
+                    inst.expire_at = expire_at;
+                }
+            }
+            // Own clock per instance; at the cap the EARLIEST-EXPIRING
+            // instance is evicted (ties: the oldest of them, by
+            // application order) to make room.
+            ReapplyPolicy::AddIndependent => {
+                if !will_change {
+                    let victim = self.earliest_expiry_index(bi).expect(
+                        "at the cap, so at least one instance is live \
+                         (max_stacks 0 is unbounded and never reaches here)",
+                    );
+                    self.buffs[bi].instances.remove(victim);
+                }
+                self.buffs[bi].instances.push(fresh);
+            }
+            ReapplyPolicy::Strongest => {
+                unreachable!("`strongest` is rejected at sim::compile (P7c-T2)")
+            }
+        }
+
+        if before == 0 {
             self.buffs[bi].activated_at = now;
-            // The instance is pushed BEFORE the refold, so anything the
-            // refold evaluates (a resource `max`/`regen_per_sec`, notably)
-            // sees `buff.<this>` = 1 AND a `buff_remaining.<this>` that
-            // agrees with it, rather than a half-applied window.
-            self.buffs[bi].instances.push(BuffInstance {
-                applied_at: now,
-                expire_at,
-                snapshot_rate: 0.0,
-            });
             self.active_buff_set.push(bi);
             self.active_buff_set.sort_unstable();
-            self.refresh_after_change()?;
-        } else {
-            // Refresh in place: one instance, expiry reset. The instance
-            // COUNT is unchanged, so nothing the effective fold depends on
-            // moved and no refold is needed.
-            let inst = &mut self.buffs[bi].instances[0];
-            inst.applied_at = now;
-            inst.expire_at = expire_at;
         }
+        if will_change {
+            // The instances are committed BEFORE the refold, so anything
+            // the refold evaluates (a resource `max`/`regen_per_sec`,
+            // notably) sees `buff.<this>`/`stacks.<this>` and a
+            // `buff_remaining.<this>` that agree with each other, rather
+            // than a half-applied window.
+            self.refresh_after_change()?;
+        }
+        // One pending expiry per buff, at the EARLIEST live expiry — the
+        // generation bumped above cancels whatever was pending before.
+        let next = self
+            .earliest_expiry(bi)
+            .expect("an application always leaves at least one instance");
         self.schedule(
-            expire_at,
+            next,
             Event::BuffExpire {
                 buff: bi,
                 generation,
             },
         )?;
         Ok(())
+    }
+
+    /// Index of `bi`'s earliest-expiring instance (the eviction victim at
+    /// the cap under [`ReapplyPolicy::AddIndependent`]); ties resolve to
+    /// the oldest by application order. `None` when inactive.
+    fn earliest_expiry_index(&self, bi: usize) -> Option<usize> {
+        self.buffs[bi]
+            .instances
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.expire_at
+                    .partial_cmp(&b.expire_at)
+                    .expect("expiries are finite (see schedule)")
+            })
+            .map(|(i, _)| i)
     }
 
     /// The scheduled expiry sweep for `bi`: drop every instance whose
@@ -1056,6 +1223,7 @@ impl<'a> Sim<'a> {
             .count();
         if expiring > 0 {
             self.flush_before_change();
+            self.flush_stacks(bi);
             // `retain` leaves only instances with `expire_at > now`, so the
             // reschedule below can never land at or before `now` — no
             // same-instant expiry loop is possible.
@@ -1076,6 +1244,19 @@ impl<'a> Sim<'a> {
             )?;
         }
         Ok(())
+    }
+
+    /// Absorb `bi`'s elapsed span into `∫ stacks dt` at the CURRENT stack
+    /// count, then restart the span at `now`. Must run BEFORE any
+    /// mutation of `bi`'s instance list, so the elapsed seconds are
+    /// credited to the count that was actually live during them.
+    /// Idempotent: a second call at the same instant absorbs a zero-length
+    /// span and adds nothing.
+    fn flush_stacks(&mut self, bi: usize) {
+        let now = self.time;
+        let b = &mut self.buffs[bi];
+        b.stack_seconds += (now - b.stack_since) * b.instances.len() as f64;
+        b.stack_since = now;
     }
 
     /// `bi`'s earliest instance expiry, or `None` when it is inactive.
@@ -1385,6 +1566,10 @@ impl<'a> Sim<'a> {
         let casts_base = buff_remaining_base + sim_plan.buffs.len();
         for ai in 0..sim_plan.actions.len() {
             self.scratch.slots[casts_base + ai] = self.actions[ai].casts as f64;
+        }
+        let stacks_base = casts_base + sim_plan.actions.len();
+        for bi in 0..sim_plan.buffs.len() {
+            self.scratch.slots[stacks_base + bi] = self.buffs[bi].instances.len() as f64;
         }
     }
 
@@ -1903,6 +2088,8 @@ impl<'a> Sim<'a> {
             if !b.instances.is_empty() {
                 b.active_seconds += now - b.activated_at;
             }
+            b.stack_seconds += (now - b.stack_since) * b.instances.len() as f64;
+            b.stack_since = now;
         }
         for ri in 0..self.resources.len() {
             self.settle_resource(ri, now);
@@ -1952,16 +2139,17 @@ impl<'a> Sim<'a> {
         }
 
         let mut buff_uptime = BTreeMap::new();
+        let mut avg_stacks = BTreeMap::new();
         for (bi, b) in self.sim_plan.buffs.iter().enumerate() {
             let seconds = self.buffs[bi].active_seconds;
-            buff_uptime.insert(
-                b.name.clone(),
-                if self.duration > 0.0 {
-                    seconds / self.duration
-                } else {
-                    0.0
-                },
-            );
+            let stack_seconds = self.buffs[bi].stack_seconds;
+            let (uptime, avg) = if self.duration > 0.0 {
+                (seconds / self.duration, stack_seconds / self.duration)
+            } else {
+                (0.0, 0.0)
+            };
+            buff_uptime.insert(b.name.clone(), uptime);
+            avg_stacks.insert(b.name.clone(), avg);
         }
 
         let mut condition_uptime = BTreeMap::new();
@@ -1998,6 +2186,7 @@ impl<'a> Sim<'a> {
             total,
             actions,
             buff_uptime,
+            avg_stacks,
             condition_uptime,
             resources,
             proc_counts,
@@ -2013,12 +2202,14 @@ impl<'a> Sim<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::Contribution;
     use crate::gamedef::GameDef;
     use crate::plan::{self, Plan};
     use crate::sim::compile as sim_compile;
     use crate::sim::CompiledValue;
     use crate::simdef::{
-        ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ResourceDef, Rotation, Rule, SimDef,
+        ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ReapplyPolicy, ResourceDef, Rotation,
+        Rule, SimDef,
     };
     use std::collections::BTreeMap;
 
@@ -2288,6 +2479,8 @@ mod tests {
             "power_up".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(4.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: vec![crate::build::Contribution {
                     bucket: "indep".into(),
                     value: 25.0,
@@ -2372,6 +2565,8 @@ mod tests {
             "x".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(4.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -2556,6 +2751,8 @@ mod tests {
             "enrage_window".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(4.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions,
                 tick_objective: None,
@@ -2723,6 +2920,8 @@ mod tests {
             "proc_buff".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(0.5),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -2960,6 +3159,8 @@ mod tests {
             "proc_buff".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(0.5),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -3386,6 +3587,8 @@ mod tests {
             "window".to_string(),
             BuffDef {
                 duration,
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -4098,6 +4301,8 @@ mod tests {
             "y".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(1.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -4210,6 +4415,8 @@ mod tests {
             "focus".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(100.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: empowered,
                 tick_objective: None,
@@ -4219,6 +4426,8 @@ mod tests {
             "marker".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(1.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -4359,6 +4568,8 @@ mod tests {
             "boost".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(100.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -4442,5 +4653,523 @@ mod tests {
                 e.what
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // P7c-T1 — the instance runtime: stacks and reapply policies.
+    //
+    // ONE toy base for every trajectory below, so the cadence is
+    // hand-worked once, here:
+    //
+    //   plan     `hit = dmg * boost`, `boost` a PRODUCT bucket (Π(1+v/100))
+    //            and `dmg` = 100 from the build. No events, no conditions
+    //            — every hit's value is a pure function of the live stack
+    //            count, which is the point.
+    //   filler   cast_time 1, no cost/cooldown, always eligible (last
+    //            rule) — one hit per second, hit N completing at t=N.
+    //   charge_gen  cast_time 0, cooldown `gen_cooldown` (first rule) —
+    //            casts at t=0 and then whenever its cooldown is up.
+    //   charge   the buff under test: one contribution of +10 to `boost`,
+    //            so k stacks read `boost = 1 + 10k/100` (NOT 1.1^k — a
+    //            per-stack contribution scales its VALUE by the count,
+    //            see `simdef::BuffDef`).
+    //   charge_pulse  on_cast, chance `pulse_chance`, icd `pulse_icd`,
+    //            apply_buff `charge`.
+    //
+    // Application cadence with `pulse_chance` = "1", `pulse_icd` = 2, and
+    // `gen_cooldown` = 2 — the icd==cooldown trick, hand-traced:
+    //   t=0  charge_gen completes (instant, first rule) → on_cast roll,
+    //        icd clear → APPLY, icd_ready=2. filler then begins.
+    //   t=1  filler completes → on_cast roll, 1 < 2 → gated.
+    //   t=2  filler completes → on_cast roll, 2 >= 2 → APPLY,
+    //        icd_ready=4; THEN the decision casts charge_gen (off
+    //        cooldown at 2), whose own on_cast roll is now gated.
+    //   … so exactly ONE application every 2s: t=0,2,4,…,18 in a 20s sim
+    //   (the t=20 application lands exactly at the end and integrates to
+    //   zero seconds).
+    // Note the application at t=2 is physically the FILLER's on_cast, not
+    // the generator's — the trick only fixes the CADENCE at the
+    // generator's cooldown, which is all these pins need.
+    // icd==cooldown trick; Task 6 replaces this with ActionDef.apply_buff
+    // ══════════════════════════════════════════════════════════════════
+
+    fn stack_plan() -> Plan {
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["dmg"],
+                 "buckets": { "boost": { "fold": "product" } },
+                 "pipeline": [ { "name": "hit", "expr": "dmg * boost" },
+                               { "name": "dot", "expr": "dmg * 0.5" } ],
+                 "objectives": ["hit", "dot"] }"#,
+        )
+        .unwrap();
+        plan::compile(&def).unwrap()
+    }
+
+    fn stack_build() -> BuildState {
+        serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap()
+    }
+
+    /// The shared fixture described above. `charge` carries one `+10`
+    /// contribution to the `boost` product bucket.
+    fn stack_simdef(
+        on_reapply: ReapplyPolicy,
+        max_stacks: u32,
+        buff_duration: f64,
+        gen_cooldown: f64,
+        pulse_chance: &str,
+        pulse_icd: f64,
+    ) -> SimDef {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "charge_gen".to_string(),
+            ActionDef {
+                cast_time: "0".into(),
+                cooldown: NumOrExpr::Num(gen_cooldown),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: None,
+            },
+        );
+        actions.insert(
+            "filler".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let mut buffs = BTreeMap::new();
+        buffs.insert(
+            "charge".to_string(),
+            BuffDef {
+                duration: NumOrExpr::Num(buff_duration),
+                max_stacks,
+                on_reapply,
+                contributions: vec![Contribution {
+                    bucket: "boost".into(),
+                    value: 10.0,
+                    event: None,
+                    condition: None,
+                }],
+                conditions: BTreeMap::new(),
+                tick_objective: None,
+            },
+        );
+        let mut procs = BTreeMap::new();
+        procs.insert(
+            "charge_pulse".to_string(),
+            ProcDef {
+                trigger: Trigger::OnCast,
+                chance: pulse_chance.into(),
+                icd: pulse_icd,
+                apply_buff: Some("charge".into()),
+                cast_action: None,
+            },
+        );
+        SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs,
+            procs,
+            damage_objective: "hit".into(),
+        }
+    }
+
+    fn stack_rotation() -> Rotation {
+        Rotation {
+            rules: vec![
+                Rule {
+                    action: "charge_gen".into(),
+                    when: None,
+                },
+                Rule {
+                    action: "filler".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    fn twenty_second_dummy() -> Scenario {
+        serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // `add_refresh_all` (PoE2 charges): count +1 up to `max_stacks`, and
+    // EVERY instance's expiry reset to `now + duration` — one shared
+    // clock. duration 5, max_stacks 3, applications t=0,2,4,…,18.
+    //
+    //   t=0   push          → 1 instance,  all expire 5
+    //   t=2   push          → 2 instances, all expire 7
+    //   t=4   push          → 3 instances, all expire 9
+    //   t=6+  AT CAP: no new instance, but the shared clock still resets
+    //         (all expire 11, 13, …, 23) — so the stack never falls off
+    //         inside the 20s sim.
+    // Stack trajectory: 1 on [0,2), 2 on [2,4), 3 on [4,20].
+    //   avg_stacks = (1·2 + 2·2 + 3·16) / 20 = (2 + 4 + 48) / 20 = 2.7
+    //   buff_uptime = 20/20 = 1.0
+    //
+    // Per-hit (`boost` is a PRODUCT bucket, one +10 contribution scaled by
+    // the stack count): 1 stack → 100 × (1 + 10/100) = 110; 3 stacks →
+    // 100 × (1 + 30/100) = 130 (NOT 100 × 1.1³ = 133.1 — the count scales
+    // the contribution's VALUE, it does not repeat the contribution).
+    //
+    // Which hit sees which count: a cast's damage is measured BEFORE that
+    // cast's own procs roll, so the hit AT an application instant still
+    // reads the pre-application count.
+    //   t=1: 1 stack → 110      t=2: 1 stack → 110
+    //   t=3: 2 stacks → 120     t=4: 2 stacks → 120
+    //   t=5..20 (16 hits): 3 stacks → 130
+    //   total = 110 + 110 + 120 + 120 + 16×130 = 460 + 2080 = 2540
+    // ------------------------------------------------------------------
+    #[test]
+    fn add_refresh_all_stacks_to_the_cap_on_one_shared_clock() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+
+        let report = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &twenty_second_dummy(),
+            Mode::Expected,
+        )
+        .unwrap();
+
+        assert_eq!(report.actions["filler"].casts, 20);
+        assert!(
+            close(report.avg_stacks["charge"], 2.7),
+            "avg_stacks: got {} — want (1·2 + 2·2 + 3·16)/20 = 2.7",
+            report.avg_stacks["charge"]
+        );
+        assert!(
+            close(report.buff_uptime["charge"], 1.0),
+            "buff_uptime: got {} — the shared clock resets every 2s against \
+             a 5s duration, so `charge` never falls off",
+            report.buff_uptime["charge"]
+        );
+        assert!(
+            close(report.total.total_damage, 2540.0),
+            "total damage: got {} — want 110+110+120+120+16×130 = 2540 \
+             (per-hit 110 at 1 stack, 130 at 3 — NOT 133.1)",
+            report.total.total_damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The shared clock's other half: when applications STOP, all three
+    // instances fall off TOGETHER at (last application + duration).
+    //
+    // Same fixture, except applications stop after t=4. Stopping them is
+    // what needs a workaround today: the `charge_pulse` proc is `on_cast`
+    // and any action's cast triggers it, so lengthening `charge_gen`'s
+    // cooldown alone would NOT stop the filler from carrying the same
+    // cadence. A `chance` of `"time <= 4"` gates the proc off instead —
+    // 1 while the clock is ≤ 4, 0 after, so the EV accumulator stops
+    // banking anything at all.
+    // icd==cooldown trick; Task 6 replaces this with ActionDef.apply_buff
+    //
+    //   t=0 push → 1 instance,  all expire 5
+    //   t=2 push → 2 instances, all expire 7
+    //   t=4 push → 3 instances, all expire 9
+    //   t=6 chance 0 → no application ever again
+    //   t=9 ALL THREE expire at once → 0 stacks
+    // Stack trajectory: 1 on [0,2), 2 on [2,4), 3 on [4,9), 0 on [9,20].
+    //   avg_stacks  = (1·2 + 2·2 + 3·5) / 20 = (2 + 4 + 15) / 20 = 1.05
+    //   buff_uptime = 9 / 20 = 0.45
+    //
+    // If instances kept their OWN clocks instead (i.e. `add_independent`
+    // semantics leaking in) they would expire at 5, 7 and 9 — 3 stacks
+    // only on [4,5) — and avg_stacks would read (1·2+2·2+3·1+2·2+1·2)/20
+    // = 0.75 against the same 0.45 uptime.
+    // ------------------------------------------------------------------
+    #[test]
+    fn add_refresh_all_expires_every_instance_together() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "time <= 4", 2.0);
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+
+        let report = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &twenty_second_dummy(),
+            Mode::Expected,
+        )
+        .unwrap();
+
+        assert!(
+            close(report.buff_uptime["charge"], 0.45),
+            "buff_uptime: got {} — all three instances share one clock and \
+             expire together at 4+5=9, so 9/20 = 0.45",
+            report.buff_uptime["charge"]
+        );
+        assert!(
+            close(report.avg_stacks["charge"], 1.05),
+            "avg_stacks: got {} — want (1·2 + 2·2 + 3·5)/20 = 1.05",
+            report.avg_stacks["charge"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `add_independent` (PoE2 poison): every instance keeps its OWN
+    // duration, and at `max_stacks` the EARLIEST-EXPIRING instance is
+    // evicted to make room for the new one.
+    //
+    // max_stacks 2, duration 4, applications at t=0,1,2 (icd 1, and the
+    // same `"time <= 2"` gate as above stops them after t=2; `charge_gen`
+    // is parked on a 100s cooldown so it contributes only the t=0
+    // application and the filler carries t=1 and t=2).
+    // icd==cooldown trick; Task 6 replaces this with ActionDef.apply_buff
+    //
+    //   t=0 push       → [exp 4]           len 1
+    //   t=1 push       → [exp 4, exp 5]    len 2
+    //   t=2 AT CAP: evict the earliest-expiring (exp 4), push exp 6
+    //                  → [exp 5, exp 6]    len 2
+    //   t=5 exp-5 instance expires → [exp 6]  len 1
+    //   t=6 exp-6 instance expires → []       len 0
+    // Stack trajectory: 1 on [0,1), 2 on [1,5), 1 on [5,6), 0 on [6,20].
+    //   avg_stacks  = (1·1 + 2·4 + 1·1) / 20 = (1 + 8 + 1) / 20 = 0.5
+    //   buff_uptime = 6 / 20 = 0.3
+    //
+    // Evicting the NEWEST instead would leave [exp 4, exp 6]: same 0.3
+    // uptime, but avg_stacks (1·1 + 2·3 + 1·2)/20 = 0.45. Not evicting at
+    // all (cap ignored) would leave [4,5,6]: uptime 0.3, avg_stacks
+    // (1·1 + 2·1 + 3·2 + 2·1 + 1·1)/20 = 0.6. So `avg_stacks` is the
+    // assertion that actually pins the eviction rule.
+    // ------------------------------------------------------------------
+    #[test]
+    fn add_independent_evicts_the_earliest_expiring_at_the_cap() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let simdef = stack_simdef(
+            ReapplyPolicy::AddIndependent,
+            2,
+            4.0,
+            100.0,
+            "time <= 2",
+            1.0,
+        );
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+
+        let report = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &twenty_second_dummy(),
+            Mode::Expected,
+        )
+        .unwrap();
+
+        assert!(
+            close(report.avg_stacks["charge"], 0.5),
+            "avg_stacks: got {} — want (1·1 + 2·4 + 1·1)/20 = 0.5 (0.45 \
+             would mean the NEWEST instance was evicted; 0.6 would mean the \
+             cap was ignored)",
+            report.avg_stacks["charge"]
+        );
+        assert!(
+            close(report.buff_uptime["charge"], 0.3),
+            "buff_uptime: got {} — the last instance expires at 2+4=6, so 6/20 = 0.3",
+            report.buff_uptime["charge"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `stacks.<buff>` in a rotation `when`: a rule gated on
+    // `stacks.charge >= 3` cannot fire before the third instance lands.
+    //
+    // Same `add_refresh_all` fixture as the 2.7 pin (stacks reach 3 at
+    // t=4), plus a `nuke` action: instant, 1000s cooldown so it casts
+    // EXACTLY ONCE, and a `damage.stats` override of `dmg` to the
+    // expression `time` — so `actions["nuke"].damage` reads back the
+    // instant it cast, multiplied by the boost live at that instant.
+    //
+    // At t=4 the filler's completion applies the third instance, and only
+    // THEN does the decision loop run: `charge_gen` (first rule, off
+    // cooldown at 4) casts, then `nuke`'s `when` sees stacks = 3 and
+    // fires. Its damage is `time × (1 + 30/100)` = 4 × 1.3 = 5.2.
+    // A rule that ignored the gate would fire at t=0 (damage 0 × 1.0 =
+    // 0); one that mis-read `stacks` as `buff` (1 while active) likewise.
+    // ------------------------------------------------------------------
+    #[test]
+    fn stacks_symbol_gates_a_rotation_rule_until_the_third_instance() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let mut simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
+        let mut nuke_stats = BTreeMap::new();
+        nuke_stats.insert("dmg".to_string(), NumOrExpr::Expr("time".into()));
+        simdef.actions.insert(
+            "nuke".to_string(),
+            ActionDef {
+                cast_time: "0".into(),
+                cooldown: NumOrExpr::Num(1000.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage { stats: nuke_stats }),
+            },
+        );
+        let rotation = Rotation {
+            rules: vec![
+                Rule {
+                    action: "charge_gen".into(),
+                    when: None,
+                },
+                Rule {
+                    action: "nuke".into(),
+                    when: Some("stacks.charge >= 3".into()),
+                },
+                Rule {
+                    action: "filler".into(),
+                    when: None,
+                },
+            ],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+
+        let report = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &twenty_second_dummy(),
+            Mode::Expected,
+        )
+        .unwrap();
+
+        assert_eq!(report.actions["nuke"].casts, 1, "1000s cooldown, 20s sim");
+        assert!(
+            close(report.actions["nuke"].damage, 5.2),
+            "nuke damage: got {} — `dmg` is the expression `time`, so this \
+             reads back t × boost = 4 × 1.3 = 5.2 (a t=0 cast would read 0)",
+            report.actions["nuke"].damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A stacked DoT ticks at rate × STACK COUNT: k instances of the same
+    // non-snapshot `tick_objective` tick k times over.
+    //
+    // Same `add_refresh_all` fixture as the 2.7 pin, with `charge` also
+    // ticking the toy plan's `dot` objective (`dmg × 0.5` = 50/s at one
+    // stack — deliberately independent of `boost`, so the rate is a clean
+    // constant per stack).
+    //
+    //   DoT damage = 50 × ∫ stacks dt = 50 × (avg_stacks × duration)
+    //              = 50 × (2.7 × 20) = 50 × 54 = 2700
+    //   hits are unchanged at 2540, so total = 2540 + 2700 = 5240.
+    // A rate that ignored the stack count would tick a flat 50/s for the
+    // 20 active seconds = 1000, for a total of 3540.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_stacked_dot_ticks_at_rate_times_stack_count() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let mut simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
+        simdef.buffs.get_mut("charge").unwrap().tick_objective = Some("dot".into());
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+
+        let report = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &twenty_second_dummy(),
+            Mode::Expected,
+        )
+        .unwrap();
+
+        let hits: f64 = report.actions["filler"].damage;
+        assert!(close(hits, 2540.0), "hit damage moved: {hits}");
+        assert!(
+            close(report.total.total_damage - hits, 2700.0),
+            "DoT damage: got {} — want 50/s × 54 stack-seconds = 2700 \
+             (1000 would mean the rate ignored the stack count)",
+            report.total.total_damage - hits
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EV/MC agreement gate (P7 spec): the stack trajectory must be the
+    // SAME in both modes. With `chance: "1"` every application is
+    // certain, so this is exact rather than statistical — MC's per-roll
+    // `rng.next_f64() < 1.0` is always true (`next_f64` is in [0,1)), and
+    // the plan has no events for `evaluate_phase_sampled` to branch on.
+    // Both modes must therefore land on the same 2.7.
+    // ------------------------------------------------------------------
+    #[test]
+    fn stack_trajectory_agrees_between_ev_and_monte_carlo() {
+        let plan = stack_plan();
+        let build = stack_build();
+        let simdef = stack_simdef(ReapplyPolicy::AddRefreshAll, 3, 5.0, 2.0, "1", 2.0);
+        let sim_plan = sim_compile(&plan, &simdef, &stack_rotation()).unwrap();
+        let scenario = twenty_second_dummy();
+
+        let ev = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        let mc = run(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            Mode::MonteCarlo {
+                iterations: 8,
+                seed: 7,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            close(ev.avg_stacks["charge"], 2.7) && close(mc.avg_stacks["charge"], 2.7),
+            "EV {} vs MC {} — both must be 2.7",
+            ev.avg_stacks["charge"],
+            mc.avg_stacks["charge"]
+        );
+        assert!(
+            close(ev.total.total_damage, mc.total.total_damage),
+            "EV {} vs MC {} total damage",
+            ev.total.total_damage,
+            mc.total.total_damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Degenerate guard, stated as a test rather than left implicit: a
+    // 0.2.0 binary buff (`max_stacks: 1`, `on_reapply: refresh` — the
+    // serde defaults) is exactly a one-instance buff, so its `avg_stacks`
+    // and its `buff_uptime` are the SAME number. Reuses the P6d proc
+    // fixture whose 0.05 uptime is already hand-worked above.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_binary_buffs_avg_stacks_equals_its_uptime() {
+        let plan = minimal_plan();
+        let build = minimal_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
+        let simdef = filler_simdef(ProcDef {
+            trigger: Trigger::OnHit,
+            chance: "0.3".into(),
+            icd: 4.0,
+            apply_buff: Some("proc_buff".into()),
+            cast_action: None,
+        });
+        let sim_plan = sim_compile(&plan, &simdef, &filler_rotation()).unwrap();
+
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert!(
+            close(report.avg_stacks["proc_buff"], 0.05),
+            "got {} — one instance at a time, so this must equal the \
+             hand-worked 0.05 uptime",
+            report.avg_stacks["proc_buff"]
+        );
+        assert!(close(
+            report.avg_stacks["proc_buff"],
+            report.buff_uptime["proc_buff"]
+        ));
     }
 }

@@ -7,7 +7,7 @@
 use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
-use crate::simdef::{NumOrExpr, Rotation, SimDef, Trigger};
+use crate::simdef::{NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
 /// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
@@ -126,18 +126,28 @@ pub struct CompiledAction {
 pub struct CompiledBuff {
     /// This buff's name.
     pub name: String,
-    /// Duration in seconds once applied (refresh-on-reapply resets to
-    /// this value) — evaluated at EACH application and snapshotted onto
-    /// that window (see [`crate::simdef::NumOrExpr`]).
+    /// Duration in seconds once applied — evaluated at EACH application
+    /// and snapshotted onto the instance it starts (see
+    /// [`crate::simdef::NumOrExpr`]).
     pub duration: CompiledValue,
-    /// Bucket contributions active while this buff is up.
+    /// Bucket contributions active while this buff is up; each value is
+    /// folded MULTIPLIED BY the live stack count (see
+    /// [`crate::simdef::BuffDef`]).
     pub contributions: Vec<Contribution>,
     /// Condition name → value while this buff is active (wins over the
-    /// scenario's static uptime for that condition while active).
+    /// scenario's static uptime for that condition while active). NOT
+    /// scaled by the stack count — see [`crate::simdef::BuffDef`].
     pub conditions: std::collections::BTreeMap<String, f64>,
     /// Resolved index into the `Plan`'s objective slice for
     /// `tick_objective`, if this buff DoT-ticks.
     pub tick_objective: Option<usize>,
+    /// Maximum live instances; `0` = unbounded (see
+    /// [`crate::simdef::BuffDef::max_stacks`]).
+    pub max_stacks: u32,
+    /// What an application does when this buff is already active (see
+    /// [`ReapplyPolicy`]). [`ReapplyPolicy::Strongest`] never reaches
+    /// here — [`compile`] rejects it (P7c-T2).
+    pub on_reapply: ReapplyPolicy,
 }
 
 /// What a firing [`crate::simdef::ProcDef`] does, resolved to an index —
@@ -215,8 +225,8 @@ pub struct SimPlan {
 /// Compile-time symbol table over the extended sim space: the `Plan`'s own
 /// flat namespace (stats + conditions ONLY — buckets/stages stay
 /// invisible), plus `time`/`duration`/resources/`cooldown.*`/`buff.*`/
-/// `buff_remaining.*`/`casts.*`, laid out in the documented order (see
-/// `sim` module docs).
+/// `buff_remaining.*`/`casts.*`/`stacks.*`, laid out in the documented
+/// order (see `sim` module docs).
 struct SimSymbols<'a> {
     plan: &'a Plan,
     time_slot: usize,
@@ -229,6 +239,7 @@ struct SimSymbols<'a> {
     buff_base: usize,
     buff_remaining_base: usize,
     casts_base: usize,
+    stacks_base: usize,
 }
 
 impl<'a> SimSymbols<'a> {
@@ -242,6 +253,7 @@ impl<'a> SimSymbols<'a> {
         let buff_base = cooldown_base + action_names.len();
         let buff_remaining_base = buff_base + buff_names.len();
         let casts_base = buff_remaining_base + buff_names.len();
+        let stacks_base = casts_base + action_names.len();
         SimSymbols {
             plan,
             time_slot: base,
@@ -254,6 +266,7 @@ impl<'a> SimSymbols<'a> {
             buff_base,
             buff_remaining_base,
             casts_base,
+            stacks_base,
         }
     }
 
@@ -262,7 +275,7 @@ impl<'a> SimSymbols<'a> {
     }
 
     fn slot_width(&self) -> usize {
-        self.casts_base + self.action_names.len()
+        self.stacks_base + self.buff_names.len()
     }
 }
 
@@ -304,6 +317,13 @@ impl Symbols for SimSymbols<'_> {
                 .iter()
                 .position(|a| *a == rest)
                 .map(|i| (self.casts_base + i) as u16);
+        }
+        if let Some(rest) = name.strip_prefix("stacks.") {
+            return self
+                .buff_names
+                .iter()
+                .position(|b| *b == rest)
+                .map(|i| (self.stacks_base + i) as u16);
         }
         // Fall back to the plan's OWN flat namespace: stats + conditions
         // only. Buckets and pipeline stages are never registered here, so
@@ -381,7 +401,8 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
-    // Buffs: tick_objective must name a plan objective.
+    // Buffs: tick_objective must name a plan objective, and the stack
+    // policy must be one this engine actually honors.
     for (name, buff) in &simdef.buffs {
         if let Some(t) = &buff.tick_objective {
             if !objective_names.iter().any(|o| o == t) {
@@ -389,6 +410,27 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                     what: format!("buff `{name}`: tick_objective `{t}` is not a plan objective"),
                 });
             }
+        }
+        if buff.on_reapply == ReapplyPolicy::Strongest {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{name}`: on_reapply `strongest` requires a snapshot \
+                     tick_objective (see P7c-T2)"
+                ),
+            });
+        }
+        // `refresh` keeps exactly one instance by construction, so any
+        // other `max_stacks` alongside it is a config the author got
+        // wrong — say so rather than silently ignore the number.
+        if buff.on_reapply == ReapplyPolicy::Refresh && buff.max_stacks != 1 {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{name}`: on_reapply `refresh` keeps exactly one instance, \
+                     so max_stacks must be 1 (got {}) — use `add_refresh_all` or \
+                     `add_independent` to stack",
+                    buff.max_stacks
+                ),
+            });
         }
     }
 
@@ -509,6 +551,8 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             contributions: b.contributions.clone(),
             conditions: b.conditions.clone(),
             tick_objective,
+            max_stacks: b.max_stacks,
+            on_reapply: b.on_reapply,
         });
     }
 
@@ -566,7 +610,9 @@ mod tests {
     use super::*;
     use crate::gamedef::GameDef;
     use crate::plan;
-    use crate::simdef::{ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ResourceDef, Rule};
+    use crate::simdef::{
+        ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ReapplyPolicy, ResourceDef, Rule,
+    };
     use std::collections::BTreeMap;
 
     /// A small toy `Plan` with enough stats/conditions/objectives to
@@ -639,6 +685,8 @@ mod tests {
             "vuln_window".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(4.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: vuln_conditions,
                 tick_objective: None,
@@ -648,6 +696,8 @@ mod tests {
             "combustion".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(8.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: vec![Contribution {
                     bucket: "indep".into(),
                     value: 25.0,
@@ -662,6 +712,8 @@ mod tests {
             "burning".to_string(),
             BuffDef {
                 duration: NumOrExpr::Num(6.0),
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: Some("dot_dps".into()),
@@ -749,8 +801,9 @@ mod tests {
 
         assert_eq!(sp.sim_base, plan.own_slot_width());
         // sim segment: time, duration, mana(1), cooldown.*(2),
-        // buff.*(3), buff_remaining.*(3), casts.*(2) = 2+1+2+3+3+2 = 13
-        assert_eq!(sp.slot_width, sp.sim_base + 13);
+        // buff.*(3), buff_remaining.*(3), casts.*(2), stacks.*(3)
+        //   = 2+1+2+3+3+2+3 = 16  (P7c appended the `stacks.*` sub-range)
+        assert_eq!(sp.slot_width, sp.sim_base + 16);
     }
 
     #[test]
@@ -838,6 +891,70 @@ mod tests {
         simdef.damage_objective = "hidden_stage".into();
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("hidden_stage"), "got: {}", e.what);
+    }
+
+    // P7c: `strongest` needs a magnitude to compare instances by, which
+    // is the snapshot `tick_objective` P7c-T2 adds. Until then the
+    // vocabulary is complete but honest — naming it is a positioned
+    // compile error, never a silent fallback to another policy.
+    #[test]
+    fn on_reapply_strongest_is_rejected_until_snapshot_ticks_land() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.buffs.get_mut("burning").unwrap().on_reapply = ReapplyPolicy::Strongest;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("burning"), "got: {}", e.what);
+        assert!(e.what.contains("strongest"), "got: {}", e.what);
+        assert!(e.what.contains("P7c-T2"), "got: {}", e.what);
+    }
+
+    // `refresh` keeps exactly one instance by construction, so a
+    // `max_stacks` other than 1 alongside it is a config mistake — say so
+    // rather than accept the number and ignore it.
+    #[test]
+    fn refresh_with_a_max_stacks_other_than_one_is_rejected() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.buffs.get_mut("combustion").unwrap().max_stacks = 5;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("combustion"), "got: {}", e.what);
+        assert!(e.what.contains("max_stacks"), "got: {}", e.what);
+        // `0` means unbounded, which `refresh` can honor even less.
+        simdef.buffs.get_mut("combustion").unwrap().max_stacks = 0;
+        assert!(compile(&plan, &simdef, &valid_rotation()).is_err());
+    }
+
+    // A stacking policy takes any cap, INCLUDING 0 (= unbounded).
+    #[test]
+    fn stacking_policies_accept_a_cap_and_unbounded() {
+        let plan = toy_plan();
+        for (policy, cap) in [
+            (ReapplyPolicy::AddRefreshAll, 3),
+            (ReapplyPolicy::AddIndependent, 0),
+        ] {
+            let mut simdef = valid_simdef();
+            let b = simdef.buffs.get_mut("combustion").unwrap();
+            b.on_reapply = policy;
+            b.max_stacks = cap;
+            let sp = compile(&plan, &simdef, &valid_rotation()).unwrap();
+            assert_eq!(sp.buffs[1].name, "combustion");
+            assert_eq!(sp.buffs[1].max_stacks, cap);
+            assert_eq!(sp.buffs[1].on_reapply, policy);
+        }
+    }
+
+    // `stacks.<buff>` joins the same prefixed sub-space as `buff.<buff>`;
+    // an unknown buff behind the prefix stays fail-closed.
+    #[test]
+    fn stacks_symbol_resolves_for_a_known_buff_only() {
+        let plan = toy_plan();
+        let mut rotation = valid_rotation();
+        rotation.rules[1].when = Some("stacks.combustion >= 2".into());
+        assert!(compile(&plan, &valid_simdef(), &rotation).is_ok());
+
+        rotation.rules[1].when = Some("stacks.nonesuch >= 2".into());
+        let e = compile(&plan, &valid_simdef(), &rotation).unwrap_err();
+        assert!(e.what.contains("stacks.nonesuch"), "got: {}", e.what);
     }
 
     #[test]

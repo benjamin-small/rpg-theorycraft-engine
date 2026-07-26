@@ -18,7 +18,22 @@ pub struct SimReport {
     pub actions: BTreeMap<String, ActionReport>,
     /// Computed fraction of the sim's total duration each buff was
     /// active, keyed by buff name (`active_seconds / total duration`).
+    /// "Active" means AT LEAST ONE live instance — a 3-stack buff and a
+    /// 1-stack buff both read `1.0` here; [`SimReport::avg_stacks`] is
+    /// where the count shows up.
     pub buff_uptime: BTreeMap<String, f64>,
+    /// Computed TIME-INTEGRATED mean stack count of each buff over the
+    /// sim's total duration, keyed by buff name (`∫ stacks dt / total
+    /// duration`) — the counted companion to [`SimReport::buff_uptime`],
+    /// integrated the same way and over the same whole-sim window (not
+    /// per phase, and not conditioned on the buff being up: seconds at
+    /// zero stacks drag the mean down exactly as they should).
+    ///
+    /// For a buff that never stacks this equals its `buff_uptime`. For a
+    /// stacking one the two answer different questions: a buff up the
+    /// whole fight at 3 stacks reads `buff_uptime` `1.0` and `avg_stacks`
+    /// `3.0`.
+    pub avg_stacks: BTreeMap<String, f64>,
     /// Computed fraction-weighted value each condition held over the
     /// sim's total duration, keyed by condition name. While a buff drives
     /// a condition it WINS over the scenario's static uptime for that

@@ -43,6 +43,33 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `CompiledAction`/`CompiledBuff` fields for these five hold it instead of
   `f64`.
 
+- **Buff stacks and reapply policies (P7c-T1).** A buff is now internally
+  an INSTANCE LIST, and `BuffDef` gains `max_stacks` (default `1`; `0` =
+  unbounded) and `on_reapply` (`refresh` | `add_refresh_all` |
+  `add_independent` | `strongest`, default `refresh`). Every 0.2.0 config
+  names neither field and gets exactly its old behavior: `refresh` with
+  one instance IS the binary buff, and the `diablo4_rotation` pins hold
+  byte for byte (225199.1088 / 3753.31848 / 0.4, MC block included).
+
+  `add_refresh_all` counts up to the cap and resets EVERY instance's
+  expiry (one shared clock — PoE2 charges); `add_independent` gives each
+  instance its own duration and, at the cap, evicts the earliest-expiring
+  one (PoE2 poison). `strongest` parses but is a fail-closed compile error
+  until snapshot ticks land (P7c-T2), and `refresh` alongside a
+  `max_stacks` other than `1` is likewise rejected rather than silently
+  ignored.
+
+  What a stack count scales, and what it deliberately does not:
+  `contributions` fold with their VALUE multiplied by the count (3 stacks
+  of `+10` in a `product` bucket read `×1.30`, not `×1.10³`) and a
+  `tick_objective` ticks at rate × count; `conditions` are driven at their
+  full configured value while ANY instance is live and are never scaled by
+  it. New symbol `stacks.<buff>` (the count) joins `buff.<buff>` (`1`
+  while any instance is live) and `buff_remaining.<buff>`, which is now
+  the LONGEST remaining window across live instances. `SimReport` gains
+  `avg_stacks` — the time-integrated mean stack count, `buff_uptime`'s
+  counted companion.
+
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated
   against a slot array whose time-varying tail (`buff.*`,

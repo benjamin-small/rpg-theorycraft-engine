@@ -17,9 +17,16 @@
 //! - each resource, by its bare name — the resource's current amount.
 //! - `cooldown.<action>` — seconds remaining before `<action>` is off
 //!   cooldown (`0` = ready).
-//! - `buff.<buff>` — `1.0` while `<buff>` is active, else `0.0`.
-//! - `buff_remaining.<buff>` — seconds remaining on `<buff>`'s duration.
+//! - `buff.<buff>` — `1.0` while `<buff>` has at least one live instance,
+//!   else `0.0`. Never the stack count, however many instances are live.
+//! - `buff_remaining.<buff>` — seconds remaining on the LONGEST-lived of
+//!   `<buff>`'s live instances (`0.0` when inactive). With one instance
+//!   that is simply "seconds left"; with several independently-expiring
+//!   ones it is the last to fall off, not the next.
 //! - `casts.<action>` — number of times `<action>` has been cast so far.
+//! - `stacks.<buff>` — `<buff>`'s live instance count as an `f64` (`0`
+//!   when inactive). The counted companion to `buff.<buff>`; see
+//!   [`crate::simdef::BuffDef`] for what a stack count scales.
 //!
 //! Five further fields are expression-valued (P7b) and compile against
 //! this SAME space, each evaluated at its own documented instant rather
@@ -48,7 +55,7 @@
 //!
 //! ```text
 //! [ time, duration, resources…, cooldown.<action>…, buff.<buff>…,
-//!   buff_remaining.<buff>…, casts.<action>… ]
+//!   buff_remaining.<buff>…, casts.<action>…, stacks.<buff>… ]
 //! ```
 
 mod compile;

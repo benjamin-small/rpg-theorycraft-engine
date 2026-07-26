@@ -203,9 +203,64 @@ pub struct ActionDamage {
     pub stats: BTreeMap<String, NumOrExpr>,
 }
 
+/// What happens when a buff is applied while it is ALREADY active — the
+/// per-mechanic collapse of the engine's unified instance list (see the
+/// P7 design spec's "Stack model — Approach B" decision).
+///
+/// The default, [`ReapplyPolicy::Refresh`], is rtce 0.2.0's only behavior:
+/// a buff is one window, and reapplying it resets that window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReapplyPolicy {
+    /// One instance, its expiry reset to `now + duration`. The binary
+    /// buff — and the degenerate case of the whole instance model, which
+    /// is why it is the default and why [`BuffDef::max_stacks`] must be
+    /// `1` alongside it.
+    #[default]
+    Refresh,
+    /// Count `+1` up to [`BuffDef::max_stacks`], then EVERY instance's
+    /// expiry is reset to `now + duration` — one shared clock, so the
+    /// whole stack falls off together (PoE2 charges). At the cap no new
+    /// instance is added, but the shared clock is still reset.
+    AddRefreshAll,
+    /// A new instance with its OWN duration, expiring independently
+    /// (PoE2 poison). At [`BuffDef::max_stacks`] the earliest-expiring
+    /// instance is evicted to make room.
+    AddIndependent,
+    /// A new instance replaces the incumbent only if its snapshot rate is
+    /// higher (PoE2 ignite). Needs a magnitude to compare, so it requires
+    /// a snapshot `tick_objective` — NOT YET IMPLEMENTED (P7c-T2): naming
+    /// it is a fail-closed compile error today, so the vocabulary is
+    /// complete without the engine pretending to honor it.
+    Strongest,
+}
+
 /// One buff/debuff: a timed window that, while active, contributes to
 /// buckets, drives condition values, and/or accrues a DoT objective.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// A buff is internally an INSTANCE LIST (P7c): every application pushes,
+/// refreshes, or replaces an instance per [`BuffDef::on_reapply`], and the
+/// live instance count is the buff's stack count. What that count scales,
+/// and what it deliberately does NOT:
+///
+/// - **`contributions`** — each contribution's VALUE is multiplied by the
+///   stack count. In a `summed_group` bucket 3 stacks of `+10` fold as
+///   `+30`; in a `product` bucket they fold as `×(1 + 30/100)`, NOT
+///   `×(1 + 10/100)³`. A per-stack effect is written once, at its
+///   per-stack magnitude.
+/// - **`conditions`** — driven at their FULL configured value while at
+///   least one instance is live, and never scaled by the stack count. A
+///   condition is an uptime fraction (`vulnerable = 1.0`), not a
+///   quantity, so "3 stacks of vulnerable" has no meaning; the precedence
+///   rule (an active buff wins over the scenario's static uptime) is
+///   unchanged from 0.2.0.
+/// - **`tick_objective`** — the DoT rate is multiplied by the stack count.
+/// - **`buff.<name>`** — `1` while ANY instance is live (never the count;
+///   `stacks.<name>` is the count). **`buff_remaining.<name>`** — the
+///   LONGEST remaining window across live instances, which under
+///   [`ReapplyPolicy::AddIndependent`] is the newest instance's, not the
+///   one that expires next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuffDef {
     /// Seconds this buff lasts once applied (refresh-on-reapply resets
     /// the remaining duration back to this value).
@@ -249,9 +304,50 @@ pub struct BuffDef {
     #[serde(default)]
     pub conditions: BTreeMap<String, f64>,
     /// A `Plan` objective name: while this buff is active, its value ×
-    /// active-seconds accrues into the sim's damage total (DoT ticking).
+    /// active-seconds × STACK COUNT accrues into the sim's damage total
+    /// (DoT ticking).
     #[serde(default)]
     pub tick_objective: Option<String>,
+    /// How many instances may be live at once. `0` means UNBOUNDED (a
+    /// poison stream that only expiry ever trims). Defaults to `1`, which
+    /// with the default [`ReapplyPolicy::Refresh`] is exactly rtce
+    /// 0.2.0's binary buff — so every 0.2.0 config keeps its behavior
+    /// without naming either field.
+    ///
+    /// `refresh` keeps exactly one instance by definition, so a
+    /// `max_stacks` other than `1` alongside it is a fail-closed compile
+    /// error rather than a silently-ignored number.
+    #[serde(default = "default_max_stacks")]
+    pub max_stacks: u32,
+    /// What an application does when this buff is already active — see
+    /// [`ReapplyPolicy`]. Defaults to [`ReapplyPolicy::Refresh`].
+    #[serde(default)]
+    pub on_reapply: ReapplyPolicy,
+}
+
+/// `1` — one live instance, the 0.2.0 binary buff (see
+/// [`BuffDef::max_stacks`]). A free function because `#[serde(default)]`
+/// on an integer field would otherwise mean `0`, which this field spells
+/// "unbounded".
+fn default_max_stacks() -> u32 {
+    1
+}
+
+/// `max_stacks: 1`, `on_reapply: refresh` — the 0.2.0 binary buff, matching
+/// what serde fills in for a config that names neither field. Hand-written
+/// rather than derived precisely because a derived `u32` default would be
+/// `0` ("unbounded").
+impl Default for BuffDef {
+    fn default() -> Self {
+        BuffDef {
+            duration: NumOrExpr::default(),
+            contributions: Vec::new(),
+            conditions: BTreeMap::new(),
+            tick_objective: None,
+            max_stacks: default_max_stacks(),
+            on_reapply: ReapplyPolicy::default(),
+        }
+    }
 }
 
 /// What event a [`ProcDef`] rolls its chance against.
@@ -446,6 +542,57 @@ mod tests {
         let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
         assert_eq!(round.actions["fireball"].cooldown, fireball.cooldown);
         assert_eq!(round.actions["fireball"].gain["mana"], NumOrExpr::Num(40.0));
+    }
+
+    // P7c backward-compatibility contract at the parse layer: a 0.2.0
+    // config names neither stack field, and must come out as exactly the
+    // binary buff — ONE instance, refreshed on reapplication.
+    #[test]
+    fn omitted_stack_fields_default_to_one_instance_and_refresh() {
+        let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
+        for name in ["vuln_window", "combustion", "burning"] {
+            assert_eq!(def.buffs[name].max_stacks, 1, "{name}");
+            assert_eq!(def.buffs[name].on_reapply, ReapplyPolicy::Refresh, "{name}");
+        }
+        // …and the same for `BuffDef::default()`, which must NOT inherit
+        // `u32`'s `0` (this field spells `0` "unbounded").
+        assert_eq!(BuffDef::default().max_stacks, 1);
+        assert_eq!(BuffDef::default().on_reapply, ReapplyPolicy::Refresh);
+    }
+
+    #[test]
+    fn stack_fields_parse_and_round_trip_in_snake_case() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "buffs": {
+                "charge":  { "duration": 5.0, "max_stacks": 3,
+                             "on_reapply": "add_refresh_all" },
+                "poison":  { "duration": 8.0, "max_stacks": 0,
+                             "on_reapply": "add_independent" },
+                "ignite":  { "duration": 4.0, "on_reapply": "strongest" }
+              },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(def.buffs["charge"].max_stacks, 3);
+        assert_eq!(def.buffs["charge"].on_reapply, ReapplyPolicy::AddRefreshAll);
+        assert_eq!(def.buffs["poison"].max_stacks, 0); // 0 = unbounded
+        assert_eq!(
+            def.buffs["poison"].on_reapply,
+            ReapplyPolicy::AddIndependent
+        );
+        // `strongest` PARSES — the vocabulary is complete; `sim::compile`
+        // is where it is honestly rejected (see that module's tests).
+        assert_eq!(def.buffs["ignite"].on_reapply, ReapplyPolicy::Strongest);
+        assert_eq!(def.buffs["ignite"].max_stacks, 1);
+
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(
+            round.buffs["charge"].on_reapply,
+            ReapplyPolicy::AddRefreshAll
+        );
+        assert_eq!(round.buffs["poison"].max_stacks, 0);
     }
 
     #[test]
