@@ -171,15 +171,48 @@ until then, per semver's "anything goes" pre-1.0 clause).
   3753.31848 / 0.4, and each action's own damage). Its Monte Carlo block
   DID move — mean 3743.0759 / std 210.1306 → 3746.6413 / 211.4556 —
   because the deleted proc used to consume one RNG draw per off-ICD
-  `on_cast` roll (6 per iteration), and removing them re-phases which
-  crit sample lands on which cast. Same distribution, different phase:
-  both means sit within 0.2% of the EV pin.
+  `on_cast` roll (SEVEN per iteration; six of them stream-relevant, the
+  seventh landing at `duration` with nothing sampling after it), and
+  removing them re-phases which crit sample lands on which cast. Same
+  distribution, different phase: both means sit within 0.2% of the EV
+  pin.
+
+  That seventh fire is worth naming, because it IS the trap: the old
+  proc fired six times on Frost Nova as intended and a seventh time at
+  t=60 on the Fireball/Firebolt completing exactly at `duration`, whose
+  ICD had just cleared. The old config therefore applied `vuln_window`
+  seven times where `apply_buff` applies it six, and the uptime pin only
+  survived because the seventh window opened at the fight boundary and
+  integrated to zero seconds. "icd equals the gating action's cooldown"
+  never meant "only that action" — it meant "at most one per
+  cooldown-length, whoever happens to trigger it".
+
+  Within one `apply_buff` list there is a deliberate asymmetry, and it is
+  the surprising part: a `duration` EXPRESSION is sequential (it reads sim
+  state, so a later entry sees earlier entries' stack counts) while a
+  snapshot magnitude is FROZEN at the world the cast found (it reads a
+  build, captured once before the list runs, so a later entry does not see
+  earlier entries' `contributions`). Freezing is what makes the damaging
+  and utility paths agree — a damaging action freezes its overlay, a
+  utility action freezes the plain effective build, and the same list now
+  means the same thing on both.
 
   New public API: `CompiledAction::apply_buff` (`Vec<usize>`) and
   `CompiledProc::actions` (`Option<Vec<usize>>`), both resolved to
-  indices. Every 0.2.0 config parses and behaves unchanged — an action
-  that names no `apply_buff` applies nothing, and a proc that names no
-  `actions` considers every action.
+  indices; `CompiledAction` and `CompiledProc` are now
+  `#[non_exhaustive]`, joining `CompiledValue` and the `sim::report`
+  types (the CONFIG types they mirror are deliberately not marked — a
+  caller building a `SimDef` in Rust should be able to write a struct
+  literal).
+
+  Every 0.2.0 config parses and behaves unchanged — an action that names
+  no `apply_buff` applies nothing, and a proc that names no `actions`
+  considers every action. **Caveat for Rust downstreams:** that is a
+  statement about JSON. Adding a field to `ActionDef` and `ProcDef` is
+  SOURCE-breaking for anyone constructing either with an exhaustive struct
+  literal (this repo's own 53-literal churn is the proof). Permitted under
+  0.x, but an upgrader deserves the warning; add `apply_buff: Vec::new()`
+  / `actions: None`, or switch to `..Default::default()` on `ActionDef`.
 
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated

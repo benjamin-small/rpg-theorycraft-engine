@@ -47,12 +47,11 @@
 //! Two further fields are cross-REFERENCES rather than expressions, and
 //! `sim::compile` resolves both to indices, fail-closed (P7d):
 //! [`crate::simdef::ActionDef::apply_buff`] (buffs the action applies at
-//! cast complete, before any of that cast's proc rolls) and
-//! [`crate::simdef::ProcDef::actions`] (a trigger filter naming the
-//! actions whose casts this proc considers; `None` = all of them, the
-//! 0.2.0 behavior). An unknown name in either — or an EMPTY `actions`
-//! list, which would describe a proc that can never fire — is a compile
-//! error.
+//! cast complete) and [`crate::simdef::ProcDef::actions`] (a trigger
+//! filter naming the actions whose casts this proc considers; `None` =
+//! all of them, the 0.2.0 behavior). An unknown name in either — or an
+//! EMPTY `actions` list, which would describe a proc that can never
+//! fire — is a compile error.
 //!
 //! Pipeline STAGES and buckets are deliberately absent from this space —
 //! a sim expression referencing one is a fail-closed "unknown identifier"
@@ -61,6 +60,45 @@
 //! colliding with an existing stat or condition, or reusing the reserved
 //! `time`/`duration` words, is a compile error rather than a silent
 //! shadow.
+//!
+//! # The cast-complete order
+//!
+//! A completing cast resolves several effects at ONE instant, and their
+//! order is observable — a `damage.stats` expression, a proc `chance`,
+//! and a snapshot capture can each read state an earlier step wrote. It
+//! is therefore fixed, and this is the canonical statement of it (every
+//! other mention in this crate links here):
+//!
+//! ```text
+//! apply `gain`  →  casts.<action> += 1
+//!   →  evaluate `damage.stats`, measure and credit the hit
+//!   →  apply_buff, in list order
+//!   →  proc rolls: on_cast, then on_hit, then on_crit
+//! ```
+//!
+//! Reading it off, in the order a config author trips over them:
+//!
+//! - A `damage.stats` expression sees a resource at its POST-`gain`
+//!   amount, and `casts.<this action>` counts from `1` on the first cast.
+//! - The cast does NOT benefit from anything it applies — neither its own
+//!   `apply_buff` nor a buff one of its procs applies. A hit cannot be
+//!   changed by what it causes.
+//! - A proc rolled by this cast DOES see the cast's `apply_buff`
+//!   (`buff.<applied>` reads `1` in its `chance`). Intrinsic effects of
+//!   the action resolve before effects merely TRIGGERED by it, so the
+//!   whole `apply_buff` list precedes the whole proc batch and the two
+//!   never interleave, whatever the procs' name order.
+//! - Within one `apply_buff` list, a `duration` expression IS sequential
+//!   (it reads sim state, so a later entry sees earlier entries' STACK
+//!   COUNTS) while a snapshot [`crate::simdef::TickObjective`] magnitude
+//!   is FROZEN at the world the cast found (it reads a build, and that
+//!   build is captured once before the list runs, so a later entry does
+//!   NOT see earlier entries' CONTRIBUTIONS). Both halves are pinned.
+//!
+//! A proc-triggered FREE cast ([`crate::simdef::ProcDef::cast_action`])
+//! runs `gain` → damage → `apply_buff` at the firing proc's instant, and
+//! skips the rest of the cast pipeline: no cost, no cooldown, and no
+//! further proc rolls (which is what bounds proc recursion).
 //!
 //! # Sim slot layout
 //!

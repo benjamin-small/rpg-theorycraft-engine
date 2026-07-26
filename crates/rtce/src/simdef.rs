@@ -186,40 +186,61 @@ pub struct ActionDef {
     /// per-action buff application out of a globally-triggered
     /// [`ProcDef`].
     ///
-    /// # Where it lands inside the completion instant
+    /// # Where it lands
     ///
-    /// AFTER this cast's own damage has been measured and credited, and
-    /// BEFORE any of this cast's proc rolls. Two consequences, both
-    /// deliberate:
+    /// AFTER this cast's own damage is measured and credited, and BEFORE
+    /// any of this cast's proc rolls — see the [`crate::sim`] module docs
+    /// for the full cast-complete order and what each step can see. The
+    /// two consequences worth knowing here: the applying cast does NOT
+    /// benefit from the buff it applies, and a proc rolled by that cast
+    /// DOES see it.
     ///
-    /// - The applying cast does NOT benefit from the buff it applies —
-    ///   the same rule [`ActionDamage::stats`] states for procs ("a proc
-    ///   triggered by a hit cannot change what that hit was").
-    /// - A proc rolled by this cast DOES see it: a `chance` expression
-    ///   naming `buff.<applied>` reads `1`. Intrinsic effects resolve
-    ///   before triggered ones, so the whole `apply_buff` list precedes
-    ///   the whole proc batch and never interleaves with it (a proc-
-    ///   applied buff at the same instant therefore always lands second,
-    ///   whatever the procs' name order).
+    /// # Within one list
     ///
     /// Entries are applied in LIST order, and a name repeated in the list
     /// is applied that many times — under `add_independent` that is two
     /// instances; under `refresh` the second application simply replaces
     /// the first.
     ///
-    /// A SNAPSHOT [`TickObjective`] captures under the CASTING ACTION'S
-    /// overlay — the effective build with this action's
-    /// [`ActionDamage::stats`] applied — so an ailment inherits the
-    /// magnitude of the hit that applied it. A utility action (no
-    /// `damage`) has no overlay and captures the plain effective build.
-    /// The PROC path is deliberately unchanged: a proc-applied buff still
-    /// captures the effective build, with no action's overlay on it.
+    /// Two things a later entry can see, and one it cannot. This
+    /// asymmetry is real, deliberate, and the most surprising thing on
+    /// this field:
+    ///
+    /// - A [`BuffDef::duration`] EXPRESSION is SEQUENTIAL. It reads sim
+    ///   state, which is refreshed per application, so a later entry sees
+    ///   earlier entries' live windows and STACK COUNTS —
+    ///   `"2 * (1 + stacks.earlier)"` works and means what it says.
+    /// - A SNAPSHOT [`TickObjective`] magnitude is FROZEN. It reads a
+    ///   BUILD, and that build is captured ONCE before the list runs, so a
+    ///   later entry does NOT see earlier entries' `contributions`. An
+    ///   `["empower", "ailment"]` list does not give the ailment
+    ///   `empower`'s multiplier; put `empower` on an earlier CAST if that
+    ///   is what you want.
+    ///
+    /// The frozen build is the whole cast's, which makes the two action
+    /// paths agree: a DAMAGING action freezes its
+    /// [`ActionDamage::stats`] overlay (so an ailment inherits the
+    /// magnitude of the hit that applied it — PoE2 semantics), and a
+    /// UTILITY action, which runs no damage query, freezes the plain
+    /// effective build. The PROC path is deliberately different and
+    /// unchanged: a proc-applied buff captures the ambient effective
+    /// build, with no action's overlay on it.
+    ///
+    /// # Elsewhere
     ///
     /// Applied by a proc-triggered FREE cast of this action
-    /// ([`ProcDef::cast_action`]) too — `apply_buff` is an effect OF the
-    /// action, like `gain` and `damage`, not part of the cast pipeline
-    /// (cost, cooldown, further proc rolls) that the free-cast path
-    /// deliberately skips.
+    /// ([`ProcDef::cast_action`]) too, under that free cast's own overlay
+    /// — `apply_buff` is an effect OF the action, like `gain` and
+    /// `damage`, not part of the cast pipeline (cost, cooldown, further
+    /// proc rolls) that the free-cast path deliberately skips.
+    ///
+    /// NB the ARITY differs from [`ProcDef::apply_buff`], which is a
+    /// single `Option<String>` rather than a list. Same key, same
+    /// concept, different shape: writing `"apply_buff": ["x"]` on a proc
+    /// is a serde type error, and `"apply_buff": "x"` on an action is
+    /// too. Harmonizing them means accepting both spellings in both
+    /// places, which is a config-compatibility change; it is tracked in
+    /// ROADMAP for 0.4.0 rather than smuggled in here.
     ///
     /// Fail-closed at `sim::compile`: a name that is not a defined buff.
     #[serde(default)]
@@ -239,15 +260,22 @@ pub struct ActionDamage {
     /// FINITE — a stat may legitimately be negative. `hits_per_use` lives
     /// in this map and follows the same rule. See [`NumOrExpr`].
     ///
-    /// The completion instant has internal ORDER, and these expressions
-    /// are evaluated at a fixed point within it: AFTER this action's
-    /// [`ActionDef::gain`] is credited and after its own cast is counted,
-    /// and BEFORE any of this cast's proc rolls. So an expression here
-    /// reads a resource at its POST-gain amount, and `casts.<this action>`
-    /// INCLUDES the cast being resolved (`1` on the first cast, never
-    /// `0`). A buff applied by this cast's own procs is NOT visible —
-    /// which is the point: a proc triggered by a hit cannot change what
-    /// that hit was.
+    /// The completion instant has internal ORDER (stated in full in the
+    /// [`crate::sim`] module docs), and these expressions are evaluated at
+    /// a fixed point within it: AFTER this action's [`ActionDef::gain`] is
+    /// credited and after its own cast is counted, and BEFORE both this
+    /// action's [`ActionDef::apply_buff`] and any of this cast's proc
+    /// rolls. So an expression here reads a resource at its POST-gain
+    /// amount, and `casts.<this action>` INCLUDES the cast being resolved
+    /// (`1` on the first cast, never `0`).
+    ///
+    /// NEITHER kind of buff this cast applies is visible: not one applied
+    /// by its own procs, and not one in its own
+    /// [`ActionDef::apply_buff`] list. Same reason for both, and it is the
+    /// point rather than a limitation — a hit cannot be changed by what it
+    /// causes. The `apply_buff` case is the newer and more surprising one,
+    /// since that buff is written on the action ITSELF and still does not
+    /// reach the action's own damage.
     ///
     /// PRECEDENCE: a [`crate::scenario::Phase`] `stats` override for the
     /// same stat WINS over this overlay (phase > overlay > build — the
@@ -597,6 +625,13 @@ pub struct ProcDef {
     pub icd: f64,
     /// Buff to apply when this proc fires. Exactly one of `apply_buff` /
     /// `cast_action` must be set — zero or both is a compile error.
+    ///
+    /// NB a proc applies AT MOST ONE buff, where
+    /// [`ActionDef::apply_buff`] takes a LIST. Same key, same concept,
+    /// different arity — so `["x"]` here is a serde type error, and a
+    /// bare `"x"` on an action is too. Harmonizing the two is a
+    /// config-compatibility change (it needs an untagged accept-both) and
+    /// is tracked in ROADMAP for 0.4.0.
     #[serde(default)]
     pub apply_buff: Option<String>,
     /// Action to cast for free (does not consume the rotation's decision
@@ -620,10 +655,23 @@ pub struct ProcDef {
     /// procs at all, so no event this filter could match ever originates
     /// there.
     ///
-    /// Fail-closed at `sim::compile`: an unknown action name, and an
-    /// EMPTY list — `actions: []` describes a proc that can never fire,
-    /// which is a config mistake rather than a way to disable one. Write
-    /// `None` (omit the key) for "every action".
+    /// # What it cannot express
+    ///
+    /// An inclusive list of casting actions, and nothing else. There is
+    /// no negation and no "every action except" — an exclusion has to be
+    /// written as the complementary list, which then has to be kept in
+    /// step by hand as actions are added. And because the filter always
+    /// matches the CASTING action, "on_hit, but only hits of actions
+    /// other than this one" is not expressible at all. Left out
+    /// deliberately for 0.3.0 rather than guessed at; noted in ROADMAP as
+    /// a 0.4.0 candidate, where a real config should decide the shape.
+    ///
+    /// # Fail-closed
+    ///
+    /// At `sim::compile`: an unknown action name, and an EMPTY list —
+    /// `actions: []` describes a proc that can never fire, which is a
+    /// config mistake rather than a way to disable one. Write `None`
+    /// (omit the key) for "every action".
     #[serde(default)]
     pub actions: Option<Vec<String>>,
 }

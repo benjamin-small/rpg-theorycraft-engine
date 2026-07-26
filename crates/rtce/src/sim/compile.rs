@@ -98,7 +98,15 @@ pub struct CompiledResource {
 
 /// One compiled [`crate::simdef::ActionDef`]: timing/cost/gain/damage,
 /// with resource references resolved to indices into `SimPlan::resources`.
+///
+/// `#[non_exhaustive]`: the COMPILED representation is the engine's to
+/// extend — every sequencing phase so far has added a field to it — and
+/// no consumer constructs one (only [`compile`] does). Same category as
+/// [`CompiledValue`]; the CONFIG types it mirrors are deliberately NOT
+/// marked, since a caller building a [`crate::simdef::SimDef`] in Rust
+/// should be able to write a struct literal.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CompiledAction {
     /// This action's name.
     pub name: String,
@@ -182,7 +190,10 @@ pub enum ProcEffect {
 }
 
 /// One compiled [`crate::simdef::ProcDef`].
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CompiledProc {
     /// This proc's name.
     pub name: String,
@@ -753,23 +764,23 @@ mod tests {
         actions.insert(
             "fireball".to_string(),
             ActionDef {
-                apply_buff: Vec::new(),
                 cast_time: "1.0 / base_aps".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost,
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage { stats: dmg_stats }),
+                apply_buff: Vec::new(),
             },
         );
         actions.insert(
             "frost_nova".to_string(),
             ActionDef {
-                apply_buff: Vec::new(),
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
+                apply_buff: Vec::new(),
             },
         );
 
@@ -819,12 +830,12 @@ mod tests {
         procs.insert(
             "conflagrate".to_string(),
             ProcDef {
-                actions: None,
                 trigger: Trigger::OnCrit,
                 chance: "lucky_hit_chance / 100 * 0.3".into(),
                 icd: 2.0,
                 apply_buff: Some("combustion".into()),
                 cast_action: None,
+                actions: None,
             },
         );
 
@@ -1264,12 +1275,12 @@ mod tests {
         simdef.actions.insert(
             "basic_bolt".to_string(),
             ActionDef {
-                apply_buff: Vec::new(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
+                apply_buff: Vec::new(),
             },
         );
         let mut rotation = valid_rotation();

@@ -42,9 +42,13 @@
       way to bind an effect to one action. `examples/diablo4_rotation.rs`
       is off it: `frost_nova` carries `apply_buff: ["vuln_window"]` and
       the `nova_pulse` proc is deleted, with the EV pins (225199.1088 /
-      3753.31848 / 0.4) byte-identical. (The trick still appears in two
-      `sim::exec` test fixtures, where it is deliberate — those fixtures
-      exist to exercise the PROC path.)
+      3753.31848 / 0.4) byte-identical, and the trick's own leak
+      documented (its icd let a SEVENTH application through at the fight
+      boundary, on an action that was never Frost Nova). Two `sim::exec`
+      fixture BUILDERS still apply their buff from a proc, deliberately —
+      they are about stacks/DoTs, `apply_buff` cannot express their
+      varying `chance`, and keeping them keeps the proc application path
+      covered.
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full
@@ -74,6 +78,23 @@
       high-frequency stack (hundreds of instances). Measure first: there
       is no bench harness in this repo yet, so the first step is a
       `benches/` entry, not an optimization.
+- [ ] Harmonize `apply_buff`'s ARITY between `ActionDef` (a
+      `Vec<String>` list) and `ProcDef` (a single `Option<String>`) —
+      0.4.0, alongside the `deny_unknown_fields` sweep below, since both
+      are config-compatibility changes. Same key, same concept, different
+      shape: a config author who learns the list form on an action gets a
+      serde type error writing it on a proc, and vice versa. Fixing it
+      means accepting BOTH spellings in BOTH places via an untagged
+      string-or-list, which is additive for JSON but changes the Rust
+      field types.
+- [ ] `ProcDef::actions` expressiveness (P7d review) — 0.4.0 candidate,
+      and only if a real config asks. Today the filter is an inclusive
+      list of CASTING actions: no negation, no "every action except"
+      (which has to be spelled as the complementary list and kept in step
+      by hand), and no way to say "on_hit, but only hits of actions other
+      than this one". Deliberately not guessed at in 0.3.0 — the right
+      shape should be chosen by a config that needs it, most likely one
+      of the PoE2 trigger slices.
 - [ ] Crate-wide `deny_unknown_fields` on the config structs (P7c-T2
       review, fail-closed hygiene). P7c-T2 put the guard on
       `TickObjectiveObj` only. The larger hole is one level up: a

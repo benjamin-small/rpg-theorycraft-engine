@@ -267,9 +267,24 @@ fn main() {
     // distribution changed: the cadence is still 31/29/6 and each
     // iteration still makes the same 60 Bernoulli(0.2) crit draws. The
     // deleted proc used to consume one RNG draw per off-ICD `on_cast`
-    // roll — 6 per iteration, at t=0,10,…,50 — and removing them
-    // re-phases which sample lands on which cast. The EV pins above,
-    // which have no RNG at all, are byte-identical.
+    // roll — SEVEN per iteration — and removing them re-phases which
+    // sample lands on which cast. The EV pins above, which have no RNG at
+    // all, are byte-identical (the same `f64`, not merely within
+    // tolerance).
+    //
+    // Seven, not six, and the extra one is the trick's own leak: the proc
+    // fired at t=0,10,…,50 on Frost Nova as intended, and a SEVENTH time
+    // at t=60 on the Fireball/Firebolt that completes exactly at
+    // `duration` (its ICD, armed at t=50, had just cleared, and Frost
+    // Nova never casts a 7th time). So the old config applied
+    // `vuln_window` SEVEN times where `apply_buff` applies it six — the
+    // 7th window opened at the fight boundary and integrated to zero
+    // seconds, which is the only reason the uptime pin never noticed.
+    // That is the config-author trap in miniature: "icd equals the gating
+    // action's cooldown" does not actually mean "only that action", it
+    // means "at most one per cooldown-length, whoever happens to trigger
+    // it". Only the 7th draw is inert (nothing samples after it), so the
+    // stream-relevant count is six.
     //
     // The rotation's cadence never depends on the RNG (there are no procs
     // at all now, and mana/cooldowns are deterministic — see `sim::exec`'s
