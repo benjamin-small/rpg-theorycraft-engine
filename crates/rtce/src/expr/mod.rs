@@ -1,5 +1,9 @@
-//! The expression language: pipeline stages, event chances, and scenario
-//! weights are written in it; `compile` turns source into a flat postfix
+//! The expression language. A `GameDef`'s pipeline stages and event
+//! chance/factor formulas are written in it, as are the `SimDef`'s
+//! cast times, proc chances, rotation `when` predicates and
+//! [`crate::simdef::NumOrExpr`] fields. A `Scenario` is NOT: its phase
+//! weights, stat overrides and uptimes are plain numbers, never compiled.
+//! `compile` turns source into a flat postfix
 //! `Program` evaluated over a slot array. Fail-closed: unknown identifiers
 //! and syntax errors carry a byte position and never guess.
 //!
@@ -29,7 +33,11 @@ mod parser;
 pub use compiler::{compile, Op, Program, Symbols};
 
 /// Position-carrying error for every stage (lex/parse/compile).
+///
+/// `#[non_exhaustive]`: the engine's to extend with more positional or
+/// contextual detail; no consumer constructs one.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ExprError {
     /// Byte offset into the source string.
     pub pos: usize,

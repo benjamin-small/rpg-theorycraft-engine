@@ -28,10 +28,13 @@ algorithm expressed entirely as data, exact enough that a production
 calculator runs on it.
 
 Three tiers of configuration and nothing else answer the closed-form
-question. **Tier 1 — the GameDef** is the slice's algorithm. This is the (abridged) real one from
+question. **Tier 1 — the GameDef** is the slice's algorithm. Below is an
+ABRIDGED transcription of the real one from
 [`crates/rtce/tests/fixtures/d4/gamedef.json`](crates/rtce/tests/fixtures/d4/gamedef.json),
 the same file the test suite pins against the `diablo4-calc` production
-calculator:
+calculator. Every cut is marked with `…`; nothing here is a simplification
+of a formula, only an omission of whole entries. (The fixture has 11
+buckets and 12 pipeline stages; read it if you want the exact thing.)
 
 ```jsonc
 {
@@ -44,22 +47,28 @@ calculator:
     "crit_group": { "fold": "summed_group" },  // x% mults SUM, then multiply
     "vuln_group": { "fold": "summed_group" },
     "indep":      { "fold": "product" },       // aspects: each its own factor
-    "as_sum":     { "fold": "sum" }            // (dot/op/element buckets elided)
+    "as_sum":     { "fold": "sum" }
+    // … plus op_group, gen_group, elem_group, tag_group,
+    //    dot_group, dot_additive
   },
   "events": {
     "crit":      { "chance": "crit_chance / 100", "factor": "1.5 * crit_group" },
     "overpower": { "chance": "op_chance / 100",   "factor": "op_baseline * op_group" }
   },
   "pipeline": [
-    { "name": "base", "expr": "weapon_avg * coeff_pct / 100 * (1 + mainstat / mainstat_divisor)" },
+    { "name": "mainstat_mult", "expr": "1 + mainstat / mainstat_divisor" },
+    { "name": "base", "expr": "weapon_avg * coeff_pct / 100 * mainstat_mult" },
     { "name": "vuln_factor", "expr": "1 + vulnerable * (1.2 * vuln_group - 1)" },
     { "name": "hit", "branched": true,
-      "expr": "base * (1 + additive / 100) * event_factors * vuln_factor * indep" },
-    { "name": "hit_after_dr", "expr": "hit * (1 - clamp(enemy_dr, 0, 100) / 100)" },
+      "expr": "base * (1 + additive / 100) * event_factors * gen_group * elem_group * tag_group * vuln_factor * indep" },
+    { "name": "hit_after_dr", "expr": "hit * (1 - enemy_dr / 100)" },
     { "name": "raw_aps", "expr": "base_aps * (1 + min(as_sum, 100) / 100)" },
-    { "name": "total_dps", "expr": "hit_after_dr * hits_per_use * raw_aps" }
+    { "name": "hit_dps", "expr": "hit_after_dr * hits_per_use * raw_aps" },
+    // … hit_min / hit_max (the roll band), and the three DoT stages
+    { "name": "total_dps", "expr": "hit_dps + dot_dps" }
   ],
-  "objectives": ["total_dps"]
+  "objectives": ["total_dps", "hit_after_dr", "hit_min", "hit_max",
+                  "hit_dps", "dot_dps", "raw_aps"]
 }
 ```
 
@@ -110,6 +119,8 @@ Diablo 4 basics — one build, two playbooks
   dummy branch table (stage `hit`):
     —            weight  0.80  event_factors  1.00  hit     8611.200
     crit         weight  0.20  event_factors  1.80  hit    18480.960
+
+  pins hold: 9526.6368 / 1114.969344 ✓
 ```
 
 Same build, two playbooks, two truths — which is the point: an external
@@ -269,6 +280,7 @@ PoE2 poison (P7e slice 2) — 20s dummy, EV mode
   total: 17625.0000 damage over 20s = 881.2500 dps
 
   EV pins hold: 6000 hit + 11625 DoT = 17625 / 881.25 dps / 3.875 stacks ✓
+    … (a 200s steady-state contrast, two lines, elided here)
 
 Monte Carlo (N=128, seed=5): mean 881.2500  std 0.0000
   MC reproduces EV exactly (std 0) ✓

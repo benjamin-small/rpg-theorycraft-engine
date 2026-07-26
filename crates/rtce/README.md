@@ -5,8 +5,11 @@ algorithm — its stats, how contributions fold into buckets, its
 probabilistic events (crits, procs, …), and the pipeline of derived
 stages — is data, not Rust code. You write that algorithm once as JSON,
 `rtce` compiles it into a flat evaluation plan, and every candidate build
-then evaluates against that plan in microseconds with zero heap
-allocation.
+then evaluates against that plan with ZERO heap allocation on the hot
+path — all the parsing, name resolution and layout work is paid once, at
+compile time, so pricing a candidate is a flat walk over a preallocated
+slot array. (No benchmark ships with the crate yet; the allocation claim
+is structural, not a measured throughput number.)
 
 On top of that same plan sits a discrete-event TIMELINE simulator, so one
 config family answers both "what does this build average, given ASSERTED
@@ -35,7 +38,9 @@ Evaluation needs three artifacts, each with a different lifetime:
 1. **`GameDef`** — the ALGORITHM: stat/condition/bucket registries, bucket
    fold rules (`sum` / `summed_group` / `product`), probabilistic events,
    and the ordered pipeline of named stages. Compiled once by
-   `plan::compile` into a `Plan`; the only place expressions are parsed.
+   `plan::compile` into a `Plan` — the only place a `GameDef`'s
+   expressions are parsed. (`sim::compile` below is the corresponding
+   single parse point for a `SimDef`'s.)
 2. **`BuildState`** — ONE candidate: stat values plus tagged contributions
    into buckets, each optionally gated by an event or a condition. The
    only artifact that changes per permutation a search driver compares.
@@ -130,7 +135,7 @@ asserted and run in CI. Run any of them with
 
 | Example | What it teaches |
 |---|---|
-| [`your_own_game`](examples/your_own_game.rs) | The smallest starting point: all three evaluation tiers on a made-up archer game in ~40 lines of JSON, two scenarios, and `explain()` output. |
+| [`your_own_game`](examples/your_own_game.rs) | The smallest starting point: the three closed-form config tiers on a made-up archer game in ~40 lines of JSON, two scenarios, and `explain()` output. Level 1 only — it never calls `sim::run`. |
 | [`diablo4_basics`](examples/diablo4_basics.rs) | One build priced against two fights on a real game's damage slice, with the branch table behind the crit expectation. |
 | [`diablo4_rotation`](examples/diablo4_rotation.rs) | Sequencing end to end: mana, a spender/generator pair, a cooldown-gated buff window whose `vulnerable` uptime FALLS OUT of the timeline, in both EV and Monte Carlo mode. |
 | [`poe2_charges`](examples/poe2_charges.rs) | `add_refresh_all` with `max_stacks: 3`, an expression `duration`, and `stacks.X` gating a rotation rule. |

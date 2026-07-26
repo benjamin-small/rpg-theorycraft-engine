@@ -1,7 +1,9 @@
 //! Scenario (playbook) — THE FIGHT being asked about, as configuration:
 //! weighted phases with stat overrides and condition-uptime fractions.
 //! Level-1 semantics (weighted-phase blending); the Level-2 timeline
-//! simulator will share this schema (see design spec).
+//! simulator ([`crate::sim::run`], shipped in 0.2.0) SHARES this schema —
+//! it reads the same phases and stat overrides, and COMPUTES the condition
+//! uptimes rather than reading the asserted ones.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

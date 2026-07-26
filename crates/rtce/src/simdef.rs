@@ -202,29 +202,50 @@ pub struct ActionDef {
     /// instances; under `refresh` the second application simply replaces
     /// the first.
     ///
-    /// Two things a later entry can see, and one it cannot. This
-    /// asymmetry is real, deliberate, and the most surprising thing on
-    /// this field:
+    /// # What a later entry sees: THREE axes, not two
     ///
-    /// - A [`BuffDef::duration`] EXPRESSION is SEQUENTIAL. It reads sim
-    ///   state, which is refreshed per application, so a later entry sees
-    ///   earlier entries' live windows and STACK COUNTS —
-    ///   `"2 * (1 + stacks.earlier)"` works and means what it says.
-    /// - A SNAPSHOT [`TickObjective`] magnitude is FROZEN. It reads a
-    ///   BUILD, and that build is captured ONCE before the list runs, so a
-    ///   later entry does NOT see earlier entries' `contributions`. An
-    ///   `["empower", "ailment"]` list does not give the ailment
-    ///   `empower`'s multiplier; put `empower` on an earlier CAST if that
-    ///   is what you want.
+    /// This is the most surprising thing on this field, and it does not
+    /// reduce to a clean "sequential vs frozen" split. Each axis is
+    /// deliberate and each is pinned:
     ///
-    /// The frozen build is the whole cast's, which makes the two action
-    /// paths agree: a DAMAGING action freezes its
-    /// [`ActionDamage::stats`] overlay (so an ailment inherits the
+    /// - **Sim STATE is SEQUENTIAL.** The slot array is refreshed per
+    ///   application, so a later entry sees earlier entries' live windows,
+    ///   STACK COUNTS and resource amounts. A [`BuffDef::duration`]
+    ///   expression reads this axis: `"2 * (1 + stacks.earlier)"` works
+    ///   and means what it says.
+    /// - **The BUILD is FROZEN.** It is captured ONCE before the list
+    ///   runs, so a later entry does NOT see earlier entries'
+    ///   `contributions`. A SNAPSHOT [`TickObjective`] magnitude reads
+    ///   this axis: an `["empower", "ailment"]` list does not give the
+    ///   ailment `empower`'s bucket multiplier; put `empower` on an
+    ///   earlier CAST if that is what you want.
+    /// - **CONDITIONS are LIVE.** They are NOT part of the frozen build.
+    ///   The effective phase is rebuilt from every live buff on every
+    ///   application, so a snapshot magnitude DOES see a condition an
+    ///   earlier entry drives — even though it does not see that same
+    ///   entry's contributions. One buff driving both therefore lands on
+    ///   a capture through one axis and not the other.
+    ///
+    /// The consequence is worth stating plainly: **for a snapshot
+    /// `tick_objective` whose objective reads a condition, LIST ORDER
+    /// alone changes the captured rate**, and nothing in
+    /// [`crate::sim::SimReport`]'s integrated columns (`uptime`,
+    /// `avg_stacks`) shows it. Pinned by
+    /// `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
+    /// where reordering a two-entry list doubles the DoT at an identical
+    /// reported uptime. Whether the phase SHOULD be frozen alongside the
+    /// build is an open 0.4.0 question in `ROADMAP.md`; it is a behavior
+    /// change and was deliberately not made in 0.3.0.
+    ///
+    /// What the freeze DOES buy, and what it was for, still holds: the two
+    /// action paths agree, in every list order. A DAMAGING action freezes
+    /// its [`ActionDamage::stats`] overlay (so an ailment inherits the
     /// magnitude of the hit that applied it — PoE2 semantics), and a
     /// UTILITY action, which runs no damage query, freezes the plain
-    /// effective build. The PROC path is deliberately different and
-    /// unchanged: a proc-applied buff captures the ambient effective
-    /// build, with no action's overlay on it.
+    /// effective build; the same list means the same thing on both. The
+    /// PROC path is deliberately different and unchanged: a proc-applied
+    /// buff captures the ambient effective build, with no action's overlay
+    /// on it.
     ///
     /// # Elsewhere
     ///
@@ -544,6 +565,29 @@ pub struct BuffDef {
     /// precedence rule, an active buff driving a condition WINS over the
     /// scenario's static uptime for that condition; the static uptime
     /// applies again once the buff expires.
+    ///
+    /// # Two buffs driving one condition
+    ///
+    /// The winner is the one whose NAME sorts first, and that is the whole
+    /// rule — there is no "strongest wins", no "most recently applied
+    /// wins", and no summing. Buffs are compiled in name-sorted order and
+    /// the executor takes the first live match in that order, so a config
+    /// with `chill` and `frost` both driving `slowed` reports `chill`'s
+    /// value whenever both are up, and **renaming a buff can change the
+    /// number**. Pinned by
+    /// `two_buffs_driving_one_condition_resolve_by_buff_name_order`.
+    ///
+    /// Prefer not to arrange it: give each buff its own condition, or
+    /// drive the shared one from a single buff. If you do rely on it, the
+    /// dependence on naming is worth a comment in your own config.
+    ///
+    /// # Range
+    ///
+    /// A condition is an uptime FRACTION. Values outside `[0, 1]` are
+    /// clamped where they fold (by `Plan`) and, since 0.3.0, where they
+    /// are REPORTED (see [`crate::sim::SimReport::condition_uptime`]), so
+    /// `1.0` and `5.0` behave identically. Not rejected at compile time —
+    /// but nothing is gained by writing more than `1.0`.
     #[serde(default)]
     pub conditions: BTreeMap<String, f64>,
     /// The `Plan` objective this buff DoT-ticks, if any: while it is
@@ -605,9 +649,27 @@ impl Default for BuffDef {
 pub enum Trigger {
     /// Rolls once per cast begun.
     OnCast,
-    /// Rolls once per damaging hit.
+    /// Rolls ONCE per completing cast of a DAMAGING action — not once per
+    /// hit.
+    ///
+    /// The distinction matters and is easy to misread from the name: an
+    /// action whose `damage.stats` sets `hits_per_use: 5` puts five hits'
+    /// worth of damage into the total but presents this trigger with
+    /// exactly ONE roll — weight `1.0` in [`crate::sim::Mode::Expected`],
+    /// one RNG draw in [`crate::sim::Mode::MonteCarlo`]. A lucky-hit-style
+    /// proc that should scale with a multi-hit skill is therefore NOT
+    /// expressible today; fold the per-hit rate into `chance` by hand if
+    /// you need it. Pinned by
+    /// `on_hit_rolls_once_per_cast_not_once_per_hit`; whether it SHOULD
+    /// scale with `hits_per_use` is an open 0.4.0 question in `ROADMAP.md`.
+    ///
+    /// An action with no `damage` presents no roll at all.
     OnHit,
-    /// Rolls once per critical hit.
+    /// Rolls once per completing cast of a damaging action, weighted by
+    /// the probability that cast crit ([`crate::sim::Mode::Expected`]) or
+    /// gated on whether the sampled branch actually crit
+    /// ([`crate::sim::Mode::MonteCarlo`]). Per CAST, not per hit — see
+    /// [`Trigger::OnHit`].
     OnCrit,
 }
 
@@ -621,6 +683,12 @@ pub struct ProcDef {
     /// per qualifying roll.
     pub chance: String,
     /// Internal cooldown in seconds after firing (`0.0` = none).
+    ///
+    /// Must be finite and `>= 0`; anything else is a fail-closed
+    /// `sim::compile` error. NaN in particular is rejected rather than
+    /// tolerated — the executor gates on `now < icd_ready_at`, which is
+    /// false for every `now` once that deadline is NaN, so a NaN `icd`
+    /// would DELETE the internal cooldown instead of tightening it.
     #[serde(default)]
     pub icd: f64,
     /// Buff to apply when this proc fires. Exactly one of `apply_buff` /

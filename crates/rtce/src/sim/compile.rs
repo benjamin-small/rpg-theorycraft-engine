@@ -86,7 +86,10 @@ fn compile_value_map(
 /// One compiled [`crate::simdef::ResourceDef`]: cap/regen expressions
 /// ready to evaluate against the combined `[plan slots | sim slots]`
 /// array.
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CompiledResource {
     /// This resource's name — also its bare-identifier sim-slot label.
     pub name: String,
@@ -136,7 +139,13 @@ pub struct CompiledAction {
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`], and
+/// with the sharpest evidence for it: P7c added `max_stacks`/`on_reapply`
+/// here and P7c-T2 changed `tick_objective`'s TYPE
+/// (`Option<usize>` → `Option<CompiledTick>`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CompiledBuff {
     /// This buff's name.
     pub name: String,
@@ -167,7 +176,10 @@ pub struct CompiledBuff {
 /// One compiled [`crate::simdef::TickObjective`]: the objective RESOLVED
 /// to its index in the `Plan`'s objective slice, plus how the executor
 /// samples it.
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompiledTick {
     /// Index into the `Plan`'s objective slice.
     pub objective: usize,
@@ -181,7 +193,12 @@ pub struct CompiledTick {
 /// What a firing [`crate::simdef::ProcDef`] does, resolved to an index —
 /// exactly one of `apply_buff`/`cast_action` was set in the source
 /// `ProcDef` (validated at compile time).
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`]: a later
+/// phase adding a third effect kind should not be a breaking change for a
+/// downstream `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProcEffect {
     /// Apply the buff at this index in `SimPlan::buffs`.
     ApplyBuff(usize),
@@ -215,7 +232,10 @@ pub struct CompiledProc {
 
 /// One compiled [`crate::simdef::Rule`]: the action index it casts and its
 /// optional `when` predicate.
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CompiledRule {
     /// Index into `SimPlan::actions`.
     pub action: usize,
@@ -229,7 +249,12 @@ pub struct CompiledRule {
 /// every cross-reference validated fail-closed (see `sim` module docs),
 /// ready for [`crate::sim::run`] to drive. Inert data — no execution logic
 /// lives here.
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`]: every
+/// sequencing phase so far has added to it, and only [`compile`]
+/// constructs one.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SimPlan {
     /// The slot offset where the sim-state segment begins — equal to the
     /// underlying `Plan`'s own unified slot width
@@ -237,8 +262,8 @@ pub struct SimPlan {
     /// expressions load plan stats/conditions from slots below this
     /// offset and sim state from slots at/above it.
     pub sim_base: usize,
-    /// Total width of the combined `[plan slots | sim slots]` array a
-    /// future executor must allocate.
+    /// Total width of the combined `[plan slots | sim slots]` array the
+    /// executor allocates (see [`crate::sim::run`]).
     pub slot_width: usize,
     /// Resources, compiled, in name-sorted order — also their bare
     /// identifier's sim-slot order (`sim_base + 2 + i`).
@@ -660,6 +685,18 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         let chance = compile_expr(&p.chance, &syms).map_err(|e| PlanError {
             what: format!("proc `{name}` chance: {e}"),
         })?;
+        // `icd` is a bare literal, not a `NumOrExpr`, so its fail-closed
+        // check lands here rather than at an evaluation instant. Both
+        // rejected values used to fail SILENTLY, in the worst direction:
+        // the executor gates on `now < icd_ready_at`, which is false for
+        // every `now` once that deadline is NaN — so `icd: NaN` DELETED
+        // the internal cooldown rather than tightening it. A negative one
+        // is just "no ICD", spelled confusingly.
+        if !p.icd.is_finite() || p.icd < 0.0 {
+            return Err(PlanError {
+                what: format!("proc `{name}` icd must be finite and >= 0, got {}", p.icd),
+            });
+        }
         let effect = if let Some(b) = &p.apply_buff {
             ProcEffect::ApplyBuff(buff_index(b))
         } else {

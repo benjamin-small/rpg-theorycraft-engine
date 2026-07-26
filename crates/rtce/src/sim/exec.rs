@@ -1,7 +1,8 @@
 //! The timeline executor: a discrete-event stepper over a compiled
 //! [`SimPlan`], producing a [`SimReport`] of COMPUTED uptimes/dps in place
-//! of `Scenario`'s asserted ones (see the design spec's "Executor" and
-//! "Scenarios — Level-2 reading" sections). One decision loop drives
+//! of `Scenario`'s asserted ones (see the P6 design spec's "Executor —
+//! one stepper, one substitution point" and "Scenarios — same schema,
+//! Level-2 reading" sections). One decision loop drives
 //! everything: walk the rotation's rules, begin the first eligible cast,
 //! and let time advance to whatever happens next — [`Mode::Expected`] and
 //! [`Mode::MonteCarlo`] share this ENTIRE loop (rotation logic is never
@@ -212,11 +213,12 @@
 //! [`Sim::eval_action_damage_sampled`]) — exact, not probabilistic.
 //!
 //! `ProcEffect::CastAction` (a proc casting a free action, [`Sim::free_cast`])
-//! is scoped identically in both modes: gains + damage only, no cost/
-//! cooldown, no further proc rolls (avoids reentrancy), and its damage is
-//! ALWAYS the EV/branch-blended value (even under `Mode::MonteCarlo` —
-//! documented as a v1 scope limit on `free_cast`'s own doc comment, not an
-//! oversight) — pinned end-to-end by
+//! is scoped identically in both modes: gains, damage, and the action's
+//! own `apply_buff` list (P7d — under THIS cast's overlay), but no cost,
+//! no cooldown, and no further proc rolls (avoids reentrancy). Its damage
+//! is ALWAYS the EV/branch-blended value (even under `Mode::MonteCarlo` —
+//! a v1 scope limit stated on the PUBLIC [`Mode::MonteCarlo`] docs and on
+//! `free_cast`'s own doc comment, not an oversight) — pinned end-to-end by
 //! `proc_effect_cast_action_fires_a_free_instant_cast`.
 //!
 //! [`SimReport::distribution`] is `Mode::MonteCarlo`-only: `mean`/`std`
@@ -251,11 +253,23 @@ pub enum Mode {
     /// `iterations` full independent timeline runs, each seeded off
     /// `seed` (see `mix_seed`'s doc comment for the derivation): procs
     /// ROLL exactly (`rng.next_f64() < chance`, ICD a hard gate, no
-    /// accumulator) and damage/crits are SAMPLED
-    /// (`Plan::evaluate_phase_sampled`) rather than branch-blended. The
-    /// resulting [`SimReport`] carries the POOLED MEAN of every
-    /// per-iteration report field (see [`run`]'s docs) plus a
-    /// [`Distribution`] over the `iterations` per-iteration `dps` values.
+    /// accumulator) and a normal cast's damage/crits are SAMPLED rather
+    /// than branch-blended. The resulting [`SimReport`] carries the POOLED
+    /// MEAN of every per-iteration report field (see [`run`]'s docs) plus
+    /// a [`Distribution`] over the `iterations` per-iteration `dps`
+    /// values.
+    ///
+    /// **Two things are deliberately NOT sampled even here**, and both are
+    /// v1 scope limits rather than oversights:
+    ///
+    /// - A proc-triggered FREE cast
+    ///   ([`super::ProcEffect::CastAction`]) always contributes its
+    ///   EV/branch-blended damage, and its crit never feeds an `on_crit`
+    ///   proc. Tightening this later is additive, not breaking.
+    /// - A DoT [`crate::simdef::BuffDef::tick_objective`]'s rate — live or
+    ///   snapshot — is always EV-blended, in BOTH modes. A tick is a
+    ///   continuous rate, not an event to sample; this is inherited from
+    ///   0.2.0 and is why the two modes agree so tightly on DoT totals.
     MonteCarlo {
         /// Number of independent timeline runs (must be `> 0`).
         iterations: u32,
@@ -773,6 +787,17 @@ struct CastMeasurement {
 /// Running integral of one tracked condition's effective value over time
 /// (buff-driven while a buff is active, else the current phase's static
 /// uptime — see [`Sim::condition_value`]).
+///
+/// `value` is CLAMPED to `[0, 1]` on the way in. A condition is an uptime
+/// FRACTION, and `Plan` clamps it to that range on the way into its slots,
+/// so an out-of-range `BuffDef::conditions` value (`marked: 5.0`) folds as
+/// `1.0` — but [`Sim::condition_value`] returns the buff's raw number, and
+/// integrating THAT would report an uptime of 4.1667 for a condition the
+/// math treated as fully up. The scenario branch of `condition_value`
+/// already clamps; this makes the buff branch agree, so the diagnostic
+/// never disagrees with the value actually used. Report-only: nothing
+/// downstream of the report reads this field. Pinned by
+/// `a_buff_driven_condition_uptime_is_clamped_like_the_value_that_folds`.
 struct CondAccum {
     seconds: f64,
     value: f64,
@@ -922,7 +947,7 @@ impl<'a> Sim<'a> {
         };
 
         for name in sim.condition_names.clone() {
-            let v = sim.condition_value(&name);
+            let v = sim.condition_value(&name).clamp(0.0, 1.0); // see `CondAccum`
             sim.condition_accum.insert(
                 name,
                 CondAccum {
@@ -1119,7 +1144,9 @@ impl<'a> Sim<'a> {
         let now = self.time;
         self.refresh_effective_state()?;
         for name in self.condition_names.clone() {
-            let v = self.condition_value(&name);
+            // Clamped: see `CondAccum`. The UNCLAMPED value still drives
+            // `effective_phase` above, where `Plan` clamps it itself.
+            let v = self.condition_value(&name).clamp(0.0, 1.0);
             let e = self
                 .condition_accum
                 .get_mut(&name)
@@ -1555,24 +1582,35 @@ impl<'a> Sim<'a> {
     /// not left as `None` for [`Sim::apply_buff`] to resolve per entry
     /// against the live effective build. That is the whole point: it
     /// makes the two paths agree. Every entry in one list, on either
-    /// path, captures against the SAME frozen build — the world as the
-    /// cast found it. Left live, a utility action's second entry would
-    /// see the first entry's `contributions` and a damaging action's
-    /// would not (its overlay was cloned before the loop), so the same
-    /// `apply_buff` list would mean two different things depending on
-    /// whether the action happened to deal damage.
+    /// path, captures against the SAME frozen build. Left live, a utility
+    /// action's second entry would see the first entry's `contributions`
+    /// and a damaging action's would not (its overlay was cloned before
+    /// the loop), so the same `apply_buff` list would mean two different
+    /// things depending on whether the action happened to deal damage.
     ///
-    /// The asymmetry that REMAINS is deliberate and is the surprising
-    /// one, documented on [`crate::simdef::ActionDef::apply_buff`]: within
-    /// one list, a `duration` expression IS sequential (it reads sim
-    /// STATE through the slot array, which [`Sim::apply_buff`] refreshes
-    /// per entry, so a later entry sees earlier entries' STACK COUNTS)
-    /// while a snapshot magnitude is FROZEN (it reads a BUILD, and that
-    /// build is this one, so a later entry does not see earlier entries'
-    /// CONTRIBUTIONS). Both halves are pinned — see
-    /// `apply_buff_applies_the_list_in_order_and_a_repeat_applies_twice`
+    /// # What this freeze does NOT freeze
+    ///
+    /// The BUILD, and only the build. It is NOT "the world as the cast
+    /// found it" — [`Sim::apply_buff`] flushes and refolds per entry, and
+    /// [`Sim::refresh_effective_state`] rebuilds `effective_phase` from
+    /// [`Sim::condition_value`] each time, so `self.effective_phase` is
+    /// LIVE while `frozen` is not. Three axes, stated canonically on
+    /// [`crate::simdef::ActionDef::apply_buff`]:
+    ///
+    /// - sim STATE (slot array): sequential — refreshed per entry.
+    /// - the BUILD (stats + `contributions`): frozen — this clone.
+    /// - CONDITIONS (the effective phase): LIVE — rebuilt per entry.
+    ///
+    /// So a snapshot capture DOES see a condition an earlier entry in the
+    /// same list drives, while not seeing that entry's contributions. All
+    /// three are pinned:
+    /// `apply_buff_applies_the_list_in_order_and_a_repeat_applies_twice`,
+    /// `a_snapshot_capture_is_frozen_across_the_list_on_both_action_paths`,
     /// and
-    /// `a_snapshot_capture_is_frozen_across_the_list_on_both_action_paths`.
+    /// `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`
+    /// (which also pins that the two ACTION PATHS still agree in both
+    /// list orders — the path symmetry this freeze exists for is intact;
+    /// it is the two-way partition in the docs that was wrong).
     ///
     /// The clone is paid only when the list is non-empty, so an action
     /// that applies nothing — every action in every 0.2.0 config — costs
@@ -7392,6 +7430,46 @@ mod tests {
             serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap()
         }
 
+        /// As `boosted_dot_plan`, but the DoT rate ALSO reads a
+        /// `marked` CONDITION. That is the third axis: a capture reads a
+        /// frozen BUILD (so `boost` is frozen) against the LIVE effective
+        /// phase (so `marked` is not). Nothing else can tell the two
+        /// apart, which is why this fixture exists.
+        fn marked_dot_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "conditions": ["marked"],
+                     "buckets": { "boost": { "fold": "product" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * boost" },
+                                   { "name": "dot",
+                                     "expr": "dmg * 0.5 * boost * (1 + marked)" } ],
+                     "objectives": ["hit", "dot"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        /// Drives BOTH axes at once: `+100` to the product bucket `boost`
+        /// (a contribution — frozen for a same-list capture) and the
+        /// condition `marked = 1.0` (live for one). Same magnitude on
+        /// each, so `marked_dot_plan`'s rate doubles per axis and the two
+        /// are individually readable off the total.
+        fn mark_buff(duration: f64) -> BuffDef {
+            BuffDef {
+                duration: NumOrExpr::Num(duration),
+                contributions: vec![Contribution {
+                    bucket: "boost".into(),
+                    value: 100.0,
+                    event: None,
+                    condition: None,
+                }],
+                conditions: [("marked".to_string(), 1.0)].into_iter().collect(),
+                tick_objective: None,
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
+            }
+        }
+
         /// A BRANCHED plan: `hit = dmg × event_factors` with a `crit`
         /// event whose factor is 2. Two fixtures need it — `on_crit` has
         /// no meaning without a crit event (`Plan::crit_chance` fail-softs
@@ -7986,6 +8064,419 @@ mod tests {
                 close(dmg_run.total.total_damage, 500.0),
                 "damaging total: got {} — want 100 hit + 400 DoT",
                 dmg_run.total.total_damage
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // The THIRD axis, and the one the "frozen at the world the cast
+        // found" phrasing used to hide: a same-list snapshot capture reads a
+        // FROZEN BUILD against the LIVE EFFECTIVE PHASE. Contributions are
+        // frozen; CONDITIONS are not. `Sim::apply_buff` refolds per entry,
+        // and `Sim::refresh_effective_state` rebuilds `effective_phase` from
+        // `Sim::condition_value` each time, so an earlier entry's condition
+        // is already in force when a later entry captures.
+        //
+        // `marked_dot_plan`, where `dot = dmg × 0.5 × boost × (1 + marked)`.
+        // One `mark` buff drives BOTH axes at `+100` / `1.0`, so each axis
+        // independently DOUBLES a captured rate and the two are separable.
+        // A 2s cast on a 1000s cooldown completes at t=2 of a 10s fight; both
+        // buffs last 100s, so the DoT ticks [2,10] = 8s. Only the LIST ORDER
+        // differs between the two runs.
+        //
+        //   ["mark", "poison"]  mark folds first, then poison captures:
+        //     boost  frozen at 1 (mark's contribution is NOT seen)
+        //     marked LIVE at 1   (mark's condition IS seen)
+        //     R = 100 × 0.5 × 1 × (1 + 1) = 100  →  8 × 100 = 800 DoT
+        //
+        //   ["poison", "mark"]  poison captures before mark exists at all:
+        //     boost 1, marked 0
+        //     R = 100 × 0.5 × 1 × (1 + 0) =  50  →  8 ×  50 = 400 DoT
+        //
+        // A pure reorder of one two-entry list DOUBLES the DoT. That is the
+        // cost of the live-phase axis, and it is pinned here rather than
+        // merely described because the integrated `uptime`/`avg_stacks`
+        // columns a reader would check are identical in both runs.
+        //
+        // What is NOT broken, and is asserted just as hard: the design goal
+        // `Sim::apply_action_buffs` actually states — the damaging and
+        // utility paths agree — holds in BOTH orderings. The hole is in the
+        // documented partition, not in the path symmetry.
+        //
+        // Mutations: freezing the phase alongside the build collapses both
+        // orderings to 400; leaving the build live alongside the phase sends
+        // ["mark","poison"] to 8 × (100 × 0.5 × 2 × 2) = 1600.
+        //
+        // Whether the phase SHOULD be frozen with the build is an open 0.4.0
+        // question in ROADMAP.md — a behavior change, deliberately not made
+        // in 0.3.0.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase() {
+            let plan = marked_dot_plan();
+            let build = boosted_dot_build();
+            let simdef = |action: ActionDef| {
+                let mut actions = BTreeMap::new();
+                actions.insert("caster".to_string(), action);
+                let mut buffs = BTreeMap::new();
+                buffs.insert("mark".to_string(), mark_buff(100.0));
+                buffs.insert("poison".to_string(), snapshot_buff(100.0));
+                SimDef {
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs: BTreeMap::new(),
+                    damage_objective: "hit".into(),
+                }
+            };
+            // DoT only: the utility path deals no hit damage, and the
+            // damaging path's hit is measured before the list runs, so
+            // subtracting it leaves the same quantity on both.
+            let dot_of = |action: ActionDef| {
+                let r = ev_with(&plan, &build, &simdef(action.clone()), &only("caster"), 10);
+                let hit = r.actions["caster"].damage;
+                (r.total.total_damage - hit, r.buffs["poison"].uptime)
+            };
+            let list = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+
+            let (mark_first_dmg, up_a) = dot_of(damaging(
+                "2",
+                1000.0,
+                BTreeMap::new(),
+                list("mark", "poison"),
+            ));
+            let (mark_first_util, _) = dot_of(utility("2", 1000.0, list("mark", "poison")));
+            let (poison_first_dmg, up_b) = dot_of(damaging(
+                "2",
+                1000.0,
+                BTreeMap::new(),
+                list("poison", "mark"),
+            ));
+            let (poison_first_util, _) = dot_of(utility("2", 1000.0, list("poison", "mark")));
+
+            assert!(
+                close(mark_first_dmg, 800.0),
+                "[mark, poison]: got {mark_first_dmg} — want 8s × R=100, i.e. \
+                 the capture reading `marked` LIVE (400 would mean the phase \
+                 is frozen with the build; 1600 would mean the build went \
+                 live too)"
+            );
+            assert!(
+                close(poison_first_dmg, 400.0),
+                "[poison, mark]: got {poison_first_dmg} — want 8s × R=50, the \
+                 capture landing before `mark` exists on either axis"
+            );
+            assert!(
+                close(mark_first_dmg, 2.0 * poison_first_dmg),
+                "a pure reorder of one two-entry list must still double the \
+                 DoT until 0.4.0 decides otherwise: {mark_first_dmg} vs \
+                 {poison_first_dmg}"
+            );
+
+            // The stated design goal, still met: the two action paths agree.
+            assert!(
+                close(mark_first_dmg, mark_first_util),
+                "damaging vs utility path disagree on [mark, poison]: \
+                 {mark_first_dmg} vs {mark_first_util}"
+            );
+            assert!(
+                close(poison_first_dmg, poison_first_util),
+                "damaging vs utility path disagree on [poison, mark]: \
+                 {poison_first_dmg} vs {poison_first_util}"
+            );
+
+            // And the reason this needs a pin: the integrated column a
+            // reader would reach for cannot see any of it.
+            assert!(
+                close(up_a, up_b) && close(up_a, 0.8),
+                "poison uptime is [2,10] of 10s = 0.8 in BOTH orderings — \
+                 the swing is invisible there: {up_a} vs {up_b}"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // `ProcDef::icd` is a bare literal rather than a `NumOrExpr`, so it
+        // never passed through P7b's fail-closed evaluation checks and was
+        // the last unvalidated number in the sim config. Both bad values
+        // failed SILENTLY, and NaN failed in the WORST direction: the ICD
+        // gate is `now < icd_ready_at`, which is false for every `now` once
+        // that deadline is NaN — so `icd: NaN` DELETED the internal cooldown
+        // rather than tightening it, turning a gated proc into an ungated
+        // one with no error anywhere. A negative icd is merely "no ICD"
+        // spelled confusingly, and is rejected for the same reason
+        // `cooldown`/`cost`/`gain` reject negatives.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_non_finite_or_negative_proc_icd_is_a_compile_error() {
+            let plan = scoped_plan();
+            let compile_with = |icd: f64| {
+                let mut actions = BTreeMap::new();
+                actions.insert(
+                    "strike".to_string(),
+                    damaging("1", 0.0, BTreeMap::new(), Vec::new()),
+                );
+                let mut buffs = BTreeMap::new();
+                buffs.insert("ail".to_string(), plain_buff(1.0));
+                let mut procs = BTreeMap::new();
+                procs.insert(
+                    "gated".to_string(),
+                    ProcDef {
+                        trigger: Trigger::OnCast,
+                        chance: "1".into(),
+                        icd,
+                        apply_buff: Some("ail".into()),
+                        cast_action: None,
+                        actions: None,
+                    },
+                );
+                let simdef = SimDef {
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs,
+                    damage_objective: "hit".into(),
+                };
+                sim_compile(&plan, &simdef, &only("strike"))
+            };
+
+            for bad in [f64::NAN, f64::INFINITY, -5.0] {
+                let e = compile_with(bad).unwrap_err();
+                assert!(e.what.contains("gated"), "got: {}", e.what);
+                assert!(e.what.contains("icd"), "got: {}", e.what);
+            }
+            // The boundary and a normal value both still compile.
+            assert!(compile_with(0.0).is_ok());
+            assert!(compile_with(2.5).is_ok());
+        }
+
+        // ------------------------------------------------------------------
+        // `Trigger::OnHit` rolls once per damaging CAST, not once per HIT.
+        //
+        // The name says otherwise and nothing else in the crate said so
+        // before 0.3.0, which makes it a silent modeling trap for lucky-hit
+        // style procs: `Sim::complete_cast` presents this trigger with
+        // exactly ONE roll per completing cast, while `hits_per_use` is read
+        // separately by `Sim::eval_hits_per_use` and only ever multiplies
+        // DAMAGE.
+        //
+        // `scoped_plan`; `strike` is a 1s cast with `hits_per_use: 5` over a
+        // 10s fight → 10 casts, 50 hits. The damage pin proves the fixture
+        // really does land 50 hits; the proc counts prove only 10 are ever
+        // offered to the trigger.
+        //
+        // Both modes are asserted, because each is blind to the other's
+        // plausible per-hit implementation:
+        //
+        //   EV, `chance: "0.2"`. The accumulator fires at most ONCE per
+        //   CALL, so a per-hit reading spelled as "weight the roll by hits"
+        //   is invisible at `chance: "1"` — this fixture is fractional on
+        //   purpose. acc += 0.2 per cast, crossing 1.0 at casts 5 and 10:
+        //     fires = 2.  Weighting the roll by `hits` gives acc += 1.0 per
+        //     cast → 10. Looping the roll 5× per cast also gives 10.
+        //
+        //   MC, `chance: "1"`. No accumulator: one draw per roll, and a
+        //   certain chance fires on every one, so the count IS the roll
+        //   count and is seed-independent.
+        //     fires = 10.  A per-hit loop gives 50.
+        //
+        // Whether it SHOULD scale with `hits_per_use` is an open 0.4.0
+        // question in ROADMAP.md; this pins today's answer so that changing
+        // it has to be deliberate.
+        // ------------------------------------------------------------------
+        #[test]
+        fn on_hit_rolls_once_per_cast_not_once_per_hit() {
+            let plan = scoped_plan();
+            let build = scoped_build();
+            let run_with = |chance: &str, mode: Mode| {
+                let mut stats = BTreeMap::new();
+                stats.insert("hits_per_use".to_string(), NumOrExpr::Num(5.0));
+                let mut actions = BTreeMap::new();
+                actions.insert("strike".to_string(), damaging("1", 0.0, stats, Vec::new()));
+                let mut buffs = BTreeMap::new();
+                buffs.insert("ail".to_string(), plain_buff(0.5));
+                let mut procs = BTreeMap::new();
+                procs.insert(
+                    "per_hit".to_string(),
+                    ProcDef {
+                        trigger: Trigger::OnHit,
+                        chance: chance.into(),
+                        icd: 0.0,
+                        apply_buff: Some("ail".into()),
+                        cast_action: None,
+                        actions: None,
+                    },
+                );
+                let simdef = SimDef {
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs,
+                    damage_objective: "hit".into(),
+                };
+                let sim_plan = sim_compile(&plan, &simdef, &only("strike")).unwrap();
+                run(&plan, &sim_plan, &build, &dummy(10), mode).unwrap()
+            };
+
+            let ev_run = run_with("0.2", Mode::Expected);
+            assert_eq!(ev_run.actions["strike"].casts, 10);
+            assert!(
+                close(ev_run.actions["strike"].damage, 5000.0),
+                "10 casts × hits_per_use 5 × hit 100 = 5000, so the fixture \
+                 genuinely lands 50 hits: got {}",
+                ev_run.actions["strike"].damage
+            );
+            assert_eq!(
+                ev_run.proc_counts["per_hit"], 2,
+                "EV at chance 0.2: one roll per CAST accumulates to 1.0 at \
+                 casts 5 and 10. 10 would mean the roll had started scaling \
+                 with hits_per_use"
+            );
+
+            let mc_run = run_with(
+                "1",
+                Mode::MonteCarlo {
+                    iterations: 4,
+                    seed: 7,
+                },
+            );
+            assert_eq!(
+                mc_run.proc_counts["per_hit"], 10,
+                "MC at chance 1: one certain draw per CAST, seed-independent. \
+                 50 would mean a draw per HIT"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // When two live buffs drive the SAME condition, the winner is the
+        // one whose NAME sorts first. `Sim::condition_value` returns the
+        // first match in `active_buff_set`, which holds BUFF INDICES, and
+        // `sim::compile` assigns those in name-sorted order — so the rule is
+        // alphabetical. Not "strongest", not "most recently applied", not
+        // summed. Renaming a buff therefore changes the number, which is why
+        // this is pinned rather than left to a private comment.
+        //
+        // `marked_dot_plan` (it is the plan here with a condition). Two
+        // utility buffs drive `marked` at DIFFERENT values and nothing else;
+        // one instant cast at t=0 opens both windows for the whole 10s
+        // fight, so the tie-break is the only thing that can decide the
+        // reported uptime.
+        //   "a_chill" → 0.25   "z_frost" → 1.0
+        //   reported `marked` uptime = 0.25 — the alphabetically FIRST
+        //   buff's value, though `z_frost` is stronger AND was applied
+        //   second.
+        //
+        // The rename control is the proof: swapping ONLY the two names, so
+        // the strong one now sorts first, flips the report to 1.0 with an
+        // otherwise byte-identical config.
+        // ------------------------------------------------------------------
+        #[test]
+        fn two_buffs_driving_one_condition_resolve_by_buff_name_order() {
+            let plan = marked_dot_plan();
+            let build = boosted_dot_build();
+            let cond = |v: f64| BuffDef {
+                duration: NumOrExpr::Num(100.0),
+                contributions: Vec::new(),
+                conditions: [("marked".to_string(), v)].into_iter().collect(),
+                tick_objective: None,
+                max_stacks: 1,
+                on_reapply: ReapplyPolicy::Refresh,
+            };
+            // The WEAK one is always applied first; only the NAMES differ
+            // between the two runs.
+            let uptime_with = |weak: &str, strong: &str| {
+                let mut actions = BTreeMap::new();
+                actions.insert(
+                    "opener".to_string(),
+                    utility("0", 1000.0, vec![weak.to_string(), strong.to_string()]),
+                );
+                let mut buffs = BTreeMap::new();
+                buffs.insert(weak.to_string(), cond(0.25));
+                buffs.insert(strong.to_string(), cond(1.0));
+                let simdef = SimDef {
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs: BTreeMap::new(),
+                    damage_objective: "hit".into(),
+                };
+                ev_with(&plan, &build, &simdef, &only("opener"), 10).condition_uptime["marked"]
+            };
+
+            let weak_sorts_first = uptime_with("a_chill", "z_frost");
+            let strong_sorts_first = uptime_with("z_chill", "a_frost");
+
+            assert!(
+                close(weak_sorts_first, 0.25),
+                "got {weak_sorts_first} — the alphabetically FIRST live buff \
+                 wins, so the weaker 0.25 is reported even though the \
+                 stronger 1.0 is up and was applied later (1.0 would mean \
+                 strongest-wins, 1.25 summed)"
+            );
+            assert!(
+                close(strong_sorts_first, 1.0),
+                "got {strong_sorts_first} — renaming the SAME two buffs so \
+                 the strong one sorts first must change the answer; that it \
+                 does is the point of this pin"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // A buff-driven condition's REPORTED uptime is clamped to [0,1] —
+        // the same clamp `Plan` applies where the value actually folds.
+        //
+        // `BuffDef::conditions` is not range-checked at compile time, and
+        // `Sim::condition_value`'s buff branch returns the raw number (its
+        // scenario branch has always clamped). Integrating the raw value
+        // made the DIAGNOSTIC disagree with the math: `marked: 5.0` folds as
+        // 1.0 but used to report 5 × its live fraction.
+        //
+        // One instant cast at t=0 opens a 5s window on a 10s fight, so the
+        // condition is up for exactly half the fight:
+        //   clamped (now):    1.0 × 0.5 = 0.5
+        //   un-clamped (was): 5.0 × 0.5 = 2.5
+        // Report-only: the value the math used is unchanged either way.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_buff_driven_condition_uptime_is_clamped_like_the_value_that_folds() {
+            let plan = marked_dot_plan();
+            let build = boosted_dot_build();
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "opener".to_string(),
+                utility("0", 1000.0, vec!["over".into()]),
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "over".to_string(),
+                BuffDef {
+                    duration: NumOrExpr::Num(5.0),
+                    contributions: Vec::new(),
+                    conditions: [("marked".to_string(), 5.0)].into_iter().collect(),
+                    tick_objective: None,
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                },
+            );
+            let simdef = SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs,
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            };
+            let r = ev_with(&plan, &build, &simdef, &only("opener"), 10);
+
+            assert!(
+                close(r.buffs["over"].uptime, 0.5),
+                "the WINDOW is [0,5) of 10s either way: got {}",
+                r.buffs["over"].uptime
+            );
+            assert!(
+                close(r.condition_uptime["marked"], 0.5),
+                "got {} — a condition is an uptime FRACTION, so `5.0` folds \
+                 as 1.0 and must report as 1.0 × 0.5 = 0.5 (2.5 is the \
+                 pre-0.3.0 un-clamped integral, a diagnostic disagreeing \
+                 with the value the math used)",
+                r.condition_uptime["marked"]
             );
         }
 

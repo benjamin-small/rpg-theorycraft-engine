@@ -27,38 +27,51 @@ proof, not a switchover.
 ### Upgrading from 0.2.0 — read this first
 
 Every 0.2.0 JSON config parses unchanged, and a field that only ever held
-a number still reaches the executor as the identical `f64`. Two things
-can still surprise you:
+a number still reaches the executor as the identical `f64`. Three things
+can still surprise you.
 
 **Four behavior fixes can move numbers**, each for a narrow class of
 config. Full detail in "Fixed" below; the short form:
 
 | Fix | Moves numbers for |
 |---|---|
-| the fight horizon is DRAINED | any config where a `BuffExpire` can land on the fight's exact end instant — in practice, INTEGER buff durations against an integer `duration`. The final cast was being dropped whole. |
+| the fight horizon is DRAINED | any config where a SECOND event (usually a `BuffExpire`, but a `PhaseBoundary` too) lands on the fight's exact end instant alongside a completing cast — most often integer buff durations against an integer `duration`. The cast there was dropped whole: count, damage and `apply_buff`. |
 | EV `on_crit` weight measured before the cast's own procs | configs with an `on_cast`/`on_hit` proc that changes crit chance, run under `Mode::Expected`. |
 | a proc's effect is visible to a later proc in the same batch | configs whose proc `chance` reads sim state (`casts.*`, resources, `buff*.*`) that another proc mutates in the same trigger batch. |
 | a resource's `max`/`regen_per_sec` re-derived against the state that caused the refold | configs whose resource `max`/`regen_per_sec` names sim state rather than plain stats/conditions. |
 
-(A fifth fix, the frozen `apply_buff` overlay, is listed too — but it
-lives entirely on `apply_buff`, which is new in 0.3.0, so no 0.2.0 config
-can have been measuring it.)
+Three further fixes are in "Fixed" but are NOT in that table, because
+none of them can move a 0.2.0 config's damage or dps: the frozen
+`apply_buff` overlay (that surface is new in 0.3.0), the
+`condition_uptime` clamp (report-only), and the `ProcDef::icd` validation
+(which REJECTS a config rather than re-scoring it — see below).
 
 Nothing in this repo moved: `examples/diablo4_rotation.rs` holds byte for
 byte at 225199.1088 total / 3753.31848 dps / 0.4 vuln uptime, and both
 downstream consumers are byte-identical.
 
+**One config that compiled in 0.2.0 no longer does.** `ProcDef::icd` is
+now required to be finite and `>= 0`. That can only reject a config whose
+`icd` was NaN, infinite, or negative — and a NaN one was silently running
+with NO internal cooldown at all, so if this error fires, the numbers you
+had were wrong. (A second, far more pathological rejection is described
+under the horizon drain: a scenario ending in more than 10,000
+zero-weight phases.)
+
 **Rust source-breaking (permitted under 0.x, but you deserve the
 warning).** New fields on `ActionDef` (`apply_buff`), `ProcDef`
 (`actions`) and `BuffDef` (`max_stacks`, `on_reapply`) break any
-exhaustive struct literal constructing them in Rust — this repo's own
-53-literal churn is the proof. JSON is unaffected. The fix: add the new
-fields explicitly with their 0.2.0-equivalent values —
-`apply_buff: Vec::new()` on `ActionDef`, `actions: None` on `ProcDef`,
-`max_stacks: 1` and `on_reapply: ReapplyPolicy::Refresh` on `BuffDef` —
-or stop writing them exhaustively (`ActionDef` derives `Default`, so
-`ActionDef { cast_time: "1".into(), ..Default::default() }` works;
-`BuffDef` and `ProcDef` do not).
+exhaustive struct literal constructing them in Rust. JSON is unaffected.
+The fix: add the new fields explicitly with their 0.2.0-equivalent
+values — `apply_buff: Vec::new()` on `ActionDef`, `actions: None` on
+`ProcDef`, `max_stacks: 1` and `on_reapply: ReapplyPolicy::Refresh` on
+`BuffDef` — or stop writing them exhaustively. `ActionDef` and `BuffDef`
+both have a `Default` (`BuffDef`'s is hand-written precisely so
+`max_stacks` defaults to `1` rather than `u32`'s `0`), so
+`ActionDef { cast_time: "1".into(), ..Default::default() }` and
+`BuffDef { duration: 4.0.into(), ..Default::default() }` both compile and
+both give you 0.2.0 behavior. `ProcDef` has no `Default`; name
+`actions: None` there.
 
 Field TYPES also changed. `BuffDef::tick_objective` is now
 `Option<TickObjective>` rather than `Option<String>`, and the five newly
@@ -69,11 +82,26 @@ and the values of `cost` / `gain` / `ActionDamage::stats` — hold
 side, `CompiledBuff::tick_objective` is `Option<CompiledTick>` rather
 than `Option<usize>`, and `SimReport::buff_uptime` is REPLACED by
 `buffs: BTreeMap<String, BuffReport>` (`.uptime` plus the new
-`.avg_stacks`). `CompiledAction`, `CompiledProc`, `CompiledValue` and
-every `sim::report` type are now `#[non_exhaustive]`, so later
-measurements stop being breaking changes for external constructors; the
-CONFIG types are deliberately NOT marked, so a caller building a `SimDef`
-in Rust can still write a struct literal.
+`.avg_stacks`).
+
+**`#[non_exhaustive]` swept across every engine-produced type**, and this
+minor bump is the last free window for it — adding the attribute is itself
+a breaking change. Now marked: every COMPILED type (`SimPlan`,
+`CompiledAction`, `CompiledBuff`, `CompiledProc`, `CompiledResource`,
+`CompiledRule`, `CompiledTick`, `CompiledValue`, and the `ProcEffect`
+enum), every read-only REPORT type (all seven in `sim::report`, plus
+`plan::Explanation` / `PhaseTrace` / `BranchTrace` and
+`search::CandidateResult`), and both ERROR types (`PlanError`,
+`ExprError`). The rationale is uniform: the engine constructs them, no
+consumer does, and every sequencing phase so far has added a field to
+one — so later measurements should be additive rather than breaking. If
+you construct or exhaustively destructure any of them, you cannot after
+0.3.0; read them field by field instead, and `match` on `ProcEffect` with
+a `_` arm.
+
+The CONFIG types are deliberately NOT marked, so a caller building a
+`GameDef`/`SimDef`/`BuildState`/`Scenario` in Rust can still write a
+struct literal.
 
 ### Added
 
@@ -241,7 +269,8 @@ in Rust can still write a struct literal.
   `on_cast` roll (SEVEN per iteration; six of them stream-relevant, the
   seventh landing at `duration` with nothing sampling after it), and
   removing them re-phases which crit sample lands on which cast. Same
-  distribution, different phase: both means sit within 0.2% of the EV
+  distribution, different phase: the new mean sits 0.18% from the EV pin
+  and the old one 0.27%, both well inside the example's own 2% band.
   pin.
 
   That seventh fire is worth naming, because it IS the trap: the old
@@ -254,15 +283,32 @@ in Rust can still write a struct literal.
   never meant "only that action" — it meant "at most one per
   cooldown-length, whoever happens to trigger it".
 
-  Within one `apply_buff` list there is a deliberate asymmetry, and it is
-  the surprising part: a `duration` EXPRESSION is sequential (it reads sim
-  state, so a later entry sees earlier entries' stack counts) while a
-  snapshot magnitude is FROZEN at the world the cast found (it reads a
-  build, captured once before the list runs, so a later entry does not see
-  earlier entries' `contributions`). Freezing is what makes the damaging
-  and utility paths agree — a damaging action freezes its overlay, a
-  utility action freezes the plain effective build, and the same list now
-  means the same thing on both.
+  Within one `apply_buff` list, what a later entry sees splits across
+  THREE axes — not the two an earlier draft of these docs claimed, and the
+  third is a genuine trap:
+
+  - **sim STATE is SEQUENTIAL.** The slot array is refreshed per entry, so
+    a `duration` expression sees earlier entries' stack counts and live
+    windows.
+  - **the BUILD is FROZEN**, captured once before the list runs, so a
+    snapshot magnitude does NOT see earlier entries' `contributions`.
+  - **CONDITIONS are LIVE.** They are not part of the frozen build; the
+    effective phase is rebuilt from every live buff on every application.
+    So a snapshot magnitude DOES see a condition an earlier entry drives.
+
+  The consequence: for a snapshot `tick_objective` whose objective reads a
+  condition, LIST ORDER alone changes the captured rate, and no integrated
+  report column shows it. Pinned by
+  `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
+  where reordering a two-entry list doubles the DoT (400 → 800) at an
+  identical 0.8 reported uptime. Whether the phase should be frozen
+  alongside the build is an open 0.4.0 question in `ROADMAP.md` — a
+  behavior change, deliberately not made here.
+
+  What the freeze DOES buy is intact, and is also pinned in both list
+  orders: the damaging and utility paths agree. A damaging action freezes
+  its overlay, a utility action freezes the plain effective build, and the
+  same list means the same thing on both.
 
   New public API: `CompiledAction::apply_buff` (`Vec<usize>`) and
   `CompiledProc::actions` (`Option<Vec<usize>>`), both resolved to
@@ -277,7 +323,7 @@ in Rust can still write a struct literal.
   considers every action. **Caveat for Rust downstreams:** that is a
   statement about JSON. Adding a field to `ActionDef` and `ProcDef` is
   SOURCE-breaking for anyone constructing either with an exhaustive struct
-  literal (this repo's own 53-literal churn is the proof). Permitted under
+  literal — this repo had to touch every fixture in the file. Permitted under
   0.x, but an upgrader deserves the warning; add `apply_buff: Vec::new()`
   / `actions: None`, or switch to `..Default::default()` on `ActionDef`.
 
@@ -338,12 +384,22 @@ in Rust can still write a struct literal.
   (`HORIZON_DRAIN_LIMIT`) and fails closed naming the looping event,
   matching the instant-cast livelock guard's shape.
 
-  **Upgrading from 0.2.0: this can move your numbers.** Any config with
-  INTEGER buff durations will eventually land an expiry exactly on an
-  integer fight's horizon, and every such config was losing its final
-  cast. The symptom is an off-by-one cast count that depends on the buff
-  duration: a 10s fight of 1s casts applying a `refresh` buff reported 9
-  casts at durations 2 / 5 / 9, and 10 at 9.5. Nothing in this repo moved
+  **Upgrading from 0.2.0: this can move your numbers.** Not every config
+  with integer buff durations — the condition is narrower, and stating it
+  as an absolute would be wrong: a SECOND event has to land on the
+  horizon alongside the cast completing there. A buff whose expiries
+  happen to fall on `duration` does it; one whose duration is long enough
+  that no expiry reaches the horizon at all does not, and neither does
+  one whose expiries simply miss it. The symptom is an off-by-one cast
+  count that depends on the buff duration: a 10s fight of 1s casts
+  applying a `refresh` buff reported 9 casts at durations 2 / 5 / 9 —
+  and a CORRECT 10 at duration 9.5, and a correct 10 at any duration ≥
+  10, where no expiry lands on t=10.
+
+  A `BuffExpire` is only the most likely second event; a `PhaseBoundary`
+  from a trailing zero-weight phase does it too. The bug was never
+  specific to buffs — it was "at most one event resolves at the
+  horizon". Nothing in this repo moved
   — no `sim::exec` pin, and `diablo4_rotation` holds byte for byte
   (225199.1088 / 3753.31848 / 0.4, MC block included), because its 60th
   cast was already alone at the horizon and its `vuln_window` expiries
@@ -413,6 +469,55 @@ in Rust can still write a struct literal.
   reads sim state, so a later entry sees earlier entries' stack counts)
   while a snapshot MAGNITUDE is frozen (it reads a build, captured once).
 
+- **`ProcDef::icd` is validated fail-closed at `sim::compile`.** It is a
+  bare literal rather than a `NumOrExpr`, so it never went through P7b's
+  evaluation-instant checks and was the last unvalidated number in the sim
+  config. Both bad values failed SILENTLY, and NaN failed in the worst
+  direction: the ICD gate is `now < icd_ready_at`, false for every `now`
+  once that deadline is NaN — so `icd: NaN` DELETED the internal cooldown
+  instead of tightening it, turning a gated proc into an ungated one with
+  no error anywhere. `icd` must now be finite and `>= 0`, with the same
+  positioned error its neighbours produce. **Upgrade note:** this rejects
+  a config that compiled in 0.2.0, but only one whose `icd` was NaN,
+  infinite, or negative — none of which can be deliberate. Pinned by
+  `a_non_finite_or_negative_proc_icd_is_a_compile_error`.
+
+- **`SimReport::condition_uptime` is clamped to `[0, 1]` for buff-driven
+  values.** A condition is an uptime FRACTION, and `Plan` clamps it to
+  that range where it actually folds — but the executor's integrator read
+  `BuffDef::conditions`' raw number, so a buff writing `{ "marked": 5.0 }`
+  folded as `1.0` and REPORTED `5 ×` its live fraction. The diagnostic
+  disagreed with the value the math used. `Sim::condition_value`'s
+  scenario branch had always clamped; the buff branch now matches.
+  **Report-only** — no damage, uptime or dps number moves, only the
+  `condition_uptime` map, and only for a config that wrote a value outside
+  `[0, 1]` in the first place. Pinned by
+  `a_buff_driven_condition_uptime_is_clamped_like_the_value_that_folds`.
+
+### Documented (behavior unchanged, but it was not written down)
+
+Three composition rules that a config could hit in 0.2.0 and that no
+public doc stated. None of them changes here; all three are now pinned so
+that changing them later has to be deliberate.
+
+- **`Trigger::OnHit` rolls once per damaging CAST, not once per hit.** The
+  name says otherwise, and `hits_per_use: 5` still presents exactly one
+  roll — weight `1.0` in EV, one draw in MC. A lucky-hit-style proc that
+  should scale with a multi-hit skill is not expressible; fold the
+  per-hit rate into `chance` by hand. Pinned in both modes by
+  `on_hit_rolls_once_per_cast_not_once_per_hit`, and whether it SHOULD
+  scale is an open 0.4.0 question in `ROADMAP.md`.
+- **Two live buffs driving the same condition resolve by BUFF NAME
+  order.** The alphabetically first live buff wins — not the strongest,
+  not the most recently applied, and they are never summed. Renaming a
+  buff can therefore change your number. Pinned, rename control included,
+  by `two_buffs_driving_one_condition_resolve_by_buff_name_order`.
+- **A proc-triggered free cast, and every DoT tick, stay EV-blended under
+  `Mode::MonteCarlo`.** Both were v1 scope limits recorded only in a
+  PRIVATE module doc, which never rendered on docs.rs while the public
+  `Mode::MonteCarlo` said damage and crits are sampled with no exception.
+  The caveats now live on the public type.
+
 ### Docs
 
 - **A buff expiring on the cast grid.** New `sim` module-docs
@@ -431,6 +536,19 @@ in Rust can still write a struct literal.
   should change (a `CastComplete` arguably ought to out-rank a coincident
   `BuffExpire`) is an open 0.4.0 question in `ROADMAP.md`, explicitly not
   decided here.
+
+- **"Frozen at the world the cast found" was too strong, and is
+  corrected.** The `apply_buff` capture semantics were documented as a
+  two-way split (sim state sequential / build frozen). There is a THIRD
+  axis: CONDITIONS are LIVE, because `refresh_effective_state` rebuilds
+  the effective phase on every application while the build clone stays
+  put. So a snapshot capture DOES see a condition an earlier list entry
+  drives, and list ORDER alone can change a captured DoT rate — pinned at
+  a 2× swing with an identical reported uptime. Corrected in four places
+  (`sim` module docs, `ActionDef::apply_buff`, `Sim::apply_action_buffs`,
+  and the P7d entry above). Behavior is unchanged, and the property the
+  freeze exists for is intact and now pinned in both list orders: the
+  damaging and utility action paths agree.
 
 - **The crate README describes the engine that exists.** It had not moved
   since 0.1.0: it presented `rtce` as evaluate-only, named three config
@@ -471,7 +589,8 @@ runnable Diablo 4 slice and computed (not asserted) uptimes.
   under both `Mode::Expected` (deterministic, branch-blended exactly like
   `evaluate` — proven to agree with it EXACTLY on a degenerate config) and
   `Mode::MonteCarlo { iterations, seed }` (seeded independent timeline
-  runs via a new zero-dependency in-crate PCG32 and `Plan::evaluate_sampled`,
+  runs via a new zero-dependency in-crate PCG32 and `Plan`'s internal
+  sampled per-phase evaluation,
   pooled into mean-field reports plus a `dps` `Distribution`). Only
   per-cast damage/proc OUTCOMES differ by mode; rotation timing never
   does. Procs fire via a deterministic accumulator in EV mode
@@ -535,5 +654,7 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.3.0
 [0.2.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.2.0
 [0.1.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.1.0

@@ -88,12 +88,17 @@
 //!   the action resolve before effects merely TRIGGERED by it, so the
 //!   whole `apply_buff` list precedes the whole proc batch and the two
 //!   never interleave, whatever the procs' name order.
-//! - Within one `apply_buff` list, a `duration` expression IS sequential
-//!   (it reads sim state, so a later entry sees earlier entries' STACK
-//!   COUNTS) while a snapshot [`crate::simdef::TickObjective`] magnitude
-//!   is FROZEN at the world the cast found (it reads a build, and that
-//!   build is captured once before the list runs, so a later entry does
-//!   NOT see earlier entries' CONTRIBUTIONS). Both halves are pinned.
+//! - Within one `apply_buff` list, what a later entry sees splits across
+//!   THREE axes, not two (the full statement is on
+//!   [`crate::simdef::ActionDef::apply_buff`]): sim STATE is SEQUENTIAL
+//!   (`stacks.*`, `buff.*`, resource amounts — a `duration` expression
+//!   reads them fresh per entry); the BUILD is FROZEN once before the
+//!   list runs (so a snapshot [`crate::simdef::TickObjective`] magnitude
+//!   does NOT see earlier entries' `contributions`); and CONDITIONS are
+//!   LIVE (a snapshot capture DOES see a condition an earlier entry
+//!   drives, because the effective phase is rebuilt on every
+//!   application). All three are pinned. The third one is the one that
+//!   surprises: list ORDER alone can change a captured DoT rate.
 //!
 //! A proc-triggered FREE cast ([`crate::simdef::ProcDef::cast_action`])
 //! runs `gain` → damage → `apply_buff` at the firing proc's instant, and
@@ -185,7 +190,7 @@
 //!
 //! # Sim slot layout
 //!
-//! A future executor maintains one flat `&[f64]` slot array shaped
+//! The executor ([`run`]) maintains one flat `&[f64]` slot array shaped
 //! `[Plan's own slot layout | sim slots]` — [`compile::SimPlan::sim_base`]
 //! marks where the sim segment begins, [`compile::SimPlan::slot_width`]
 //! its total width. The sim segment itself is laid out in EXACTLY this

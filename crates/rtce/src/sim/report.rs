@@ -35,6 +35,17 @@ pub struct SimReport {
     /// condition (see design spec); this is the resulting blended
     /// average, the Level-2 analogue of a `Scenario` phase's asserted
     /// uptime.
+    ///
+    /// Always in `[0, 1]`. Every contributing value is clamped to that
+    /// range before it is integrated — the same clamp `Plan` applies where
+    /// the condition actually folds — so this diagnostic can never
+    /// disagree with the value the math used. A
+    /// [`crate::simdef::BuffDef`] writing `conditions: { x: 5.0 }` folds
+    /// as `1.0` and now reports `1.0`; before 0.3.0 the buff-driven branch
+    /// was un-clamped and reported above `1`.
+    ///
+    /// When two live buffs drive the SAME condition, the one whose NAME
+    /// sorts first wins — see [`crate::simdef::BuffDef::conditions`].
     pub condition_uptime: BTreeMap<String, f64>,
     /// Per-resource health: time spent starved (blocked from an
     /// otherwise-eligible action purely by insufficient resource) and

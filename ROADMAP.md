@@ -20,7 +20,8 @@
   fail-closed extended symbol space; a discrete-event `sim::run` sharing
   ONE decision loop across `Mode::Expected` (keystone-proven to agree
   with `Plan::evaluate` exactly) and `Mode::MonteCarlo` (seeded, a new
-  in-crate PCG32, `Plan::evaluate_sampled`); `SimReport` with COMPUTED
+  in-crate PCG32, and per-cast sampled evaluation inside `Plan`);
+  `SimReport` with COMPUTED
   buff/condition uptimes and resource health in place of `Scenario`'s
   asserted ones; `examples/diablo4_rotation.rs` (mana, a spender/generator
   pair, a proc-gated buff window, hand-worked EV + Monte Carlo pins),
@@ -47,12 +48,21 @@
   PoE2-shaped fixture, `poe2_charges` / `poe2_poison` / `poe2_triggers`,
   each with hand-derived pins and contrast runs (P7e).
 
-  Five behavior fixes, all CHANGELOG'd with what kind of config each can
-  move numbers for: the horizon drain (below), EV's `on_crit` weight
-  measured before the cast's own procs, per-proc slot refresh, resource
-  `max`/`regen_per_sec` re-derived at every refold, and the `apply_buff`
-  snapshot overlay frozen on both action paths. 176 tests green (168 in
-  the `rtce` lib), `cargo publish -p rtce --dry-run` clean at 0.3.0.
+  Seven behavior fixes, all CHANGELOG'd with what kind of config each
+  affects: the horizon drain (below), EV's `on_crit` weight measured
+  before the cast's own procs, per-proc slot refresh, resource
+  `max`/`regen_per_sec` re-derived at every refold, the `apply_buff`
+  snapshot overlay frozen on both action paths, `ProcDef::icd` validated
+  fail-closed (NaN used to DELETE the internal cooldown silently), and
+  `SimReport::condition_uptime` clamped to `[0,1]` for buff-driven values.
+
+  Plus a release-review pass: `#[non_exhaustive]` swept across every
+  engine-produced type (the last free window for it), and three
+  previously-undocumented composition rules pinned — `on_hit` rolls per
+  CAST not per hit, two buffs on one condition resolve by buff NAME, and
+  a same-list `apply_buff` capture reads a frozen BUILD against a LIVE
+  PHASE. 181 tests green (173 in the `rtce` lib),
+  `cargo publish -p rtce --dry-run` clean at 0.3.0.
 
   **The horizon-drain bug (found P7e, fixed P7e-T2).**
   `sim::exec::run_loop` processed at most ONE event at `t == duration`: it
@@ -130,12 +140,20 @@
       `benches/` entry, not an optimization.
 
 ## Open for 0.4.0
-These accumulated during P7 and were deliberately NOT decided in 0.3.0.
-The first three are config-compatibility changes and want to land
-together, in one slice with a migration note. The last two are open
-design questions: today's behavior is documented and pinned, which is not
-the same as being right, and neither should be guessed at without a
-config that needs the answer.
+These accumulated during P7 and its release review, and were deliberately
+NOT decided in 0.3.0. Three groups:
+
+- **Config-compatibility changes** (the `apply_buff` arity, the
+  `ProcDef::actions` shape, the `deny_unknown_fields` sweep) — they
+  reject or reshape configs that parse today, so they want ONE slice with
+  a single migration note.
+- **Open design questions** (the `CastComplete`/`BuffExpire` ordering,
+  the per-stack `product` fold, the frozen-vs-live capture phase, whether
+  `on_hit` scales with `hits_per_use`) — today's answer is documented and
+  pinned in each case, which is not the same as being right. None should
+  be guessed at without a config that needs the answer.
+- **API and coverage debt** (`SimScratch`, the `ProcDef` effect arity,
+  the untested `refresh`+live-DoT path, `expr::MAX_STACK`).
 
 - [ ] Harmonize `apply_buff`'s ARITY between `ActionDef` (a
       `Vec<String>` list) and `ProcDef` (a single `Option<String>`) —
@@ -221,6 +239,53 @@ config that needs the answer.
       which is a `GameDef`-level addition (new `FoldKind`, or a per-
       contribution flag) rather than a `SimDef` one — so the shape should
       be chosen by a config that actually needs `×1.331`, not guessed at.
+- [ ] **Should a same-list `apply_buff` capture freeze the PHASE too?**
+      (0.3.0 release review) — OPEN, deliberately not decided in 0.3.0.
+      `Sim::apply_action_buffs` freezes the BUILD before the list runs,
+      but `Sim::apply_buff` refolds per entry and
+      `Sim::refresh_effective_state` rebuilds `effective_phase` from
+      `Sim::condition_value` each time — so a snapshot capture reads a
+      frozen build against a LIVE phase. A list of `["mark", "poison"]`
+      where `mark` drives both a bucket contribution and a condition gives
+      the poison the condition and not the contribution, and reordering
+      the two doubles the DoT at an identical reported `uptime` and
+      `avg_stacks` (pinned:
+      `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
+      400 vs 800). Arguably wrong — one application instant should
+      plausibly present one world. NOT changed in 0.3.0: it is
+      long-standing behavior, it would move numbers for any config with a
+      condition-reading snapshot DoT, and the property the freeze was
+      built for (the damaging and utility paths agreeing) holds in both
+      orderings either way.
+- [ ] **Should `Trigger::OnHit` scale with `hits_per_use`?** (0.3.0
+      release review) — OPEN. Today it rolls once per damaging CAST, so a
+      5-hit skill offers one roll, and a lucky-hit-style ARPG proc has to
+      fold the per-hit rate into `chance` by hand. Pinned in both modes by
+      `on_hit_rolls_once_per_cast_not_once_per_hit`. Two spellings of the
+      fix differ (weight the EV accumulator by `hits` vs loop the roll),
+      and they are NOT equivalent under an ICD — so this wants a config
+      that needs it, not a guess.
+- [ ] `sim::SimScratch` is public, constructible, and accepted by
+      nothing — `sim::run` builds its own internally (0.3.0 release
+      review). It is the clearest piece of dead public API in the crate.
+      Either give `run` a `_with_scratch` variant that takes it (the
+      `Plan::scratch` / `Plan::evaluate` shape, which is the point of
+      having the type at all) or remove it. Removing is breaking, so
+      0.4.0 either way.
+- [ ] A `ProcDef` can do exactly ONE of `apply_buff` / `cast_action`, and
+      the limitation is enforced but not stated on the type (0.3.0 release
+      review). Either document it as permanent or allow both; a proc that
+      applies a buff AND free-casts is a plausible ARPG mechanic.
+- [ ] Coverage gaps recorded rather than closed in 0.3.0 (release
+      review): `refresh` with a LIVE `tick_objective` — the 0.2.0 default
+      DoT shape — has no behavioral test, no live tick objective runs
+      under `Mode::MonteCarlo` at all, and `ReapplyPolicy::Strongest` is
+      EV-only and example-free. None is a known bug; all three are places
+      a bug could hide.
+- [ ] `expr::MAX_STACK` is unreachable in practice (the depth guard trips
+      first) but is named in public docs as though a config could hit it
+      (0.3.0 release review). Either prove it reachable with a fixture or
+      stop advertising it as a failure mode.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

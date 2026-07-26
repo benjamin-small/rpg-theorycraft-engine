@@ -16,7 +16,11 @@ pub const MAX_EVENTS: usize = 8;
 /// config (unknown/duplicate names, too many events, reserved names) or a
 /// bad runtime input (unknown stat/bucket/event/condition reference,
 /// non-finite/negative phase weight, empty scenario).
+///
+/// `#[non_exhaustive]`: the engine's to extend with more positional or
+/// contextual detail; no consumer constructs one.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PlanError {
     /// Human-readable description of what went wrong.
     pub what: String,
@@ -252,7 +256,12 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
 
 /// Per-phase teaching trace — the "show your work" path. Allocates freely;
 /// tracing is OFF on the evaluate() hot path.
+///
+/// `#[non_exhaustive]`: a read-only report the engine produces and no
+/// consumer constructs — the same category as `sim::report`'s types, so
+/// later measurements are additive rather than breaking.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct Explanation {
     /// Same values, same order, as `evaluate`'s objective slice.
     pub objectives: Vec<f64>,
@@ -263,7 +272,12 @@ pub struct Explanation {
 /// Teaching trace for one scenario phase: every condition/bucket/stage
 /// value it resolved to, plus every event-branch a `branched` stage
 /// enumerated.
+///
+/// `#[non_exhaustive]`: a read-only report the engine produces and no
+/// consumer constructs — the same category as `sim::report`'s types, so
+/// later measurements are additive rather than breaking.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct PhaseTrace {
     /// This phase's name.
     pub name: String,
@@ -284,7 +298,12 @@ pub struct PhaseTrace {
 
 /// One event-branch of one `branched` stage: which events fired, that
 /// branch's probability weight, and the value it contributed.
+///
+/// `#[non_exhaustive]`: a read-only report the engine produces and no
+/// consumer constructs — the same category as `sim::report`'s types, so
+/// later measurements are additive rather than breaking.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct BranchTrace {
     /// Name of the `branched` stage this branch belongs to.
     pub stage: String,

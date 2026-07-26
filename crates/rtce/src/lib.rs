@@ -6,9 +6,12 @@
 //! algorithm once as JSON (or any `serde`-compatible source), `rtce`
 //! compiles it into a flat evaluation [`plan::Plan`], and every candidate
 //! build then evaluates against that plan in microseconds. This is what
-//! lets an external driver price tens of thousands of gear permutations
-//! per second: the expensive parsing/compiling work happens once, and the
-//! hot path (`Plan::evaluate`) allocates nothing.
+//! lets an external driver price whole candidate sets cheaply: the
+//! expensive parsing/compiling work happens once, and the hot path
+//! ([`plan::Plan::evaluate`]) allocates nothing, walking a preallocated
+//! slot array instead. That is a structural claim about the design, not a
+//! measured throughput figure — no benchmark harness ships with the crate
+//! yet.
 //!
 //! # Three fidelity levels
 //!
@@ -37,7 +40,9 @@
 //!    and factor expressions, and the ordered pipeline of named stages.
 //!    Written once per game, changes rarely. Turned into a [`plan::Plan`]
 //!    by [`plan::compile`] — this is the "compile once" half of the
-//!    contract, and it's the only place expressions are parsed.
+//!    contract, and it's the only place a `GameDef`'s expressions are
+//!    parsed ([`sim::compile`] is the matching single parse point for a
+//!    [`simdef::SimDef`]'s).
 //! 2. [`build::BuildState`] — ONE candidate. Raw stat values plus a list
 //!    of tagged [`build::Contribution`]s into buckets (each optionally
 //!    gated by an event or a condition). This is the only artifact that
@@ -118,8 +123,9 @@
 //! asserted and run in CI. Run any with
 //! `cargo run -p rtce --example <name>`:
 //!
-//! - `your_own_game` — the smallest starting point: all three evaluation
-//!   tiers on a made-up archer game, two scenarios, `explain()` output.
+//! - `your_own_game` — the smallest starting point: the three closed-form
+//!   config tiers on a made-up archer game, two scenarios, `explain()`
+//!   output. Level 1 only; it never calls [`sim::run`].
 //! - `diablo4_basics` — one build priced against two fights on a real
 //!   game's damage slice, plus the branch table behind the crit
 //!   expectation.

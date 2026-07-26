@@ -47,7 +47,12 @@ pub struct Candidate {
 
 /// One candidate's priced objectives, across every scenario it was
 /// evaluated against.
+///
+/// `#[non_exhaustive]`: a read-only report the engine produces and no
+/// consumer constructs — the same category as `sim::report`'s types, so
+/// later measurements are additive rather than breaking.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct CandidateResult {
     /// Echoes the `Candidate::id` this result was priced from.
     pub id: String,
