@@ -67,10 +67,25 @@
       holds more than 4: the length is bounded by duration ÷ application
       cadence, and `max_stacks: 0` does not by itself make a list long.
       P7c-T2 added a third whole-list scan (`Sim::snapshot_total`, once
-      per refold) on the same tiny lists. Left deferred, and now
-      deliberately WITHOUT a nominated witness — revisit when a config
-      actually drives a long-duration, high-frequency stack (hundreds of
-      instances), and measure first.
+      per refold — and a second time per APPLICATION in debug builds, via
+      the fold-gate assertion in `Sim::apply_buff`) on the same tiny
+      lists. Left deferred, and now deliberately WITHOUT a nominated
+      witness — revisit when a config actually drives a long-duration,
+      high-frequency stack (hundreds of instances). Measure first: there
+      is no bench harness in this repo yet, so the first step is a
+      `benches/` entry, not an optimization.
+- [ ] Crate-wide `deny_unknown_fields` on the config structs (P7c-T2
+      review, fail-closed hygiene). P7c-T2 put the guard on
+      `TickObjectiveObj` only. The larger hole is one level up: a
+      misspelled `tick_objectiv` on `BuffDef` is silently ignored and
+      silently means "this buff has no DoT" — a quieter wrong answer than
+      the typo the local guard catches. Applying it to `GameDef`/
+      `SimDef`/`BuildState`/`Scenario` and friends is a compatibility
+      decision (it rejects configs that parse today), so it wants its own
+      slice and a 0.4.0 note. Alongside it: untagged enums (`NumOrExpr`,
+      `TickObjectiveRepr`) report "data did not match any variant" rather
+      than the inner field error, which is positioned but unhelpful —
+      worth a hand-written `Deserialize` if the sweep happens.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

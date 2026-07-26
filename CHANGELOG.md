@@ -86,11 +86,23 @@ until then, per semver's "anything goes" pre-1.0 clause).
   Nothing re-reads the `Plan` for such a buff, so an instance is immune to
   every later stat, phase and buff change — PoE2 ailment semantics.
 
+  A rate is captured against the state the instance LANDS ON — before its
+  own application folds in, the same instant `duration` is evaluated at.
+  A buff whose own `contributions` feed the objective it ticks therefore
+  SELF-AMPLIFIES, one application behind.
+
   A captured rate belongs to the APPLICATION and is never re-captured:
   `add_refresh_all` pushes an existing instance's EXPIRY out onto the
   shared clock while leaving its rate alone, and only a new instance
-  (`refresh`'s replacement, an `add_independent` push, a `strongest`
-  win) ever carries a new one.
+  (`refresh`'s replacement, an `add_independent` push, a `strongest` win)
+  ever carries a new one. The policies differ sharply in what they do with
+  a captured rate, and each variant documents its own case: `refresh`
+  re-captures unconditionally, so a reapplication in a weaker moment
+  LOWERS the DoT (the opposite of `strongest`); `add_refresh_all` never
+  re-captures, and AT THE CAP discards the incoming rate entirely while
+  still resetting the shared clock, so a capped stack can ride an old
+  snapshot indefinitely; `add_independent` evicts the earliest-EXPIRING
+  instance at the cap, not the weakest.
 
   `on_reapply: strongest` (PoE2 ignite) is now honored: the incoming
   instance replaces the incumbent only when its snapshot rate is STRICTLY
@@ -106,6 +118,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
   included. New public API: `simdef::TickObjective` and
   `sim::CompiledTick`; `CompiledBuff::tick_objective` is now
   `Option<CompiledTick>` rather than `Option<usize>`.
+
+  A snapshot rate is EV-blended in both modes (the capture calls
+  `Plan::evaluate_phase`, never `evaluate_phase_sampled`), inherited from
+  0.2.0's DoT integration: a tick is a continuous rate, not an event to
+  sample. That is why EV and Monte Carlo agree so tightly on snapshot-DoT
+  totals — they differ in when instances are applied, never in what each
+  captures.
 
 - **Fixed (behavior): a proc's effect is now visible to a later proc in
   the same trigger batch.** Proc `chance` expressions were evaluated

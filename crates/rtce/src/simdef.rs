@@ -199,6 +199,11 @@ pub struct ActionDamage {
     /// `0`). A buff applied by this cast's own procs is NOT visible —
     /// which is the point: a proc triggered by a hit cannot change what
     /// that hit was.
+    ///
+    /// PRECEDENCE: a [`crate::scenario::Phase`] `stats` override for the
+    /// same stat WINS over this overlay (phase > overlay > build — the
+    /// phase is written last into the slot array). Overriding a stat here
+    /// is therefore not a guarantee for the phases that also name it.
     #[serde(default)]
     pub stats: BTreeMap<String, NumOrExpr>,
 }
@@ -216,16 +221,32 @@ pub enum ReapplyPolicy {
     /// buff — and the degenerate case of the whole instance model, which
     /// is why it is the default and why [`BuffDef::max_stacks`] must be
     /// `1` alongside it.
+    ///
+    /// With a SNAPSHOT [`BuffDef::tick_objective`], the replacement
+    /// re-captures the rate UNCONDITIONALLY — so a reapplication in a
+    /// weaker moment LOWERS the DoT, which is exactly the opposite of
+    /// [`ReapplyPolicy::Strongest`]. Pick deliberately between them.
     #[default]
     Refresh,
     /// Count `+1` up to [`BuffDef::max_stacks`], then EVERY instance's
     /// expiry is reset to `now + duration` — one shared clock, so the
     /// whole stack falls off together (PoE2 charges). At the cap no new
     /// instance is added, but the shared clock is still reset.
+    ///
+    /// With a SNAPSHOT [`BuffDef::tick_objective`], the shared clock moves
+    /// EXPIRIES ONLY: an existing instance keeps the rate it captured,
+    /// however long its window is subsequently extended for. Two
+    /// consequences worth knowing before choosing this policy — at the cap
+    /// the incoming application captures nothing at all (no instance is
+    /// added, so its rate is discarded while the clock still resets), and
+    /// a continuously-refreshed capped stack can therefore ride a rate
+    /// captured arbitrarily long ago.
     AddRefreshAll,
     /// A new instance with its OWN duration, expiring independently
     /// (PoE2 poison). At [`BuffDef::max_stacks`] the earliest-expiring
-    /// instance is evicted to make room.
+    /// instance is evicted to make room — the earliest-EXPIRING, not the
+    /// weakest, so with a SNAPSHOT [`BuffDef::tick_objective`] a capped
+    /// stack can evict a strong instance in favour of a weak one.
     AddIndependent,
     /// A new instance replaces the incumbent only if its snapshot rate is
     /// STRICTLY higher (PoE2 ignite). It needs a magnitude to compare, so
@@ -279,6 +300,20 @@ pub struct TickObjective {
     ///   already inherent in it and is never multiplied in a second time.
     ///   This is PoE2 ailment semantics, and what
     ///   [`ReapplyPolicy::Strongest`] compares instances by.
+    ///
+    /// A capture is taken at the application instant against the state the
+    /// instance LANDS ON — before this application's own effects fold in.
+    /// So if the buff's own [`BuffDef::contributions`] feed the objective
+    /// it ticks, it SELF-AMPLIFIES on reapplication, one application
+    /// behind: the first instance captures the un-buffed rate, the second
+    /// captures it with one stack live, and so on. Deliberate, and the
+    /// same instant [`BuffDef::duration`] is evaluated at; if you want the
+    /// first instance to see itself, it cannot be expressed here.
+    ///
+    /// What each [`ReapplyPolicy`] does with a captured rate differs
+    /// sharply — see the variants; `refresh` re-captures unconditionally,
+    /// `add_refresh_all` never re-captures, and `strongest` re-captures
+    /// only on an improvement.
     pub snapshot: bool,
 }
 
@@ -320,6 +355,13 @@ enum TickObjectiveRepr {
 /// `deny_unknown_fields` is a struct-level serde attribute — it does not
 /// exist on an enum VARIANT, and silently accepting a typo'd key is not an
 /// option here.
+///
+/// Note the guard is LOCAL to this object, not a crate-wide policy: a
+/// misspelled `tick_objectiv` on [`BuffDef`] itself is still silently
+/// ignored (and silently means "no DoT"), which is the bigger hole. Making
+/// every config struct `deny_unknown_fields` is a crate-wide hygiene
+/// change with its own compatibility question, tracked in ROADMAP for
+/// 0.4.0 rather than smuggled in here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TickObjectiveObj {

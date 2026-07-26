@@ -981,9 +981,12 @@ mod tests {
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("burning"), "got: {}", e.what);
         assert!(e.what.contains("max_stacks"), "got: {}", e.what);
-        // `0` (unbounded) is no more honorable than 2.
+        // `0` (unbounded) is no more honorable than 2 — and must be
+        // rejected by THIS rule, not incidentally by another one.
         simdef.buffs.get_mut("burning").unwrap().max_stacks = 0;
-        assert!(compile(&plan, &simdef, &valid_rotation()).is_err());
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("burning"), "got: {}", e.what);
+        assert!(e.what.contains("max_stacks"), "got: {}", e.what);
     }
 
     // The positive case: with both preconditions met, `strongest` compiles
