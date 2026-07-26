@@ -21,6 +21,14 @@
 //! - `buff_remaining.<buff>` — seconds remaining on `<buff>`'s duration.
 //! - `casts.<action>` — number of times `<action>` has been cast so far.
 //!
+//! Five further fields are expression-valued (P7b) and compile against
+//! this SAME space, each evaluated at its own documented instant rather
+//! than once up front: `BuffDef::duration`, `ActionDef::cooldown`, the
+//! `ActionDef::cost`/`gain` amounts, and the `ActionDamage::stats` values.
+//! Each accepts a plain number OR an expression string
+//! ([`crate::simdef::NumOrExpr`], untagged) — every rtce 0.2.0 config,
+//! which only ever wrote numbers there, parses and behaves unchanged.
+//!
 //! Pipeline STAGES and buckets are deliberately absent from this space —
 //! a sim expression referencing one is a fail-closed "unknown identifier"
 //! compile error, the same as any other unresolved name. Resource/action/
@@ -48,7 +56,7 @@ mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledProc, CompiledResource, CompiledRule,
-    ProcEffect, SimPlan,
+    CompiledValue, ProcEffect, SimPlan,
 };
 pub use exec::{run, Mode, SimScratch};
 pub use report::{ActionReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals};

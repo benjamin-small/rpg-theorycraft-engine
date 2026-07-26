@@ -7,7 +7,69 @@
 use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
-use crate::simdef::{Rotation, SimDef, Trigger};
+use crate::simdef::{NumOrExpr, Rotation, SimDef, Trigger};
+
+/// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
+/// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
+/// expression into a [`Program`] over the sim symbol space.
+///
+/// Compiling says nothing about WHEN this gets evaluated — that is fixed
+/// per field and documented on [`NumOrExpr`]; the executor calls
+/// [`CompiledValue::eval`] at exactly that instant and validates the
+/// result fail-closed there.
+#[derive(Debug)]
+pub enum CompiledValue {
+    /// A literal from the config, pre-baked.
+    Const(f64),
+    /// A compiled expression over the sim symbol space.
+    Expr(Program),
+}
+
+impl CompiledValue {
+    /// This value at the instant `slots` describes. Never validates —
+    /// the caller does that at the field's documented evaluation instant,
+    /// so the error can name the field and the instant (see `sim::exec`'s
+    /// `eval_field`).
+    pub fn eval(&self, slots: &[f64]) -> f64 {
+        match self {
+            CompiledValue::Const(v) => *v,
+            CompiledValue::Expr(p) => p.eval(slots),
+        }
+    }
+}
+
+/// Compile one [`NumOrExpr`]; `what` labels the field in the positioned
+/// error an unparseable/unresolvable expression produces (invoked only on
+/// the error path).
+fn compile_value(
+    v: &NumOrExpr,
+    syms: &SimSymbols<'_>,
+    what: impl FnOnce() -> String,
+) -> Result<CompiledValue, PlanError> {
+    match v {
+        NumOrExpr::Num(n) => Ok(CompiledValue::Const(*n)),
+        NumOrExpr::Expr(src) => match compile_expr(src, syms) {
+            Ok(p) => Ok(CompiledValue::Expr(p)),
+            Err(e) => Err(PlanError {
+                what: format!("{}: {e}", what()),
+            }),
+        },
+    }
+}
+
+/// Compile a whole `name -> NumOrExpr` map (cost/gain/damage.stats),
+/// preserving the source map's (sorted) order.
+fn compile_value_map(
+    map: &std::collections::BTreeMap<String, NumOrExpr>,
+    syms: &SimSymbols<'_>,
+    what: impl Fn(&str) -> String,
+) -> Result<std::collections::BTreeMap<String, CompiledValue>, PlanError> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        out.insert(k.clone(), compile_value(v, syms, || what(k))?);
+    }
+    Ok(out)
+}
 
 /// One compiled [`crate::simdef::ResourceDef`]: cap/regen expressions
 /// ready to evaluate against the combined `[plan slots | sim slots]`
@@ -30,17 +92,21 @@ pub struct CompiledAction {
     pub name: String,
     /// Compiled `cast_time` expression.
     pub cast_time: Program,
-    /// Cooldown in seconds, starting when the cast begins.
-    pub cooldown: f64,
-    /// Resource cost paid on cast begin: `(resource index, amount)`.
-    pub cost: Vec<(usize, f64)>,
-    /// Resource gain on cast complete: `(resource index, amount)`.
-    pub gain: Vec<(usize, f64)>,
-    /// Raw per-cast stat override map (from `ActionDamage::stats`), if
-    /// this action deals damage. `hits_per_use` (default `1.0` if absent)
-    /// is read directly out of this map by the executor rather than fed
-    /// into the `Plan` as a stat — see `simdef::ActionDamage` docs.
-    pub damage: Option<std::collections::BTreeMap<String, f64>>,
+    /// Cooldown in seconds, starting when the cast begins — evaluated at
+    /// cast start (see [`crate::simdef::NumOrExpr`]).
+    pub cooldown: CompiledValue,
+    /// Resource cost paid on cast begin: `(resource index, amount)`, the
+    /// amount evaluated at cast start (and at every affordability check).
+    pub cost: Vec<(usize, CompiledValue)>,
+    /// Resource gain on cast complete: `(resource index, amount)`, the
+    /// amount evaluated at cast complete.
+    pub gain: Vec<(usize, CompiledValue)>,
+    /// Compiled per-cast stat override map (from `ActionDamage::stats`),
+    /// if this action deals damage; every value is evaluated at cast
+    /// complete. `hits_per_use` (default `1.0` if absent) is read directly
+    /// out of this map by the executor rather than fed into the `Plan` as
+    /// a stat — see `simdef::ActionDamage` docs.
+    pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -49,8 +115,9 @@ pub struct CompiledBuff {
     /// This buff's name.
     pub name: String,
     /// Duration in seconds once applied (refresh-on-reapply resets to
-    /// this value).
-    pub duration: f64,
+    /// this value) — evaluated at EACH application and snapshotted onto
+    /// that window (see [`crate::simdef::NumOrExpr`]).
+    pub duration: CompiledValue,
     /// Bucket contributions active while this buff is up.
     pub contributions: Vec<Contribution>,
     /// Condition name → value while this buff is active (wins over the
@@ -388,21 +455,27 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         let cast_time = compile_expr(&a.cast_time, &syms).map_err(|e| PlanError {
             what: format!("action `{name}` cast_time: {e}"),
         })?;
-        let cost = a
-            .cost
-            .iter()
-            .map(|(r, v)| (resource_index(r), *v))
-            .collect();
-        let gain = a
-            .gain
-            .iter()
-            .map(|(r, v)| (resource_index(r), *v))
-            .collect();
-        let damage = a.damage.as_ref().map(|d| d.stats.clone());
+        let cooldown = compile_value(&a.cooldown, &syms, || format!("action `{name}` cooldown"))?;
+        let mut cost = Vec::new();
+        for (r, v) in &a.cost {
+            let v = compile_value(v, &syms, || format!("action `{name}` cost `{r}`"))?;
+            cost.push((resource_index(r), v));
+        }
+        let mut gain = Vec::new();
+        for (r, v) in &a.gain {
+            let v = compile_value(v, &syms, || format!("action `{name}` gain `{r}`"))?;
+            gain.push((resource_index(r), v));
+        }
+        let damage = match &a.damage {
+            Some(d) => Some(compile_value_map(&d.stats, &syms, |k| {
+                format!("action `{name}` damage.stats `{k}`")
+            })?),
+            None => None,
+        };
         actions.push(CompiledAction {
             name: name.clone(),
             cast_time,
-            cooldown: a.cooldown,
+            cooldown,
             cost,
             gain,
             damage,
@@ -417,9 +490,10 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .position(|o| o == t)
                 .expect("tick_objective validated above")
         });
+        let duration = compile_value(&b.duration, &syms, || format!("buff `{name}` duration"))?;
         buffs.push(CompiledBuff {
             name: name.clone(),
-            duration: b.duration,
+            duration,
             contributions: b.contributions.clone(),
             conditions: b.conditions.clone(),
             tick_objective,
@@ -480,7 +554,7 @@ mod tests {
     use super::*;
     use crate::gamedef::GameDef;
     use crate::plan;
-    use crate::simdef::{ActionDamage, ActionDef, BuffDef, ProcDef, ResourceDef, Rule};
+    use crate::simdef::{ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ResourceDef, Rule};
     use std::collections::BTreeMap;
 
     /// A small toy `Plan` with enough stats/conditions/objectives to
@@ -521,15 +595,15 @@ mod tests {
 
         let mut actions = BTreeMap::new();
         let mut cost = BTreeMap::new();
-        cost.insert("mana".to_string(), 40.0);
+        cost.insert("mana".to_string(), NumOrExpr::Num(40.0));
         let mut dmg_stats = BTreeMap::new();
-        dmg_stats.insert("coeff_pct".to_string(), 200.0);
-        dmg_stats.insert("hits_per_use".to_string(), 1.0);
+        dmg_stats.insert("coeff_pct".to_string(), NumOrExpr::Num(200.0));
+        dmg_stats.insert("hits_per_use".to_string(), NumOrExpr::Num(1.0));
         actions.insert(
             "fireball".to_string(),
             ActionDef {
                 cast_time: "1.0 / base_aps".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost,
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage { stats: dmg_stats }),
@@ -539,7 +613,7 @@ mod tests {
             "frost_nova".to_string(),
             ActionDef {
                 cast_time: "0".into(),
-                cooldown: 10.0,
+                cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
@@ -552,7 +626,7 @@ mod tests {
         buffs.insert(
             "vuln_window".to_string(),
             BuffDef {
-                duration: 4.0,
+                duration: NumOrExpr::Num(4.0),
                 contributions: Vec::new(),
                 conditions: vuln_conditions,
                 tick_objective: None,
@@ -561,7 +635,7 @@ mod tests {
         buffs.insert(
             "combustion".to_string(),
             BuffDef {
-                duration: 8.0,
+                duration: NumOrExpr::Num(8.0),
                 contributions: vec![Contribution {
                     bucket: "indep".into(),
                     value: 25.0,
@@ -575,7 +649,7 @@ mod tests {
         buffs.insert(
             "burning".to_string(),
             BuffDef {
-                duration: 6.0,
+                duration: NumOrExpr::Num(6.0),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: Some("dot_dps".into()),
@@ -636,7 +710,12 @@ mod tests {
         assert_eq!(sp.actions.len(), 2);
         // BTreeMap order: "fireball" < "frost_nova".
         assert_eq!(sp.actions[0].name, "fireball");
-        assert_eq!(sp.actions[0].cost, vec![(0, 40.0)]);
+        assert_eq!(sp.actions[0].cost.len(), 1);
+        assert_eq!(sp.actions[0].cost[0].0, 0); // "mana"
+                                                // A literal is pre-baked into a constant — no Program at all.
+        assert!(matches!(sp.actions[0].cost[0].1, CompiledValue::Const(v) if v == 40.0));
+        assert!(matches!(sp.actions[1].cooldown, CompiledValue::Const(v) if v == 10.0));
+        assert!(matches!(sp.buffs[0].duration, CompiledValue::Const(v) if v == 6.0));
         assert!(sp.actions[0].damage.is_some());
         assert_eq!(sp.actions[1].name, "frost_nova");
 
@@ -721,7 +800,7 @@ mod tests {
             .get_mut("fireball")
             .unwrap()
             .cost
-            .insert("stamina".into(), 10.0);
+            .insert("stamina".into(), NumOrExpr::Num(10.0));
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("stamina"), "got: {}", e.what);
     }
@@ -735,7 +814,7 @@ mod tests {
             .get_mut("fireball")
             .unwrap()
             .gain
-            .insert("stamina".into(), 10.0);
+            .insert("stamina".into(), NumOrExpr::Num(10.0));
         let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
         assert!(e.what.contains("stamina"), "got: {}", e.what);
     }
@@ -830,7 +909,7 @@ mod tests {
             "basic_bolt".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,

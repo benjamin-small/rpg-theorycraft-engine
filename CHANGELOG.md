@@ -5,6 +5,29 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/) once published (0.x
 until then, per semver's "anything goes" pre-1.0 clause).
 
+## [Unreleased]
+
+**P7 — PoE2 test bed + instance mechanics** (in progress; folded into the
+0.3.0 entry when the phase closes).
+
+- **Expression-valued sim fields (P7b).** `BuffDef::duration`,
+  `ActionDef::cooldown`, the `cost`/`gain` amounts, and the
+  `ActionDamage::stats` values now accept a plain number OR an expression
+  string over the sim symbol space (`simdef::NumOrExpr`, untagged serde —
+  **every 0.2.0 config parses and behaves identically**, pinned by a test
+  that replays the P6 spec's exact numeric JSON and reproduces the P6c
+  starvation cadence). A literal is pre-baked into a constant at
+  `sim::compile`; an expression is parsed there with the usual positioned
+  fail-closed errors (pipeline stages/buckets stay invisible). Evaluation
+  instants are fixed and documented per field: `duration` at application
+  (SNAPSHOTTED onto that window — a later stat/phase change never moves an
+  expiry already in flight), `cooldown` and `cost` at cast start, `gain`
+  and `damage.stats` at cast complete. A non-finite result is a run error
+  at that instant naming the field; `duration`/`cooldown`/`cost`/`gain`
+  additionally reject negatives. `sim::CompiledValue` is new public API,
+  and the `CompiledAction`/`CompiledBuff` fields for these five hold it
+  instead of `f64`.
+
 ## [0.2.0] — 2026-07-22
 
 **P6 — sequencing: the timeline simulator.** A second way to answer "what

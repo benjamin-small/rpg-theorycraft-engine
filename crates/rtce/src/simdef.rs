@@ -31,6 +31,81 @@ pub struct SimDef {
     pub damage_objective: String,
 }
 
+/// A literal number or an expression string, evaluated at a documented
+/// instant.
+///
+/// Untagged: a JSON number deserializes to [`NumOrExpr::Num`] and a JSON
+/// string to [`NumOrExpr::Expr`], so every rtce 0.2.0 config — which only
+/// ever wrote plain numbers in these positions — parses and behaves
+/// EXACTLY as before. A `Num` is pre-baked into a constant at
+/// `sim::compile`; an `Expr` is parsed there against the sim symbol space
+/// (see the `sim` module docs), with the usual positioned, fail-closed
+/// error for an unknown identifier or a syntax problem. Pipeline stages
+/// and buckets are NOT in that space — naming one is a compile error, the
+/// same as any other unresolved name.
+///
+/// # Evaluation instants
+///
+/// An expression is re-evaluated every time its field is USED, at the
+/// instant named below — never once up front:
+///
+/// | Field | Evaluated |
+/// |---|---|
+/// | [`BuffDef::duration`] | at application (snapshotted onto that window) |
+/// | [`ActionDef::cooldown`] | at cast start |
+/// | [`ActionDef::cost`] values | at cast start — and at every decision that merely CHECKS affordability |
+/// | [`ActionDef::gain`] values | at cast complete |
+/// | [`ActionDamage::stats`] values | at cast complete |
+///
+/// A cost expression is therefore RE-CHECKED at each decision point, never
+/// PREDICTED: the executor's resource-affordability wake time is solved
+/// from the cost as evaluated at that decision instant, and if the
+/// expression's value has changed by the time the wake fires, the wake
+/// simply re-decides at the new value (see `sim::exec`'s `earliest_afford`).
+///
+/// # Fail-closed
+///
+/// At its evaluation instant a value that is not finite is a run error
+/// naming the field and the instant; `duration`/`cooldown`/`cost`/`gain`
+/// additionally reject a negative result. [`ActionDamage::stats`] values
+/// may legitimately be negative (a stat is not a quantity of anything), so
+/// only finiteness is enforced there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NumOrExpr {
+    /// Literal value (backward compatible with 0.2.0 configs).
+    Num(f64),
+    /// Expression over the sim symbol space.
+    Expr(String),
+}
+
+/// `0.0` — the same default the `f64` fields carried before these became
+/// expression-valued, so `#[serde(default)]` on `cooldown`/`cost`/`gain`
+/// keeps its 0.2.0 meaning.
+impl Default for NumOrExpr {
+    fn default() -> Self {
+        NumOrExpr::Num(0.0)
+    }
+}
+
+impl From<f64> for NumOrExpr {
+    fn from(v: f64) -> Self {
+        NumOrExpr::Num(v)
+    }
+}
+
+impl From<&str> for NumOrExpr {
+    fn from(s: &str) -> Self {
+        NumOrExpr::Expr(s.to_string())
+    }
+}
+
+impl From<String> for NumOrExpr {
+    fn from(s: String) -> Self {
+        NumOrExpr::Expr(s)
+    }
+}
+
 /// One resource (mana, spirit, fury, …): a capped pool that regenerates
 /// continuously and is spent/gained by actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,15 +124,24 @@ pub struct ActionDef {
     /// stages/buckets) for the cast time in seconds. `"0"` = instant.
     pub cast_time: String,
     /// Cooldown in seconds, starting when the cast begins (`0.0` = none).
+    /// Literal or expression; an expression is evaluated AT CAST START
+    /// (before the cost is deducted) and must be finite and `>= 0` —
+    /// see [`NumOrExpr`].
     #[serde(default)]
-    pub cooldown: f64,
-    /// Resource cost paid when the cast begins, by resource name.
+    pub cooldown: NumOrExpr,
+    /// Resource cost paid when the cast begins, by resource name. Literal
+    /// or expression; an expression is evaluated AT CAST START, and also
+    /// at every decision point that checks whether this action is
+    /// affordable — see [`NumOrExpr`] for why a cost expression is
+    /// re-checked rather than predicted.
     #[serde(default)]
-    pub cost: BTreeMap<String, f64>,
+    pub cost: BTreeMap<String, NumOrExpr>,
     /// Resource gained when the cast completes, by resource name (e.g.
-    /// basic/generator skills).
+    /// basic/generator skills). Literal or expression; an expression is
+    /// evaluated AT CAST COMPLETE and must be finite and `>= 0` — see
+    /// [`NumOrExpr`].
     #[serde(default)]
-    pub gain: BTreeMap<String, f64>,
+    pub gain: BTreeMap<String, NumOrExpr>,
     /// This action's damage effect, if any (omit for utility-only casts).
     #[serde(default)]
     pub damage: Option<ActionDamage>,
@@ -70,9 +154,13 @@ pub struct ActionDef {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActionDamage {
     /// Stat name → override value, applied only while resolving this
-    /// action's damage.
+    /// action's damage. Literal or expression; an expression is evaluated
+    /// AT CAST COMPLETE, ONCE per cast (the same evaluated overlay feeds
+    /// the damage query and the `on_crit` proc weight), and need only be
+    /// FINITE — a stat may legitimately be negative. `hits_per_use` lives
+    /// in this map and follows the same rule. See [`NumOrExpr`].
     #[serde(default)]
-    pub stats: BTreeMap<String, f64>,
+    pub stats: BTreeMap<String, NumOrExpr>,
 }
 
 /// One buff/debuff: a timed window that, while active, contributes to
@@ -81,7 +169,20 @@ pub struct ActionDamage {
 pub struct BuffDef {
     /// Seconds this buff lasts once applied (refresh-on-reapply resets
     /// the remaining duration back to this value).
-    pub duration: f64,
+    ///
+    /// Literal or expression. An expression is evaluated AT EACH
+    /// APPLICATION and SNAPSHOTTED onto the window it starts (or
+    /// refreshes): a stat/phase change afterwards never retroactively
+    /// lengthens or shortens a window already in flight — the NEXT
+    /// application re-evaluates and gets the new value. It is evaluated
+    /// against the state as of the application instant, BEFORE this buff's
+    /// own contributions/conditions are folded into the effective build.
+    /// Must be finite and `>= 0` — see [`NumOrExpr`].
+    ///
+    /// NB: the reserved sim symbol `duration` is the SCENARIO's total
+    /// length in seconds, not this field. An expression here that names
+    /// `duration` reads the fight length.
+    pub duration: NumOrExpr,
     /// Bucket contributions active while this buff is up, folded into the
     /// effective build alongside the base `BuildState`'s own.
     #[serde(default)]
@@ -212,14 +313,18 @@ mod tests {
 
         let fireball = &def.actions["fireball"];
         assert_eq!(fireball.cast_time, "1.0 / base_aps");
-        assert_eq!(fireball.cooldown, 0.0);
-        assert_eq!(fireball.cost["mana"], 40.0);
+        // P7b: these four positions became `NumOrExpr`. Untagged serde
+        // must keep reading the spec's plain JSON NUMBERS as `Num` — this
+        // is the 0.2.0 backward-compatibility contract at the parse layer
+        // (the behavioral half is pinned in `sim::exec`'s tests).
+        assert_eq!(fireball.cooldown, NumOrExpr::Num(0.0));
+        assert_eq!(fireball.cost["mana"], NumOrExpr::Num(40.0));
         assert!(fireball.gain.is_empty());
         let dmg = fireball.damage.as_ref().unwrap();
-        assert_eq!(dmg.stats["coeff_pct"], 200.0);
-        assert_eq!(dmg.stats["hits_per_use"], 1.0);
+        assert_eq!(dmg.stats["coeff_pct"], NumOrExpr::Num(200.0));
+        assert_eq!(dmg.stats["hits_per_use"], NumOrExpr::Num(1.0));
 
-        assert_eq!(def.buffs["vuln_window"].duration, 4.0);
+        assert_eq!(def.buffs["vuln_window"].duration, NumOrExpr::Num(4.0));
         assert_eq!(def.buffs["vuln_window"].conditions["vulnerable"], 1.0);
         assert_eq!(def.buffs["combustion"].contributions.len(), 1);
         assert_eq!(def.buffs["combustion"].contributions[0].bucket, "indep");
@@ -241,6 +346,56 @@ mod tests {
         // Round-trip through serde again (idempotence).
         let reparsed: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
         assert_eq!(reparsed.damage_objective, def.damage_objective);
+    }
+
+    // P7b: the same five positions, written as STRINGS this time — the
+    // untagged enum's other arm. Both arms round-trip, so a config may mix
+    // them freely (`"cost": { "mana": 40.0, "rage": "10 + rage_cost" }`).
+    const EXPR_SIMDEF_JSON: &str = r#"{
+      "actions": {
+        "fireball": {
+          "cast_time": "1.0 / base_aps",
+          "cooldown": "5 + 5",
+          "cost": { "mana": "20 + 10" },
+          "gain": { "mana": 40.0 },
+          "damage": { "stats": { "coeff_pct": "200 * 2", "hits_per_use": 1.0 } }
+        }
+      },
+      "buffs": { "vuln_window": { "duration": "2 + bonus_dur" } },
+      "damage_objective": "hit_after_dr"
+    }"#;
+
+    #[test]
+    fn expression_valued_fields_deserialize_and_round_trip() {
+        let def: SimDef = serde_json::from_str(EXPR_SIMDEF_JSON).unwrap();
+        let fireball = &def.actions["fireball"];
+        assert_eq!(fireball.cooldown, NumOrExpr::Expr("5 + 5".into()));
+        assert_eq!(fireball.cost["mana"], NumOrExpr::Expr("20 + 10".into()));
+        assert_eq!(fireball.gain["mana"], NumOrExpr::Num(40.0));
+        let dmg = fireball.damage.as_ref().unwrap();
+        assert_eq!(dmg.stats["coeff_pct"], NumOrExpr::Expr("200 * 2".into()));
+        assert_eq!(dmg.stats["hits_per_use"], NumOrExpr::Num(1.0));
+        assert_eq!(
+            def.buffs["vuln_window"].duration,
+            NumOrExpr::Expr("2 + bonus_dur".into())
+        );
+
+        // Serializing puts each arm back in its own JSON shape (number
+        // stays a number, expression stays a string) — round-tripping a
+        // config never rewrites a literal as `"40"`.
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(round.actions["fireball"].cooldown, fireball.cooldown);
+        assert_eq!(round.actions["fireball"].gain["mana"], NumOrExpr::Num(40.0));
+    }
+
+    #[test]
+    fn omitted_cooldown_defaults_to_zero() {
+        let def: SimDef = serde_json::from_str(
+            r#"{ "actions": { "a": { "cast_time": "1" } }, "damage_objective": "hit" }"#,
+        )
+        .unwrap();
+        assert_eq!(def.actions["a"].cooldown, NumOrExpr::Num(0.0));
+        assert!(def.actions["a"].cost.is_empty());
     }
 
     #[test]

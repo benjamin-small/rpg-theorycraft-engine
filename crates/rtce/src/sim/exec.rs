@@ -39,6 +39,40 @@
 //! resource amounts, `cooldown.*`, `buff.*`, `buff_remaining.*`,
 //! `casts.*`) right before every expression evaluation.
 //!
+//! # Expression-valued fields and their evaluation instants (P7b)
+//!
+//! Five config fields accept a literal OR an expression
+//! ([`crate::simdef::NumOrExpr`]); a literal is pre-baked into a constant
+//! at compile time, so a 0.2.0 config's numbers reach this executor as the
+//! identical `f64` they always did. An EXPRESSION is re-evaluated at a
+//! fixed instant in this loop's control flow, against the sim slot array
+//! as of that instant, and validated fail-closed there (see
+//! [`eval_field`]):
+//!
+//! | Field | Instant | Where |
+//! |---|---|---|
+//! | `BuffDef::duration` | at application, SNAPSHOTTED onto that window | [`Sim::apply_buff`] |
+//! | `ActionDef::cooldown` | at cast start, before the cost is deducted | [`Sim::begin_cast`] |
+//! | `ActionDef::cost` values | at cast start — and at every decision that CHECKS affordability | [`Sim::begin_cast`], [`Sim::cost_payable`], [`Sim::earliest_afford`] |
+//! | `ActionDef::gain` values | at cast complete | [`Sim::apply_gain`] |
+//! | `ActionDamage::stats` values | at cast complete, ONCE per cast | [`Sim::overlay_build_for_action`] |
+//!
+//! Two consequences worth stating outright:
+//!
+//! - A cost expression is RE-CHECKED, never PREDICTED. The
+//!   resource-starvation wake time [`Sim::earliest_afford`] solves for is
+//!   the earliest instant linear regen affords the cost AS EVALUATED AT
+//!   THAT DECISION; if the expression's value has changed by the time the
+//!   wake fires, the wake just re-decides at the new value (possibly
+//!   scheduling another wake). No event scheduling changed for this: a
+//!   `Wake` was always a "re-run the decision here" marker with no state
+//!   of its own, and it still is. Cooldown-ready wake times likewise stay
+//!   precomputable, because `cooldown_ready_at` is a concrete instant
+//!   fixed when the cast STARTS, not a formula re-read later.
+//! - A buff's duration is snapshotted onto the window it starts: a stat or
+//!   phase change afterwards never retroactively moves an expiry already
+//!   on the heap. (This is also what makes P7c's snapshot DoTs coherent.)
+//!
 //! # Event queue and the spec's named event kinds
 //!
 //! The design spec names six event kinds (`CastComplete`, `BuffExpire`,
@@ -118,7 +152,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use super::compile::{ProcEffect, SimPlan};
+use super::compile::{CompiledValue, ProcEffect, SimPlan};
 use super::report::{ActionReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals};
 use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
@@ -160,6 +194,36 @@ pub enum Mode {
 /// instead cross the `1.0 - 1e-9` line one roll early) — harmless at every
 /// `chance` scale this engine actually models (percent-ish proc rates).
 const PROC_FIRE_EPSILON: f64 = 1e-9;
+
+/// Evaluate one expression-valued sim field ([`crate::simdef::NumOrExpr`])
+/// at its documented evaluation instant, fail-closed: a non-finite result
+/// is always an error, and `nonneg` additionally rejects a negative one
+/// (`duration`/`cooldown`/`cost`/`gain` are quantities of seconds or
+/// resource; `damage.stats` values are stats, which may legitimately be
+/// negative). Never guesses a default and never clamps.
+///
+/// `what` labels the field AND the instant in the error message and is
+/// invoked only on the error path, so the happy path allocates nothing —
+/// which matters because the cost fields are evaluated inside the
+/// rotation's per-decision rule walk.
+fn eval_field(
+    value: &CompiledValue,
+    slots: &[f64],
+    nonneg: bool,
+    what: impl FnOnce() -> String,
+) -> Result<f64, PlanError> {
+    let x = value.eval(slots);
+    if !x.is_finite() || (nonneg && x < 0.0) {
+        return Err(PlanError {
+            what: format!(
+                "{}: evaluated to {x} (must be finite{})",
+                what(),
+                if nonneg { " and >= 0" } else { "" }
+            ),
+        });
+    }
+    Ok(x)
+}
 
 /// Hard bound on consecutive zero-time (`cast_time == 0.0`, `cooldown ==
 /// 0.0`, cost payable) casts chained within ONE decision instant before
@@ -856,8 +920,29 @@ impl<'a> Sim<'a> {
     /// Apply (or refresh, if already active) `bi`: pay-free, instantaneous.
     /// Refresh-on-reapply resets `expire_at` but leaves the active span's
     /// `activated_at`/effective-state untouched (see [`BuffRt`] docs).
+    ///
+    /// The buff's `duration` is evaluated HERE — at the application
+    /// instant — and SNAPSHOTTED onto the window this call starts or
+    /// refreshes: nothing later reads the field again for this window, so
+    /// a stat/phase change afterwards cannot retroactively move the expiry
+    /// already on the heap. It is evaluated against the state as it stands
+    /// BEFORE this buff's own contributions/conditions fold into the
+    /// effective build (an expression here reads the world the buff is
+    /// landing on, never its own effect).
     fn apply_buff(&mut self, bi: usize) -> Result<(), PlanError> {
         let now = self.time;
+        self.refresh_time_varying_slots();
+        let duration = eval_field(
+            &self.sim_plan.buffs[bi].duration,
+            &self.scratch.slots,
+            true,
+            || {
+                format!(
+                    "buff `{}` duration at application (t={now})",
+                    self.sim_plan.buffs[bi].name
+                )
+            },
+        )?;
         if !self.buffs[bi].active {
             self.flush_before_change();
             self.buffs[bi].active = true;
@@ -867,7 +952,7 @@ impl<'a> Sim<'a> {
             self.refresh_after_change()?;
         }
         self.buffs[bi].generation += 1;
-        self.buffs[bi].expire_at = now + self.sim_plan.buffs[bi].duration;
+        self.buffs[bi].expire_at = now + duration;
         let generation = self.buffs[bi].generation;
         self.schedule(
             self.buffs[bi].expire_at,
@@ -924,34 +1009,97 @@ impl<'a> Sim<'a> {
         (r.amount + self.resource_regen[ri] * dt).min(self.resource_max[ri])
     }
 
-    fn cost_payable(&self, action: usize, now: f64) -> bool {
+    /// Label for one `cost`/`gain` entry's fail-closed error (see
+    /// [`eval_field`]) — built only when that error actually fires.
+    fn resource_field_label(&self, action: usize, ri: usize, kind: &str, now: f64) -> String {
+        format!(
+            "action `{}` {kind} `{}` at t={now}",
+            self.sim_plan.actions[action].name, self.sim_plan.resources[ri].name
+        )
+    }
+
+    /// Is every one of `action`'s costs payable right now? The amounts are
+    /// evaluated AT THIS DECISION INSTANT against the current slot array
+    /// (the caller refreshes its time-varying tail first) — see the
+    /// module docs' instants table.
+    fn cost_payable(&self, action: usize, now: f64) -> Result<bool, PlanError> {
+        for (ri, amt) in &self.sim_plan.actions[action].cost {
+            let amt = eval_field(amt, &self.scratch.slots, true, || {
+                self.resource_field_label(action, *ri, "cost", now)
+            })?;
+            if self.resource_amount_now(*ri, now) < amt {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `action`'s cost map evaluated at the current instant, ready to
+    /// spend. Same instant and same fail-closed rule as
+    /// [`Sim::cost_payable`]; materialized into a `Vec` so the amounts are
+    /// fixed BEFORE any resource is mutated (a cost expression that reads
+    /// a resource must not see a sibling cost entry's deduction).
+    fn eval_costs(&self, action: usize, now: f64) -> Result<Vec<(usize, f64)>, PlanError> {
         self.sim_plan.actions[action]
             .cost
             .iter()
-            .all(|&(ri, amt)| self.resource_amount_now(ri, now) >= amt)
+            .map(|(ri, amt)| {
+                let amt = eval_field(amt, &self.scratch.slots, true, || {
+                    self.resource_field_label(action, *ri, "cost", now)
+                })?;
+                Ok((*ri, amt))
+            })
+            .collect()
+    }
+
+    /// `action`'s gain map evaluated at the current instant (cast
+    /// complete), materialized before any resource is credited for the
+    /// same reason as [`Sim::eval_costs`].
+    fn eval_gains(&self, action: usize, now: f64) -> Result<Vec<(usize, f64)>, PlanError> {
+        self.sim_plan.actions[action]
+            .gain
+            .iter()
+            .map(|(ri, amt)| {
+                let amt = eval_field(amt, &self.scratch.slots, true, || {
+                    self.resource_field_label(action, *ri, "gain", now)
+                })?;
+                Ok((*ri, amt))
+            })
+            .collect()
     }
 
     /// Earliest time every cost in `action`'s cost map is simultaneously
     /// payable (linear regen — solvable exactly), or `None` if some cost
     /// can never be met (zero/negative regen while short, or the amount
     /// exceeds the resource's own cap).
-    fn earliest_afford(&self, action: usize, now: f64) -> Option<f64> {
+    ///
+    /// An EXPRESSION cost is taken at its value AS OF `now` — this solves
+    /// "when does regen reach the cost the rotation is looking at right
+    /// now", it does not predict where a time-varying cost is heading. If
+    /// the expression's value has moved by the time the scheduled `Wake`
+    /// fires, that decision simply re-evaluates and, if still short,
+    /// schedules the next wake from there (see the module docs).
+    fn earliest_afford(&self, action: usize, now: f64) -> Result<Option<f64>, PlanError> {
         let mut latest = now;
-        for &(ri, amt) in &self.sim_plan.actions[action].cost {
+        for (ri, amt) in &self.sim_plan.actions[action].cost {
+            let ri = *ri;
+            let amt = eval_field(amt, &self.scratch.slots, true, || {
+                self.resource_field_label(action, ri, "cost", now)
+            })?;
             let cur = self.resource_amount_now(ri, now);
             if cur >= amt {
                 continue;
             }
             let regen = self.resource_regen[ri];
             if regen <= 0.0 || amt > self.resource_max[ri] {
-                return None;
+                return Ok(None);
             }
             let t = now + (amt - cur) / regen;
             if t > latest {
                 latest = t;
             }
         }
-        Some(latest)
+        Ok(Some(latest))
     }
 
     fn mark_starved(&mut self, ri: usize, now: f64) {
@@ -966,22 +1114,30 @@ impl<'a> Sim<'a> {
         }
     }
 
-    fn pay_cost(&mut self, action: usize, now: f64) {
-        let costs = self.sim_plan.actions[action].cost.clone();
-        for (ri, amt) in costs {
+    /// Spend `costs` — already evaluated by the caller at the cast-start
+    /// instant (see [`Sim::eval_costs`]).
+    fn pay_cost(&mut self, costs: &[(usize, f64)], now: f64) {
+        for &(ri, amt) in costs {
             self.settle_resource(ri, now);
             self.resources[ri].amount -= amt;
             self.clear_starved(ri, now);
         }
     }
 
-    fn apply_gain(&mut self, action: usize, now: f64) {
-        let gains = self.sim_plan.actions[action].gain.clone();
+    /// Credit `action`'s gains AT CAST COMPLETE — the amounts are
+    /// evaluated here, at that instant (see the module docs' table).
+    fn apply_gain(&mut self, action: usize, now: f64) -> Result<(), PlanError> {
+        if self.sim_plan.actions[action].gain.is_empty() {
+            return Ok(());
+        }
+        self.refresh_time_varying_slots();
+        let gains = self.eval_gains(action, now)?;
         for (ri, amt) in gains {
             self.settle_resource(ri, now);
             let max = self.resource_max[ri];
             self.resources[ri].amount = (self.resources[ri].amount + amt).min(max);
         }
+        Ok(())
     }
 
     /// Refresh the sim slot array's TIME-VARYING tail (everything past the
@@ -1058,7 +1214,7 @@ impl<'a> Sim<'a> {
                 }
                 let action = rule.action;
                 let cd_ready = self.actions[action].cooldown_ready_at;
-                let cost_ok = self.cost_payable(action, now);
+                let cost_ok = self.cost_payable(action, now)?;
                 if cd_ready <= now && cost_ok {
                     chosen = Some(action);
                     break;
@@ -1066,7 +1222,7 @@ impl<'a> Sim<'a> {
                 let resource_time = if cost_ok {
                     Some(now)
                 } else {
-                    self.earliest_afford(action, now)
+                    self.earliest_afford(action, now)?
                 };
                 if let Some(rt) = resource_time {
                     let candidate = rt.max(cd_ready);
@@ -1103,7 +1259,7 @@ impl<'a> Sim<'a> {
                 if cd_ready <= now {
                     // Cooldown isn't the blocker — whatever's short here IS
                     // resource starvation.
-                    let costs = self.sim_plan.actions[action].cost.clone();
+                    let costs = self.eval_costs(action, now)?;
                     for (ri, amt) in costs {
                         if self.resource_amount_now(ri, now) < amt {
                             self.mark_starved(ri, now);
@@ -1116,10 +1272,29 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// Start `action`'s cast at `self.time`. Both expression-valued
+    /// cast-start fields — `cost` and `cooldown` — are evaluated HERE, in
+    /// the pre-payment state (an expression reading a resource sees what
+    /// the character has BEFORE this cast spends it), and only then is the
+    /// cost deducted and the cooldown armed. `cast_time` keeps its P6
+    /// instant: evaluated after payment, so a `cast_time` expression still
+    /// sees the post-cost resource level.
     fn begin_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
-        self.pay_cost(action, now);
-        let cooldown = self.sim_plan.actions[action].cooldown;
+        self.refresh_time_varying_slots();
+        let costs = self.eval_costs(action, now)?;
+        let cooldown = eval_field(
+            &self.sim_plan.actions[action].cooldown,
+            &self.scratch.slots,
+            true,
+            || {
+                format!(
+                    "action `{}` cooldown at cast start (t={now})",
+                    self.sim_plan.actions[action].name
+                )
+            },
+        )?;
+        self.pay_cost(&costs, now);
         self.actions[action].cooldown_ready_at = now + cooldown;
 
         self.refresh_time_varying_slots();
@@ -1144,18 +1319,40 @@ impl<'a> Sim<'a> {
 
     fn complete_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
-        self.apply_gain(action, now);
+        self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
 
-        let has_damage = self.sim_plan.actions[action].damage.is_some();
         let mut is_crit = false;
-        if has_damage {
+        // Everything about this cast is measured HERE, at the cast-complete
+        // instant, off ONE overlay: `damage.stats` (and `hits_per_use`) are
+        // evaluated once, and EV mode's `on_crit` weight — the probability
+        // THIS hit crits — is taken from the same overlay and the same
+        // effective phase the damage query uses. Deferring the crit query
+        // to its point of use would read a LATER state (this cast's own
+        // on_cast/on_hit procs can apply buffs and spend resources in
+        // between), so one hit's two `Plan` queries could disagree about
+        // the world the hit landed in — and a proc triggered BY this hit
+        // cannot retroactively change whether this hit crit.
+        let overlay = if self.sim_plan.actions[action].damage.is_some() {
+            self.refresh_time_varying_slots();
+            let build = self.overlay_build_for_action(action, now)?;
+            let hits = self.eval_hits_per_use(action, now)?;
+            let crit_chance = if self.rng.is_none() {
+                self.eval_action_crit_chance(&build)?
+            } else {
+                0.0 // MC mode samples the crit outright; no weight needed.
+            };
+            Some((build, hits, crit_chance))
+        } else {
+            None
+        };
+        if let Some((build, hits, _)) = &overlay {
             let dmg = if self.rng.is_some() {
-                let (dmg, crit) = self.eval_action_damage_sampled(action)?;
+                let (dmg, crit) = self.eval_action_damage_sampled(build, *hits)?;
                 is_crit = crit;
                 dmg
             } else {
-                self.eval_action_damage(action)?
+                self.eval_action_damage(build, *hits)?
             };
             self.total_damage += dmg;
             self.phase_damage[self.current_phase] += dmg;
@@ -1165,15 +1362,15 @@ impl<'a> Sim<'a> {
         self.mid_cast = false;
         if self.rng.is_some() {
             self.roll_procs_mc(Trigger::OnCast, true)?;
-            if has_damage {
+            if overlay.is_some() {
                 self.roll_procs_mc(Trigger::OnHit, true)?;
                 self.roll_procs_mc(Trigger::OnCrit, is_crit)?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0)?;
-            if has_damage {
+            if let Some((_, _, crit_chance)) = &overlay {
+                let crit_chance = *crit_chance;
                 self.roll_procs_ev(Trigger::OnHit, 1.0)?;
-                let crit_chance = self.eval_action_crit_chance(action)?;
                 self.roll_procs_ev(Trigger::OnCrit, crit_chance)?;
             }
         }
@@ -1183,11 +1380,16 @@ impl<'a> Sim<'a> {
     /// The per-cast overlay build: the effective damage build (base +
     /// active buffs' contributions) with `action`'s own `damage.stats`
     /// overlaid on top (`hits_per_use` excluded — read directly by
-    /// callers, never fed to the `Plan`; see
-    /// [`crate::simdef::ActionDamage`]). Shared by every per-cast `Plan`
-    /// query this action needs (EV damage, EV crit chance, sampled
-    /// damage+mask) so the overlay is built identically everywhere.
-    fn overlay_build_for_action(&self, action: usize) -> BuildState {
+    /// [`Sim::eval_hits_per_use`], never fed to the `Plan`; see
+    /// [`crate::simdef::ActionDamage`]). Built ONCE per cast, at cast
+    /// complete, and shared by every per-cast `Plan` query that cast needs
+    /// (EV damage, EV crit chance, sampled damage+mask) so all of them see
+    /// the identical stats.
+    ///
+    /// Each value is evaluated at THIS instant (the caller refreshes the
+    /// slot array's time-varying tail first) and need only be FINITE — a
+    /// stat may legitimately be negative.
+    fn overlay_build_for_action(&self, action: usize, now: f64) -> Result<BuildState, PlanError> {
         let damage_stats = self.sim_plan.actions[action]
             .damage
             .as_ref()
@@ -1197,61 +1399,75 @@ impl<'a> Sim<'a> {
             if k == "hits_per_use" {
                 continue;
             }
-            build.stats.insert(k.clone(), *v);
+            let v = eval_field(v, &self.scratch.slots, false, || {
+                format!(
+                    "action `{}` damage.stats `{k}` at cast complete (t={now})",
+                    self.sim_plan.actions[action].name
+                )
+            })?;
+            build.stats.insert(k.clone(), v);
         }
-        build
+        Ok(build)
     }
 
-    /// `damage_objective × hits` for one completed cast of `action`, EV
-    /// mode: `Plan::evaluate_phase`'s branch-blended value.
-    fn eval_action_damage(&mut self, action: usize) -> Result<f64, PlanError> {
-        let hits = self.sim_plan.actions[action]
+    /// `action`'s per-cast hit count — `damage.stats`'s `hits_per_use`
+    /// entry (default `1.0` when absent), evaluated at the same cast-
+    /// complete instant and under the same finite-only rule as the rest of
+    /// that map.
+    fn eval_hits_per_use(&self, action: usize, now: f64) -> Result<f64, PlanError> {
+        match self.sim_plan.actions[action]
             .damage
             .as_ref()
             .expect("caller checked damage.is_some()")
             .get("hits_per_use")
-            .copied()
-            .unwrap_or(1.0);
-        let build = self.overlay_build_for_action(action);
+        {
+            Some(v) => eval_field(v, &self.scratch.slots, false, || {
+                format!(
+                    "action `{}` damage.stats `hits_per_use` at cast complete (t={now})",
+                    self.sim_plan.actions[action].name
+                )
+            }),
+            None => Ok(1.0),
+        }
+    }
+
+    /// `damage_objective × hits` for one completed cast, EV mode:
+    /// `Plan::evaluate_phase`'s branch-blended value over the cast's
+    /// already-built overlay (see [`Sim::overlay_build_for_action`]).
+    fn eval_action_damage(&mut self, build: &BuildState, hits: f64) -> Result<f64, PlanError> {
         let phase = self.effective_phase.clone();
         let objs = self
             .plan
-            .evaluate_phase(&build, &phase, &mut self.scratch.eval)?;
+            .evaluate_phase(build, &phase, &mut self.scratch.eval)?;
         Ok(objs[self.sim_plan.damage_objective] * hits)
     }
 
     /// EV mode only: the probability the `"crit"` event fires for one hit
-    /// of `action` — see [`Plan::crit_chance`]'s docs for the naming
+    /// of this cast — see [`Plan::crit_chance`]'s docs for the naming
     /// convention and the fail-soft `0.0` when this game has no `"crit"`
     /// event. Used to weight `on_crit` proc accumulation (see
     /// [`Sim::roll_procs_ev`]'s doc comment).
-    fn eval_action_crit_chance(&mut self, action: usize) -> Result<f64, PlanError> {
-        let build = self.overlay_build_for_action(action);
+    fn eval_action_crit_chance(&mut self, build: &BuildState) -> Result<f64, PlanError> {
         let phase = self.effective_phase.clone();
-        self.plan
-            .crit_chance(&build, &phase, &mut self.scratch.eval)
+        self.plan.crit_chance(build, &phase, &mut self.scratch.eval)
     }
 
-    /// MC mode only: `damage_objective × hits` for one completed cast of
-    /// `action`, SAMPLED (`Plan::evaluate_phase_sampled`) — returns the
-    /// damage AND whether the sampled branch fired the `"crit"` event
+    /// MC mode only: `damage_objective × hits` for one completed cast,
+    /// SAMPLED (`Plan::evaluate_phase_sampled`) — returns the damage AND
+    /// whether the sampled branch fired the `"crit"` event
     /// (`Plan::is_crit_bit_set`), which `complete_cast` feeds straight
     /// into the `on_crit` proc roll (no separate crit-probability query
     /// needed in MC mode — the coin was already flipped).
-    fn eval_action_damage_sampled(&mut self, action: usize) -> Result<(f64, bool), PlanError> {
-        let hits = self.sim_plan.actions[action]
-            .damage
-            .as_ref()
-            .expect("caller checked damage.is_some()")
-            .get("hits_per_use")
-            .copied()
-            .unwrap_or(1.0);
-        let build = self.overlay_build_for_action(action);
+    fn eval_action_damage_sampled(
+        &mut self,
+        build: &BuildState,
+        hits: f64,
+    ) -> Result<(f64, bool), PlanError> {
         let phase = self.effective_phase.clone();
         let plan = self.plan;
         let rng = self.rng.as_mut().expect("caller checked rng.is_some()");
         let (objs, mask) =
-            plan.evaluate_phase_sampled(&build, &phase, rng, &mut self.scratch.eval)?;
+            plan.evaluate_phase_sampled(build, &phase, rng, &mut self.scratch.eval)?;
         let dmg = objs[self.sim_plan.damage_objective] * hits;
         let is_crit = plan.is_crit_bit_set(mask);
         Ok((dmg, is_crit))
@@ -1286,7 +1502,6 @@ impl<'a> Sim<'a> {
     /// gone along with the deferred flag.
     fn roll_procs_ev(&mut self, trigger: Trigger, weight: f64) -> Result<(), PlanError> {
         let now = self.time;
-        self.refresh_time_varying_slots();
         for pi in 0..self.sim_plan.procs.len() {
             if self.sim_plan.procs[pi].trigger != trigger {
                 continue;
@@ -1296,6 +1511,13 @@ impl<'a> Sim<'a> {
                 // banked — matches `roll_procs_mc`'s "skip outright".
                 continue;
             }
+            // Per-proc, not once per batch: an EARLIER proc in this same
+            // batch may have fired and applied a buff / free-cast, and a
+            // `chance` expression must see that (the stat/condition prefix
+            // already refolded on such a change — this keeps the
+            // time-varying tail, `buff.*`/`buff_remaining.*`/resources/
+            // `casts.*`, telling the same story).
+            self.refresh_time_varying_slots();
             let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots) * weight;
             self.procs[pi].acc += chance;
             // `PROC_FIRE_EPSILON` tolerance: a mathematically-exact
@@ -1331,7 +1553,6 @@ impl<'a> Sim<'a> {
             return Ok(());
         }
         let now = self.time;
-        self.refresh_time_varying_slots();
         for pi in 0..self.sim_plan.procs.len() {
             if self.sim_plan.procs[pi].trigger != trigger {
                 continue;
@@ -1339,6 +1560,8 @@ impl<'a> Sim<'a> {
             if self.procs[pi].icd_ready_at > now {
                 continue; // hard gate — no accumulation, no memory.
             }
+            // Per-proc — see `roll_procs_ev` for why.
+            self.refresh_time_varying_slots();
             let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
             // A fresh short-lived borrow of `self.rng`, released before
             // the match arms below need `&mut self` in full (calling
@@ -1385,10 +1608,16 @@ impl<'a> Sim<'a> {
     /// tightening this later is additive, not a breaking change.
     fn free_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
-        self.apply_gain(action, now);
+        self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
         if self.sim_plan.actions[action].damage.is_some() {
-            let dmg = self.eval_action_damage(action)?;
+            // Same instants as a normal completion — a free cast BEGINS
+            // and COMPLETES at the firing proc's instant, so `gain` and
+            // `damage.stats` are both evaluated at `now`.
+            self.refresh_time_varying_slots();
+            let build = self.overlay_build_for_action(action, now)?;
+            let hits = self.eval_hits_per_use(action, now)?;
+            let dmg = self.eval_action_damage(&build, hits)?;
             self.total_damage += dmg;
             self.phase_damage[self.current_phase] += dmg;
             self.actions[action].damage += dmg;
@@ -1551,8 +1780,9 @@ mod tests {
     use crate::gamedef::GameDef;
     use crate::plan::{self, Plan};
     use crate::sim::compile as sim_compile;
+    use crate::sim::CompiledValue;
     use crate::simdef::{
-        ActionDamage, ActionDef, BuffDef, ProcDef, ResourceDef, Rotation, Rule, SimDef,
+        ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ResourceDef, Rotation, Rule, SimDef,
     };
     use std::collections::BTreeMap;
 
@@ -1632,7 +1862,7 @@ mod tests {
             "spam".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -1715,13 +1945,13 @@ mod tests {
             },
         );
         let mut cost = BTreeMap::new();
-        cost.insert("mana".to_string(), 50.0);
+        cost.insert("mana".to_string(), NumOrExpr::Num(50.0));
         let mut actions = BTreeMap::new();
         actions.insert(
             "spender".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost,
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -1799,7 +2029,7 @@ mod tests {
             "empower".to_string(),
             ActionDef {
                 cast_time: "0".into(),
-                cooldown: 10.0,
+                cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
@@ -1809,7 +2039,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -1821,7 +2051,7 @@ mod tests {
         buffs.insert(
             "power_up".to_string(),
             BuffDef {
-                duration: 4.0,
+                duration: NumOrExpr::Num(4.0),
                 contributions: vec![crate::build::Contribution {
                     bucket: "indep".into(),
                     value: 25.0,
@@ -1905,7 +2135,7 @@ mod tests {
         buffs.insert(
             "x".to_string(),
             BuffDef {
-                duration: 4.0,
+                duration: NumOrExpr::Num(4.0),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -1916,7 +2146,7 @@ mod tests {
             "a".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -1980,7 +2210,7 @@ mod tests {
             "instant_nop".to_string(),
             ActionDef {
                 cast_time: "0".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
@@ -2065,7 +2295,7 @@ mod tests {
             "empower".to_string(),
             ActionDef {
                 cast_time: "0".into(),
-                cooldown: 10.0,
+                cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
@@ -2075,7 +2305,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2089,7 +2319,7 @@ mod tests {
         buffs.insert(
             "enrage_window".to_string(),
             BuffDef {
-                duration: 4.0,
+                duration: NumOrExpr::Num(4.0),
                 contributions: Vec::new(),
                 conditions,
                 tick_objective: None,
@@ -2172,7 +2402,7 @@ mod tests {
             "spam".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2244,7 +2474,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2256,7 +2486,7 @@ mod tests {
         buffs.insert(
             "proc_buff".to_string(),
             BuffDef {
-                duration: 0.5,
+                duration: NumOrExpr::Num(0.5),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -2481,7 +2711,7 @@ mod tests {
             "spam".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2493,7 +2723,7 @@ mod tests {
         buffs.insert(
             "proc_buff".to_string(),
             BuffDef {
-                duration: 0.5,
+                duration: NumOrExpr::Num(0.5),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
                 tick_objective: None,
@@ -2556,7 +2786,7 @@ mod tests {
             "trigger".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: None,
@@ -2566,7 +2796,7 @@ mod tests {
             "nuke".to_string(),
             ActionDef {
                 cast_time: "0".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2632,7 +2862,7 @@ mod tests {
             "spam".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2688,7 +2918,7 @@ mod tests {
             "spam".to_string(),
             ActionDef {
                 cast_time: "1".into(),
-                cooldown: 0.0,
+                cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
@@ -2778,6 +3008,851 @@ mod tests {
         assert!(
             rel_err < 0.15,
             "mc mean proc count {mc_count} vs ev count {ev_count}, relative error {rel_err}"
+        );
+    }
+
+    // ==================================================================
+    // P7b — expression-valued sim fields (`NumOrExpr`)
+    //
+    // Five fields accept a literal OR an expression: `BuffDef::duration`,
+    // `ActionDef::cooldown`, the `cost`/`gain` amounts, and the
+    // `ActionDamage::stats` values. What these tests pin is not "an
+    // expression can be written" but WHEN each one is evaluated (the
+    // instants table on `simdef::NumOrExpr`) and that a bad value fails
+    // closed AT that instant.
+    // ==================================================================
+
+    /// A minimal `Plan` for the P7b fixtures: `hit = dmg`, plus a
+    /// `bonus_dur` stat for the duration cases and a `hidden_stage`
+    /// pipeline stage that is deliberately NOT an objective (used to prove
+    /// stages stay invisible to expression-valued fields too).
+    /// `toy_plan`'s crit machinery is irrelevant here — the question under
+    /// test is WHEN a field's expression is evaluated, not what the damage
+    /// formula does with the result.
+    fn flat_plan() -> Plan {
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["dmg", "bonus_dur"],
+                 "pipeline": [ { "name": "hit", "expr": "dmg" },
+                               { "name": "hidden_stage", "expr": "dmg * 2" } ],
+                 "objectives": ["hit"] }"#,
+        )
+        .unwrap();
+        plan::compile(&def).unwrap()
+    }
+
+    fn flat_build() -> BuildState {
+        serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "bonus_dur": 2.0 } }"#).unwrap()
+    }
+
+    // ------------------------------------------------------------------
+    // BACKWARD COMPATIBILITY (the hard requirement — rtce 0.2.0 is
+    // published). Verbatim from the P6 design spec's "Config surface"
+    // section, byte-identical to `simdef.rs`'s own `SIMDEF_JSON`: every
+    // one of the now-expression-valued positions is a plain JSON NUMBER.
+    // Untagged serde must keep reading them as `NumOrExpr::Num`, and the
+    // executor must keep treating them exactly as the old `f64` fields.
+    // ------------------------------------------------------------------
+    const P6_NUMERIC_SIMDEF_JSON: &str = r#"{
+      "resources": {
+        "mana": { "max": "max_mana", "regen_per_sec": "mana_regen" }
+      },
+      "actions": {
+        "fireball": {
+          "cast_time": "1.0 / base_aps",
+          "cooldown": 0.0,
+          "cost": { "mana": 40.0 },
+          "gain": {},
+          "damage": {
+            "stats": { "coeff_pct": 200.0, "hits_per_use": 1.0 }
+          }
+        }
+      },
+      "buffs": {
+        "vuln_window": { "duration": 4.0, "conditions": { "vulnerable": 1.0 } },
+        "combustion":  { "duration": 8.0,
+                         "contributions": [{ "bucket": "indep", "value": 25.0 }] },
+        "burning":     { "duration": 6.0, "tick_objective": "dot_dps" }
+      },
+      "procs": {
+        "conflagrate": { "trigger": "on_crit",
+                         "chance": "lucky_hit_chance / 100 * 0.3",
+                         "icd": 2.0,
+                         "apply_buff": "combustion" }
+      },
+      "damage_objective": "hit_after_dr"
+    }"#;
+
+    #[test]
+    fn p6_numeric_simdef_json_parses_and_compiles_to_constants() {
+        let def: SimDef = serde_json::from_str(P6_NUMERIC_SIMDEF_JSON).unwrap();
+        assert_eq!(def.actions["fireball"].cooldown, NumOrExpr::Num(0.0));
+        assert_eq!(def.actions["fireball"].cost["mana"], NumOrExpr::Num(40.0));
+        assert_eq!(def.buffs["burning"].duration, NumOrExpr::Num(6.0));
+
+        // …and compiles against a plan carrying the spec's names, with
+        // every literal pre-baked into a `Const` (no Program at all).
+        let plan_def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["max_mana", "mana_regen", "base_aps", "lucky_hit_chance",
+                           "coeff_pct", "weapon"],
+                 "conditions": ["vulnerable"],
+                 "buckets": { "indep": { "fold": "product" } },
+                 "pipeline": [ { "name": "hit_after_dr", "expr": "weapon * indep" },
+                               { "name": "dot_dps", "expr": "weapon * 0.1" } ],
+                 "objectives": ["hit_after_dr", "dot_dps"] }"#,
+        )
+        .unwrap();
+        let plan = plan::compile(&plan_def).unwrap();
+        let sp = sim_compile(&plan, &def, &Rotation::default()).unwrap();
+        assert!(matches!(sp.actions[0].cooldown, CompiledValue::Const(v) if v == 0.0));
+        assert!(matches!(sp.actions[0].cost[0].1, CompiledValue::Const(v) if v == 40.0));
+        for b in &sp.buffs {
+            assert!(matches!(b.duration, CompiledValue::Const(_)));
+        }
+    }
+
+    // The P6c starvation pin, rebuilt from JSON with NUMERIC literals in
+    // `cost` — byte-for-byte the same cadence
+    // `resource_starvation_cadence_is_hand_worked` derives (casts at
+    // t=0,1,5,10,15; 5 casts / 20s; 15s starved). This is the BEHAVIORAL
+    // half of the compatibility contract: `NumOrExpr::Num` must reach the
+    // executor as the identical number the `f64` field used to.
+    #[test]
+    fn p6c_starvation_pin_reproduces_from_numeric_json() {
+        let def: GameDef = serde_json::from_str(
+            r#"{ "stats": ["dmg"],
+                 "pipeline": [ { "name": "hit", "expr": "dmg" } ],
+                 "objectives": ["hit"] }"#,
+        )
+        .unwrap();
+        let plan = plan::compile(&def).unwrap();
+        let build: BuildState = serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let simdef: SimDef = serde_json::from_str(
+            r#"{ "resources": { "mana": { "max": "100", "regen_per_sec": "10" } },
+                 "actions": { "spender": { "cast_time": "1", "cooldown": 0.0,
+                                           "cost": { "mana": 50.0 },
+                                           "damage": { "stats": {} } } },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap();
+        let rotation: Rotation =
+            serde_json::from_str(r#"{ "rules": [ { "action": "spender" } ] }"#).unwrap();
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["spender"].casts, 5);
+        assert!(close(report.total.total_damage, 500.0));
+        assert!(close(report.total.dps, 25.0));
+        assert!(close(report.resources["mana"].time_starved, 15.0));
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR DURATION — evaluated at APPLICATION.
+    //
+    // Fixture: `filler` (1s cast) completes every second t=1..20. An
+    // on_cast proc (chance 1, icd 10) applies `window`, whose duration is
+    // `"2 + bonus_dur"`. On_cast procs roll at cast COMPLETE, so:
+    //   t=1   icd clear → fire → apply, duration = 2 + 2 = 4 → expires t=5
+    //   t=2..10  ICD-gated (icd_ready_at = 11), no roll banked
+    //   t=11  fire → apply, duration 4 → expires t=15
+    //   t=21  would be the next fire — past the 20s duration
+    // uptime = (4 + 4) / 20 = 0.4
+    // ------------------------------------------------------------------
+    fn expr_duration_fixture(duration: NumOrExpr) -> (SimDef, Rotation) {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "filler".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        let mut buffs = BTreeMap::new();
+        buffs.insert(
+            "window".to_string(),
+            BuffDef {
+                duration,
+                contributions: Vec::new(),
+                conditions: BTreeMap::new(),
+                tick_objective: None,
+            },
+        );
+        let mut procs = BTreeMap::new();
+        procs.insert(
+            "pulse".to_string(),
+            ProcDef {
+                trigger: Trigger::OnCast,
+                chance: "1".into(),
+                icd: 10.0,
+                apply_buff: Some("window".into()),
+                cast_action: None,
+            },
+        );
+        (
+            SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs,
+                procs,
+                damage_objective: "hit".into(),
+            },
+            Rotation {
+                rules: vec![Rule {
+                    action: "filler".into(),
+                    when: None,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn expr_duration_reads_the_stat_at_application() {
+        let plan = flat_plan();
+        let build = flat_build(); // bonus_dur = 2
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("2 + bonus_dur".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        // Windows [1,5) and [11,15) — see the hand-worked trace above.
+        assert!(
+            close(report.buff_uptime["window"], 0.4),
+            "got {}",
+            report.buff_uptime["window"]
+        );
+        // …and the literal 4.0 gives the byte-identical answer.
+        let (lit_def, lit_rot) = expr_duration_fixture(NumOrExpr::Num(4.0));
+        let lit_plan = sim_compile(&plan, &lit_def, &lit_rot).unwrap();
+        let lit = run(&plan, &lit_plan, &build, &scenario, Mode::Expected).unwrap();
+        assert_eq!(
+            report.buff_uptime["window"], lit.buff_uptime["window"],
+            "expr `2 + bonus_dur` must behave EXACTLY as the literal 4.0"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The reserved sim symbol `duration` is the SCENARIO's total length,
+    // NOT the buff field of the same name (the one documented ambiguity in
+    // `simdef::NumOrExpr`). A 20s fight with duration `"duration / 10"`
+    // therefore gives 2s windows, not a self-reference:
+    //   t=1  apply → expires t=3   |   t=11 apply → expires t=13
+    // uptime = (2 + 2) / 20 = 0.2
+    // ------------------------------------------------------------------
+    #[test]
+    fn buff_duration_expr_naming_duration_reads_the_fight_length() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("duration / 10".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        assert!(
+            close(report.buff_uptime["window"], 0.2),
+            "got {}",
+            report.buff_uptime["window"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR DURATION — SNAPSHOTTED at application (the semantics Task 5's
+    // snapshot DoTs rest on). Same fixture, two phases:
+    //   phase 1: t ∈ [0,4),  bonus_dur = 2 (from the build)
+    //   phase 2: t ∈ [4,20), bonus_dur = 6 (phase stat override)
+    // Hand-worked:
+    //   t=1   apply — duration snapshots as 2 + 2 = 4 → expires t=5
+    //   t=4   PHASE BOUNDARY raises bonus_dur to 6. The window already in
+    //         flight is UNAFFECTED: it still expires at t=5, not t=9.
+    //   t=5   expire. Active span [1,5) = 4s.
+    //   t=11  ICD clear → apply — duration re-evaluates NOW: 2 + 6 = 8
+    //         → expires t=19. Active span [11,19) = 8s.
+    //   t=19  expire. (Next fire would be t=21, past duration.)
+    // uptime = (4 + 8) / 20 = 12/20 = 0.6
+    // A duration that re-evaluated live off the current stat would give
+    // the first window 8s too → 16/20 = 0.8; one frozen at compile/start
+    // time would give both windows 4s → 8/20 = 0.4. Only the snapshot
+    // reading is 0.6.
+    // ------------------------------------------------------------------
+    #[test]
+    fn expr_duration_snapshots_at_application_across_a_phase_boundary() {
+        let plan = flat_plan();
+        let build = flat_build(); // bonus_dur = 2
+        let scenario: Scenario = serde_json::from_str(
+            r#"{ "phases": [ { "name": "early", "weight": 4 },
+                             { "name": "late",  "weight": 16,
+                               "stats": { "bonus_dur": 6.0 } } ] }"#,
+        )
+        .unwrap();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("2 + bonus_dur".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert!(
+            close(report.buff_uptime["window"], 0.6),
+            "got {} (0.8 = re-evaluated live, 0.4 = frozen at start)",
+            report.buff_uptime["window"]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR COST — evaluated at cast start / at each affordability check.
+    // `"20 + 10"` must behave EXACTLY as the literal 30. Hand-worked
+    // cadence (mana max 100, regen 10/s, starting full, 1s cast, cost 30):
+    //   t=0  100→70, completes t=1
+    //   t=1   80→50, completes t=2
+    //   t=2   60→30, completes t=3
+    //   t=3   40→10, completes t=4
+    //   t=4  mana 20 < 30 — starved from t=4, wake at 4 + 10/10 = 5
+    //   t=5   30→0,  completes t=6
+    //   t=6  mana 10 < 30 — starved from t=6, wake at 6 + 20/10 = 8
+    //   t=8   30→0,  completes t=9
+    //   t=9  starved from t=9,  wake t=11
+    //   t=11  30→0,  completes t=12
+    //   t=12 starved from t=12, wake t=14
+    //   t=14  30→0,  completes t=15
+    //   t=15 starved from t=15, wake t=17
+    //   t=17  30→0,  completes t=18
+    //   t=18 starved from t=18, wake t=20 = duration (no further cast)
+    // 9 casts × 100 dmg = 900 over 20s = 45 dps.
+    // starved = (5-4)+(8-6)+(11-9)+(14-12)+(17-15)+(20-18) = 1+2+2+2+2+2 = 11s
+    // ------------------------------------------------------------------
+    fn expr_cost_fixture(cost: NumOrExpr) -> (SimDef, Rotation) {
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            "mana".to_string(),
+            ResourceDef {
+                max: "100".into(),
+                regen_per_sec: "10".into(),
+            },
+        );
+        let mut cost_map = BTreeMap::new();
+        cost_map.insert("mana".to_string(), cost);
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "spender".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: cost_map,
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        (
+            SimDef {
+                resources,
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            },
+            Rotation {
+                rules: vec![Rule {
+                    action: "spender".into(),
+                    when: None,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn expr_cost_behaves_exactly_as_the_literal() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+
+        let (expr_def, rot) = expr_cost_fixture(NumOrExpr::Expr("20 + 10".into()));
+        let expr_plan = sim_compile(&plan, &expr_def, &rot).unwrap();
+        let expr_report = run(&plan, &expr_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        let (lit_def, lit_rot) = expr_cost_fixture(NumOrExpr::Num(30.0));
+        let lit_plan = sim_compile(&plan, &lit_def, &lit_rot).unwrap();
+        let lit_report = run(&plan, &lit_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        // The hand-worked cadence above.
+        assert_eq!(expr_report.actions["spender"].casts, 9);
+        assert!(
+            close(expr_report.total.total_damage, 900.0),
+            "got {}",
+            expr_report.total.total_damage
+        );
+        assert!(close(expr_report.total.dps, 45.0));
+        assert!(
+            close(expr_report.resources["mana"].time_starved, 11.0),
+            "got {}",
+            expr_report.resources["mana"].time_starved
+        );
+
+        // …and identical to the literal, field for field.
+        assert_eq!(
+            expr_report.actions["spender"].casts,
+            lit_report.actions["spender"].casts
+        );
+        assert_eq!(
+            expr_report.total.total_damage,
+            lit_report.total.total_damage
+        );
+        assert_eq!(
+            expr_report.resources["mana"].time_starved,
+            lit_report.resources["mana"].time_starved
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR COOLDOWN — evaluated at cast start. `"5 + 5"` == literal 10.
+    // Hand-worked: `nova` is instant (cast_time 0) with a 10s cooldown and
+    // is the only rule, so it casts at t=0, the decision loop schedules a
+    // wake at its cooldown-ready time, and it recasts at t=10. The wake at
+    // t=20 lands exactly ON `duration`, where the run loop stops before
+    // deciding again (see module docs on the `End` boundary):
+    //   casts at t=0 and t=10 → 2 × 100 = 200 damage over 20s = 10 dps.
+    // ------------------------------------------------------------------
+    fn expr_cooldown_fixture(cooldown: NumOrExpr) -> (SimDef, Rotation) {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "nova".to_string(),
+            ActionDef {
+                cast_time: "0".into(),
+                cooldown,
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        (
+            SimDef {
+                resources: BTreeMap::new(),
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            },
+            Rotation {
+                rules: vec![Rule {
+                    action: "nova".into(),
+                    when: None,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn expr_cooldown_behaves_exactly_as_the_literal() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+
+        let (expr_def, rot) = expr_cooldown_fixture(NumOrExpr::Expr("5 + 5".into()));
+        let expr_plan = sim_compile(&plan, &expr_def, &rot).unwrap();
+        let expr_report = run(&plan, &expr_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        let (lit_def, lit_rot) = expr_cooldown_fixture(NumOrExpr::Num(10.0));
+        let lit_plan = sim_compile(&plan, &lit_def, &lit_rot).unwrap();
+        let lit_report = run(&plan, &lit_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(expr_report.actions["nova"].casts, 2);
+        assert!(
+            close(expr_report.total.total_damage, 200.0),
+            "got {}",
+            expr_report.total.total_damage
+        );
+        assert!(close(expr_report.total.dps, 10.0));
+        assert_eq!(
+            expr_report.actions["nova"].casts,
+            lit_report.actions["nova"].casts
+        );
+        assert_eq!(
+            expr_report.total.total_damage,
+            lit_report.total.total_damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR GAIN — evaluated at CAST COMPLETE. `"50 + 50"` == literal 100.
+    // Hand-worked (mana max 100, NO regen, starts full; `spender` costs
+    // 100 and deals 100 damage, `generator` gains 100 on completion):
+    //   t=0  spender (100→0), completes t=1
+    //   t=1  mana 0 — spender unaffordable and unreachable (no regen), so
+    //        the priority list falls through to generator, completing t=2
+    //        and crediting +100 AT COMPLETION
+    //   t=2  spender again … alternating forever
+    // spends at t=0,2,4,…,18 → 10 casts × 100 = 1000 over 20s = 50 dps.
+    // ------------------------------------------------------------------
+    fn expr_gain_fixture(gain: NumOrExpr) -> (SimDef, Rotation) {
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            "mana".to_string(),
+            ResourceDef {
+                max: "100".into(),
+                regen_per_sec: "0".into(),
+            },
+        );
+        let mut cost_map = BTreeMap::new();
+        cost_map.insert("mana".to_string(), NumOrExpr::Num(100.0));
+        let mut gain_map = BTreeMap::new();
+        gain_map.insert("mana".to_string(), gain);
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "spender".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: cost_map,
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage {
+                    stats: BTreeMap::new(),
+                }),
+            },
+        );
+        actions.insert(
+            "generator".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: gain_map,
+                damage: None,
+            },
+        );
+        (
+            SimDef {
+                resources,
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            },
+            Rotation {
+                rules: vec![
+                    Rule {
+                        action: "spender".into(),
+                        when: None,
+                    },
+                    Rule {
+                        action: "generator".into(),
+                        when: None,
+                    },
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn expr_gain_behaves_exactly_as_the_literal() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+
+        let (expr_def, rot) = expr_gain_fixture(NumOrExpr::Expr("50 + 50".into()));
+        let expr_plan = sim_compile(&plan, &expr_def, &rot).unwrap();
+        let expr_report = run(&plan, &expr_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        let (lit_def, lit_rot) = expr_gain_fixture(NumOrExpr::Num(100.0));
+        let lit_plan = sim_compile(&plan, &lit_def, &lit_rot).unwrap();
+        let lit_report = run(&plan, &lit_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(expr_report.actions["spender"].casts, 10);
+        assert_eq!(expr_report.actions["generator"].casts, 10);
+        assert!(
+            close(expr_report.total.total_damage, 1000.0),
+            "got {}",
+            expr_report.total.total_damage
+        );
+        assert!(close(expr_report.total.dps, 50.0));
+        assert_eq!(
+            expr_report.total.total_damage,
+            lit_report.total.total_damage
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // EXPR damage.stats — evaluated at CAST COMPLETE (not at cast start).
+    // `beam` is a 1s cast whose `dmg` override is `"time * 10"` and whose
+    // `hits_per_use` is the expression `"2"`. Over a 5s fight the casts
+    // COMPLETE at t=1,2,3,4,5 (the 5th starts at t=4 and completes exactly
+    // at duration — see module docs on the `End` boundary), so:
+    //   dmg per hit = 10, 20, 30, 40, 50   (× hits_per_use 2)
+    //   total = 2 × (10+20+30+40+50) = 2 × 150 = 300 over 5s = 60 dps
+    // Evaluated at cast START instead, `time` would read 0,1,2,3,4 and the
+    // total would be 2 × 100 = 200 — the instant is what this pins.
+    // ------------------------------------------------------------------
+    #[test]
+    fn expr_damage_stats_are_evaluated_at_cast_complete() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 5 } ] }"#).unwrap();
+
+        let mut stats = BTreeMap::new();
+        stats.insert("dmg".to_string(), NumOrExpr::Expr("time * 10".into()));
+        stats.insert("hits_per_use".to_string(), NumOrExpr::Expr("2".into()));
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "beam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage { stats }),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "hit".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "beam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+        assert_eq!(report.actions["beam"].casts, 5);
+        assert!(
+            close(report.total.total_damage, 300.0),
+            "got {} (200 = evaluated at cast START)",
+            report.total.total_damage
+        );
+        assert!(close(report.total.dps, 60.0), "got {}", report.total.dps);
+    }
+
+    // ------------------------------------------------------------------
+    // FAIL-CLOSED — at the evaluation instant, never a guessed default.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn negative_expr_duration_fails_closed_at_application() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("0 - 5".into()));
+        // Compiling is FINE — `0 - 5` is a perfectly good expression. The
+        // error belongs to the application instant (t=1, the first proc
+        // fire), and must name the buff.
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what
+                .contains("buff `window` duration at application (t=1)"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("-5"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn non_finite_expr_duration_fails_closed_at_application() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("1 / 0".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what
+                .contains("buff `window` duration at application (t=1)"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("inf"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn expr_cost_referencing_an_unknown_symbol_is_a_compile_error() {
+        let plan = flat_plan();
+        let (simdef, rotation) = expr_cost_fixture(NumOrExpr::Expr("mystery_stat + 1".into()));
+        let e = sim_compile(&plan, &simdef, &rotation).unwrap_err();
+        assert!(e.what.contains("mystery_stat"), "got: {}", e.what);
+        assert!(e.what.contains("spender"), "got: {}", e.what);
+        // Positioned, like every other expression error in this engine.
+        assert!(e.what.contains("at byte"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn expr_duration_referencing_a_pipeline_stage_is_a_compile_error() {
+        // Stages/buckets stay invisible to the sim symbol space — an
+        // expression-valued field is no exception.
+        let plan = flat_plan();
+        let (simdef, rotation) = expr_duration_fixture(NumOrExpr::Expr("hidden_stage".into()));
+        let e = sim_compile(&plan, &simdef, &rotation).unwrap_err();
+        assert!(e.what.contains("hidden_stage"), "got: {}", e.what);
+        assert!(e.what.contains("window"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn negative_expr_cooldown_fails_closed_at_cast_start() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_cooldown_fixture(NumOrExpr::Expr("0 - 1".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what.contains("action `nova` cooldown at cast start"),
+            "got: {}",
+            e.what
+        );
+        assert!(
+            e.what.contains("must be finite and >= 0"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn negative_expr_cost_fails_closed_at_the_decision_instant() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_cost_fixture(NumOrExpr::Expr("0 - 5".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what.contains("action `spender` cost `mana`"),
+            "got: {}",
+            e.what
+        );
+        assert!(
+            e.what.contains("must be finite and >= 0"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn negative_expr_gain_fails_closed_at_cast_complete() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+        let (simdef, rotation) = expr_gain_fixture(NumOrExpr::Expr("0 - 5".into()));
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what.contains("action `generator` gain `mana`"),
+            "got: {}",
+            e.what
+        );
+        assert!(
+            e.what.contains("must be finite and >= 0"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn non_finite_expr_damage_stat_fails_closed_at_cast_complete() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 5 } ] }"#).unwrap();
+
+        let mut stats = BTreeMap::new();
+        // 0/0 = NaN — a stat may legitimately be NEGATIVE, so finiteness
+        // is the only check here (see `simdef::NumOrExpr`).
+        stats.insert("dmg".to_string(), NumOrExpr::Expr("0 / 0".into()));
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "beam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage { stats }),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "hit".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "beam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let e = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap_err();
+        assert!(
+            e.what
+                .contains("action `beam` damage.stats `dmg` at cast complete"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("NaN"), "got: {}", e.what);
+    }
+
+    // A NEGATIVE damage stat is legal (only finiteness is enforced) —
+    // `dmg` = -100 over a 5s fight yields 5 casts × -100 = -500. Pinned so
+    // the finite-only rule can't silently tighten into a >= 0 check.
+    #[test]
+    fn negative_expr_damage_stat_is_allowed() {
+        let plan = flat_plan();
+        let build = flat_build();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 5 } ] }"#).unwrap();
+
+        let mut stats = BTreeMap::new();
+        stats.insert("dmg".to_string(), NumOrExpr::Expr("0 - 100".into()));
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "beam".to_string(),
+            ActionDef {
+                cast_time: "1".into(),
+                cooldown: NumOrExpr::Num(0.0),
+                cost: BTreeMap::new(),
+                gain: BTreeMap::new(),
+                damage: Some(ActionDamage { stats }),
+            },
+        );
+        let simdef = SimDef {
+            resources: BTreeMap::new(),
+            actions,
+            buffs: BTreeMap::new(),
+            procs: BTreeMap::new(),
+            damage_objective: "hit".into(),
+        };
+        let rotation = Rotation {
+            rules: vec![Rule {
+                action: "beam".into(),
+                when: None,
+            }],
+        };
+        let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+        let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+        assert_eq!(report.actions["beam"].casts, 5);
+        assert!(
+            close(report.total.total_damage, -500.0),
+            "got {}",
+            report.total.total_damage
         );
     }
 }
