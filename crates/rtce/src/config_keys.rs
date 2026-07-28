@@ -28,6 +28,22 @@
 //!
 //! A new config struct (e.g. P8c's `defaults` block) should take the
 //! FIRST shape unless a consumer already constructs it in Rust.
+//!
+//! # Duplicate keys
+//!
+//! Stated for the record (and pinned in this module's tests), since
+//! `#[serde(flatten)]` changes serde's usual story only for UNKNOWN
+//! keys:
+//!
+//! - A duplicate KNOWN field is still a serde error ("duplicate field
+//!   `duration`"), on both mechanisms — the flatten-bearing structs and
+//!   the hand-written mirrors alike.
+//! - A duplicate UNKNOWN key resolves LAST-WINS (the collection map is a
+//!   `BTreeMap`; the second insert replaces the first). Since every
+//!   non-`_` unknown key is rejected anyway, the only OBSERVABLE
+//!   last-wins case is a duplicate `_` annotation — a config carrying
+//!   `"_note"` twice keeps the second, silently. Accepted as harmless:
+//!   annotations carry no semantics.
 
 use crate::plan::PlanError;
 use std::collections::BTreeMap;
@@ -140,6 +156,28 @@ mod tests {
             e.what
         );
         assert!(!e.what.contains("did you mean"), "got: {}", e.what);
+    }
+
+    // The serde half of the "Duplicate keys" module-doc claim, pinned on
+    // BOTH mechanisms so it cannot drift: a duplicate KNOWN field still
+    // errors with flatten in play (flatten only re-routes UNKNOWN keys).
+    #[test]
+    fn a_duplicate_known_field_is_still_a_serde_error_on_both_mechanisms() {
+        // Flatten-bearing struct:
+        let e = serde_json::from_str::<crate::simdef::BuffDef>(
+            r#"{ "duration": 1.0, "duration": 2.0 }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("duplicate field `duration`"),
+            "got: {e}"
+        );
+        // Hand-written mirror:
+        let e = serde_json::from_str::<crate::scenario::Phase>(
+            r#"{ "name": "p", "weight": 1, "name": "q" }"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("duplicate field `name`"), "got: {e}");
     }
 
     #[test]

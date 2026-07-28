@@ -321,6 +321,13 @@ NOT decided in 0.3.0. Three groups:
       first) but is named in public docs as though a config could hit it
       (0.3.0 release review). Either prove it reachable with a fixture or
       stop advertising it as a failure mode.
+- [ ] 0.5.0: `search::Candidate`/`search::Move` still silently IGNORE
+      unknown keys (P8a spec review). Outside P8a's 16-struct config
+      sweep — today every driver constructs them in-process, where Rust's
+      field checking already applies — but the same silent-typo class the
+      sweep closed opens again the moment a driver goes out-of-process
+      and ships candidate sets as JSON. Give them the P8a treatment
+      (stored `extra` + walk, or parse-time mirror) when that happens.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;

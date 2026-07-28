@@ -39,9 +39,10 @@ both consumers' committed gamedefs — pass unmodified.
   registry name. `GameDef`, `BucketDef`, `StageDef`, `BuildState`,
   `Contribution`, `Scenario`, `Phase` reject at PARSE via hand-written
   `Deserialize` impls instead (with the context the struct itself
-  carries, e.g. ``phase `boss` ``): these seven are constructed in Rust
-  with exhaustive struct literals by both consumers, so they
-  deliberately gain **no** new field.
+  carries, e.g. ``phase `boss` ``): each of these seven is constructed
+  in Rust with exhaustive struct literals in at least one consumer (the
+  union across the two consumers covers all seven), so they deliberately
+  gain **no** new field.
 - **Rust source compatibility:** adding the public `extra` field to the
   nine collect-side structs is source-breaking for exhaustive struct
   literals of THOSE types (add `extra: Default::default()`); neither
@@ -73,6 +74,11 @@ error, mirroring the existing `Phase.uptimes` "must be finite" rule:
   buff).
 - `BuildState.stats` values, at `Plan` build resolution.
 - `Phase.stats` override values, alongside the existing uptime check.
+- The same three, ONCE at `sim::run` entry (before the event loop):
+  a utility-only rotation completes with zero `Plan` evaluations, so the
+  per-evaluation checks above never fired on that route and a NaN build
+  used to come back `Ok(dps = 0)` silently while the NaN flowed into
+  rule gates and resource regen.
 
 No numeric path changed: `diablo4_rotation`'s EV and Monte Carlo blocks
 are byte-identical, and both consumers' pinned numbers are untouched.

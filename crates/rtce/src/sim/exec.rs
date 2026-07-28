@@ -413,6 +413,43 @@ pub fn run(
                 ),
             });
         }
+        // Same silent-NaN class as the weight (P8a follow-up): a
+        // utility-only rotation completes with ZERO `Plan` evaluations,
+        // so `validate_and_resolve_build_for_phase`'s per-evaluation
+        // checks never run on that route, while the NaN still flows
+        // through `write_stat_condition_slots` into rule gates and
+        // resource regen. Validate once here, before the event loop.
+        for (name, v) in &phase.stats {
+            if !v.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "phase `{}` stat `{name}` must be finite, got {v}",
+                        phase.name
+                    ),
+                });
+            }
+        }
+    }
+    // The build half of the same entry walk (finiteness only — stat names
+    // and bucket references stay validated where they resolve). Messages
+    // mirror `Plan`'s build-resolution errors, so the two levels never
+    // disagree on the same bad input.
+    for (name, v) in &build.stats {
+        if !v.is_finite() {
+            return Err(PlanError {
+                what: format!("build stat `{name}` must be finite, got {v}"),
+            });
+        }
+    }
+    for c in &build.contributions {
+        if !c.value.is_finite() {
+            return Err(PlanError {
+                what: format!(
+                    "contribution value into bucket `{}` must be finite, got {}",
+                    c.bucket, c.value
+                ),
+            });
+        }
     }
     let duration: f64 = scenario.phases.iter().map(|p| p.weight).sum();
     if !duration.is_finite() || duration <= 0.0 {
@@ -9031,6 +9068,137 @@ mod tests {
                 "excluding `b` must remove 10 RNG draws and shift the stream \
                  — equality here would mean the filter rolls and discards"
             );
+        }
+    }
+
+    // ==================================================================
+    // P8a follow-up — the ZERO-EVALUATION hole (spec-review probe): a
+    // utility-only rotation completes without a single `Plan`
+    // evaluation, so the per-evaluation validation in
+    // `validate_and_resolve_build_for_phase` never runs, and a
+    // non-finite build came back `Ok(dps = 0)` SILENTLY — while Level-1
+    // `evaluate` on the SAME build fails closed. Meanwhile the NaN
+    // flowed through `write_stat_condition_slots` into rule gates and
+    // resource regen. The fix: `run` validates the build's stats and
+    // contribution values, and each phase's stat overrides, ONCE at
+    // entry — before the event loop, on every route.
+    // ==================================================================
+    mod run_entry_validation {
+        use super::*;
+
+        /// One utility action (no `damage`), spammed — the executor
+        /// never queries the `Plan`, which is exactly the route that
+        /// dodged every per-evaluation check.
+        fn utility_only() -> (Plan, SimPlan) {
+            let plan = minimal_plan();
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "shout".to_string(),
+                ActionDef {
+                    extra: Default::default(),
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: None,
+                    apply_buff: Vec::new(),
+                },
+            );
+            let simdef = SimDef {
+                extra: Default::default(),
+                resources: BTreeMap::new(),
+                actions,
+                buffs: BTreeMap::new(),
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            };
+            let rotation = Rotation {
+                extra: Default::default(),
+                rules: vec![Rule {
+                    extra: Default::default(),
+                    action: "shout".into(),
+                    when: None,
+                }],
+            };
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            (plan, sim_plan)
+        }
+
+        fn five_seconds() -> Scenario {
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 5 } ] }"#).unwrap()
+        }
+
+        #[test]
+        fn a_non_finite_build_stat_is_rejected_at_run_entry_with_zero_evaluations() {
+            let (plan, sim_plan) = utility_only();
+            let mut build = minimal_build();
+            build.stats.insert("dmg".into(), f64::NAN);
+            let err = run(&plan, &sim_plan, &build, &five_seconds(), Mode::Expected).expect_err(
+                "a NaN build stat must fail closed even when no cast ever \
+                 evaluates the Plan",
+            );
+            assert!(
+                err.what.contains("build stat `dmg` must be finite"),
+                "got: {}",
+                err.what
+            );
+        }
+
+        #[test]
+        fn a_non_finite_contribution_value_is_rejected_at_run_entry_too() {
+            let (plan, sim_plan) = utility_only();
+            let mut build = minimal_build();
+            build.contributions.push(crate::build::Contribution {
+                bucket: "nope".into(),
+                value: f64::INFINITY,
+                event: None,
+                condition: None,
+            });
+            let err = run(&plan, &sim_plan, &build, &five_seconds(), Mode::Expected).unwrap_err();
+            assert!(
+                err.what
+                    .contains("contribution value into bucket `nope` must be finite"),
+                "got: {}",
+                err.what
+            );
+        }
+
+        #[test]
+        fn a_non_finite_phase_stat_override_is_rejected_at_run_entry_too() {
+            let (plan, sim_plan) = utility_only();
+            let mut scenario = five_seconds();
+            scenario.phases[0].stats.insert("dmg".into(), f64::NAN);
+            let err = run(
+                &plan,
+                &sim_plan,
+                &minimal_build(),
+                &scenario,
+                Mode::Expected,
+            )
+            .unwrap_err();
+            assert!(
+                err.what.contains("phase `p` stat `dmg` must be finite"),
+                "got: {}",
+                err.what
+            );
+        }
+
+        // The finite path through the same fixture still runs to
+        // completion — the entry walk rejects non-finite VALUES, nothing
+        // else. (Cadence: cast_time 1, no damage → 5 casts, 0 damage.)
+        #[test]
+        fn a_finite_utility_only_rotation_still_completes() {
+            let (plan, sim_plan) = utility_only();
+            let report = run(
+                &plan,
+                &sim_plan,
+                &minimal_build(),
+                &five_seconds(),
+                Mode::Expected,
+            )
+            .unwrap();
+            assert_eq!(report.actions["shout"].casts, 5);
+            assert_eq!(report.total.total_damage, 0.0);
         }
     }
 }
