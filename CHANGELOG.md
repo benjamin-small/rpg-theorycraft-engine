@@ -58,14 +58,21 @@ are now ONE ordered list each — `ActionDef::effects` /
   replacing serde's "unknown variant" default); `_`-prefixed annotation
   keys are accepted inside an entry like everywhere else, and an entry
   must hold exactly ONE effect key.
-- **Rust API**: `sim::ProcEffect` is renamed `sim::CompiledEffect`, and
-  the compiled `CompiledProc.effect` / `CompiledAction.apply_buff`
-  fields are replaced by `effects: Vec<CompiledEffect>` on both (the
-  structs are `#[non_exhaustive]` and only `compile` constructs them —
+### Changed — Rust API (P8b)
+
+- `sim::ProcEffect` is renamed `sim::CompiledEffect`, and the compiled
+  `CompiledProc.effect` / `CompiledAction.apply_buff` fields are
+  replaced by `effects: Vec<CompiledEffect>` on both (the structs are
+  `#[non_exhaustive]` and only `compile` constructs them —
   source-breaking only for code matching the old names; neither
-  consumer does). `ActionDef` / `ProcDef` gain the public `effects`
-  field (source-breaking for exhaustive struct literals of those two
-  types; neither consumer constructs them).
+  consumer does).
+- `ActionDef` / `ProcDef` gain the public `effects` field
+  (source-breaking for exhaustive struct literals of those two types;
+  neither consumer constructs them).
+- `EffectDef` is `#[non_exhaustive]` from birth, for the same reason
+  `CompiledEffect` is: a later effect kind must land on both enums, so
+  an exhaustive config enum would make it breaking anyway. Downstream
+  `match`es over it need a wildcard arm; construction is unrestricted.
 
 ### Changed — unknown config keys now fail closed (P8a)
 

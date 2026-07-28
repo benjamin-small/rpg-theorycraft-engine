@@ -132,10 +132,11 @@
 //! the whole timeline, and together they retire the `icd == cooldown`
 //! trick a 0.2.0 config needed for either:
 //!
-//! - [`crate::simdef::ActionDef::apply_buff`] — buffs the action itself
-//!   applies at cast complete ([`Sim::apply_action_buffs`]), one
-//!   application per list entry, each routed through the buff's own
-//!   [`crate::simdef::ReapplyPolicy`] exactly like a proc application.
+//! - [`crate::simdef::ActionDef::effects`] (or its 0.x `apply_buff`
+//!   sugar) — buffs the action itself applies at cast complete
+//!   ([`Sim::apply_action_buffs`]), one application per list entry, each
+//!   routed through the buff's own [`crate::simdef::ReapplyPolicy`]
+//!   exactly like a proc application.
 //! - [`crate::simdef::ProcDef::actions`] — a trigger filter
 //!   ([`Sim::proc_considers`]); `None` is every action, the 0.2.0
 //!   behavior.
@@ -1216,7 +1217,8 @@ impl<'a> Sim<'a> {
     /// - a LIVE tick rate's refold ([`Sim::refresh_after_change`]) passes
     ///   `None` — no cast is in the picture at all; it is the ambient
     ///   rate, by definition.
-    /// - an [`crate::simdef::ActionDef::apply_buff`] application passes
+    /// - an action-effects ([`crate::simdef::ActionDef::effects`])
+    ///   application passes
     ///   `Some(the completing cast's build)` — or `None` for a UTILITY
     ///   action, which runs no damage query and so has no overlay to
     ///   inherit.
@@ -1337,8 +1339,8 @@ impl<'a> Sim<'a> {
     /// `overlay` is forwarded verbatim to [`Sim::eval_objective`] for a
     /// SNAPSHOT capture, and is unused for everything else. `None` — the
     /// effective build — is what every PROC application passes and what
-    /// rtce 0.2.0 always did; `Some(cast_build)` is what an
-    /// [`crate::simdef::ActionDef::apply_buff`] application passes, so an
+    /// rtce 0.2.0 always did; `Some(cast_build)` is what an action-effects
+    /// ([`crate::simdef::ActionDef::effects`]) application passes, so an
     /// ailment inherits the magnitude of the hit that applied it (see
     /// [`Sim::apply_action_buffs`]). It deliberately does NOT reach
     /// `duration`, which reads sim STATE through the slot array rather
@@ -1617,7 +1619,7 @@ impl<'a> Sim<'a> {
     /// [`Sim::refresh_effective_state`] rebuilds `effective_phase` from
     /// [`Sim::condition_value`] each time, so `self.effective_phase` is
     /// LIVE while `frozen` is not. Three axes, stated canonically on
-    /// [`crate::simdef::ActionDef::apply_buff`]:
+    /// [`crate::simdef::ActionDef::effects`]:
     ///
     /// - sim STATE (slot array): sequential — refreshed per entry.
     /// - the BUILD (stats + `contributions`): frozen — this clone.
@@ -2267,7 +2269,7 @@ impl<'a> Sim<'a> {
     /// expression sees the state AT THIS POINT in it — AFTER
     /// [`Sim::apply_gain`] and this cast's own `casts` increment, and
     /// BEFORE both this cast's own
-    /// [`crate::simdef::ActionDef::apply_buff`] and any of its proc rolls.
+    /// [`crate::simdef::ActionDef::effects`] and any of its proc rolls.
     /// Concretely: a resource named in a `damage.stats` expression reads
     /// its POST-gain amount, `casts.<this action>` INCLUDES the cast being
     /// measured (so it counts from 1 on the first cast, never 0), and
@@ -2546,9 +2548,11 @@ impl<'a> Sim<'a> {
         }
     }
 
-    /// Fire proc `pi` at `now`: consume the accumulator (EV mode only —
-    /// MC mode's `roll_procs_mc` never calls this, it runs the effects
-    /// inline), start the ICD, run the effects.
+    /// Fire proc `pi` at `now`: consume the accumulator, start the ICD,
+    /// run the effects. EV mode only — MC mode's [`Sim::roll_procs_mc`]
+    /// has no accumulator to consume, so it starts its own ICD and calls
+    /// [`Sim::run_proc_effects`] directly; the effect execution itself is
+    /// that ONE shared path in both modes.
     fn fire_proc(&mut self, pi: usize, now: f64) -> Result<(), PlanError> {
         self.procs[pi].acc -= 1.0;
         self.procs[pi].fire_count += 1;
@@ -2586,10 +2590,10 @@ impl<'a> Sim<'a> {
     }
 
     /// A proc-triggered free cast: gains + damage + the action's own
-    /// [`crate::simdef::ActionDef::apply_buff`] (P7d), and NOT cost,
+    /// [`crate::simdef::ActionDef::effects`] (P7d), and NOT cost,
     /// cooldown, or any further proc roll (which avoids reentrancy). That
     /// split is the line between an effect OF the action and the cast
-    /// PIPELINE around it — `apply_buff` is the former, so omitting it
+    /// PIPELINE around it — the effects list is the former, so omitting it
     /// here would make the same action mean two different things
     /// depending on who cast it, silently. Applying a buff cannot recurse
     /// (only a cast rolls procs), so it costs the reentrancy guard
@@ -9247,7 +9251,7 @@ mod tests {
             }
         }
 
-        fn run_ev(simdef: &SimDef) -> SimReport {
+        fn run_mode(simdef: &SimDef, mode: Mode) -> SimReport {
             let plan = flat_plan();
             let rotation = Rotation {
                 extra: Default::default(),
@@ -9258,7 +9262,11 @@ mod tests {
                 }],
             };
             let sim_plan = sim_compile(&plan, simdef, &rotation).unwrap();
-            run(&plan, &sim_plan, &flat_build(), &dummy(10), Mode::Expected).unwrap()
+            run(&plan, &sim_plan, &flat_build(), &dummy(10), mode).unwrap()
+        }
+
+        fn run_ev(simdef: &SimDef) -> SimReport {
+            run_mode(simdef, Mode::Expected)
         }
 
         // --------------------------------------------------------------
@@ -9302,6 +9310,71 @@ mod tests {
                 close(buff_first.buffs["timed"].uptime, 0.1),
                 "buff-first: got {} — want 0.1 (casts.ping is still 0 when \
                  `timed` applies; 0.2 would mean the list order was ignored)",
+                buff_first.buffs["timed"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The SAME multi-entry lists under `Mode::MonteCarlo` — the
+        // anti-drift pin for `run_proc_effects` being the ONE shared
+        // execution path of both modes. Without this test, forking the
+        // MC fire site to run only `effects.first()` left the ENTIRE
+        // workspace green (P8b review probe): every pre-existing MC
+        // fixture carries a one-entry sugar list, and the EV order pin
+        // above never touches the MC path.
+        //
+        // Deterministic despite the RNG, so the EV hand-working carries
+        // over exactly: `chance` is `"time == 1"`, so the Bernoulli draw
+        // compares against 1.0 at t=1 (every roll in [0,1) fires) and
+        // against 0.0 everywhere else (no roll fires) — the fire pattern
+        // is seed-independent — and `flat_plan` has no events to sample,
+        // so every iteration is the identical timeline. Pins are the EV
+        // test's, re-asserted per order: cast-first 0.2 / reversed 0.1,
+        // one `ping` cast each. Under a first-effect-only fork BOTH
+        // halves go red: cast-first never applies `timed` (uptime 0.0),
+        // reversed never free-casts `ping` (casts 0).
+        // --------------------------------------------------------------
+        #[test]
+        fn mc_mode_executes_the_whole_effects_list_in_order() {
+            let mc = Mode::MonteCarlo {
+                iterations: 3,
+                seed: 7,
+            };
+            let cast_first = run_mode(
+                &one_shot_simdef(vec![
+                    EffectDef::CastAction("ping".into()),
+                    EffectDef::ApplyBuff("timed".into()),
+                ]),
+                mc,
+            );
+            assert_eq!(cast_first.proc_counts["echo"], 1, "one fire, at t=1");
+            assert_eq!(
+                cast_first.actions["ping"].casts, 1,
+                "the cast_action entry must run under MC"
+            );
+            assert!(
+                close(cast_first.buffs["timed"].uptime, 0.2),
+                "MC cast-first: got {} — want the EV pin 0.2 (0.0 would mean \
+                 MC ran only the FIRST effect; 0.1 that it ignored order)",
+                cast_first.buffs["timed"].uptime
+            );
+
+            let buff_first = run_mode(
+                &one_shot_simdef(vec![
+                    EffectDef::ApplyBuff("timed".into()),
+                    EffectDef::CastAction("ping".into()),
+                ]),
+                mc,
+            );
+            assert_eq!(buff_first.proc_counts["echo"], 1);
+            assert_eq!(
+                buff_first.actions["ping"].casts, 1,
+                "the SECOND entry must run under MC — 0 means the list was \
+                 truncated after the first effect"
+            );
+            assert!(
+                close(buff_first.buffs["timed"].uptime, 0.1),
+                "MC buff-first: got {} — want the EV pin 0.1",
                 buff_first.buffs["timed"].uptime
             );
         }

@@ -132,7 +132,7 @@ pub struct CompiledAction {
     pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
     /// Effects this action executes at cast complete, resolved to indices
     /// and kept in the CONFIG's order, which is the execution order (see
-    /// [`crate::simdef::ActionDef::apply_buff`] for where in the
+    /// [`crate::simdef::ActionDef::effects`] for where in the
     /// completion instant they land and what a repeat means). Both the
     /// deprecated `apply_buff` sugar and an explicit `effects` list
     /// desugar HERE, so the executor has one path. Only

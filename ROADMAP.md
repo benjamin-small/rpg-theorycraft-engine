@@ -174,6 +174,20 @@ NOT decided in 0.3.0. Three groups:
       should be driven by a real combo config (PoE2 trigger chains are
       the likely candidate), not guessed at. Until then `cast_action`
       stays proc-only, enforced fail-closed on `ActionDef::effects`.
+- [ ] Remove the 0.x effect sugar (`ProcDef::apply_buff`,
+      `ProcDef::cast_action`, `ActionDef::apply_buff`) — 1.0 at the
+      earliest: P8b's "kept for 0.x" is a promise with an expiry, and
+      this entry is what tracks it. Removal is config-breaking (every
+      0.2.0/0.3.0 config is written in the sugar), so it wants its own
+      migration note; the desugar makes migration mechanical
+      (`"apply_buff": ["a", "b"]` becomes
+      `"effects": [ { "apply_buff": "a" }, { "apply_buff": "b" } ]`).
+      Recorded decision (P8b review): NO `#[deprecated]` attribute in
+      the meantime — the crate's own tests and serde's derived code read
+      the fields (every site would need `#[allow(deprecated)]`), and the
+      deprecation is a JSON-config-surface concern rustc cannot warn a
+      config author about anyway; the rustdoc DEPRECATED notes plus the
+      CHANGELOG are the advertised channel.
 - [ ] `ProcDef::actions` expressiveness (P7d review) — 0.4.0 candidate,
       and only if a real config asks. Today the filter is an inclusive
       list of CASTING actions: no negation, no "every action except"

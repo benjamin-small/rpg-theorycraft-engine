@@ -249,24 +249,48 @@ pub struct ActionDef {
     #[serde(default)]
     pub damage: Option<ActionDamage>,
     /// Buffs this action applies when its cast COMPLETES — one
-    /// application per entry, routed through each buff's
-    /// [`BuffDef::on_reapply`] policy exactly as a proc application is.
-    /// Empty (the default) means this action applies nothing, which is
-    /// every rtce 0.2.0 config.
+    /// application per entry, in list order.
     ///
     /// DEPRECATED (kept for 0.x; prefer [`ActionDef::effects`]): sugar
     /// for an `effects` list of `{ "apply_buff": … }` entries, one per
     /// name, in this list's order — the desugared form compiles
-    /// byte-for-byte identically, and EVERYTHING documented below (the
-    /// instant, list order, repeats, the three axes) applies to the list
-    /// form unchanged. Setting this alongside an explicit `effects` list
-    /// is a compile error (ambiguous order); migrate the sugar into the
-    /// list.
+    /// byte-for-byte identically, and EVERYTHING on
+    /// [`ActionDef::effects`] (the instant, list order, repeats, the
+    /// three-axes rule) applies to this field verbatim; the semantics
+    /// are documented THERE, once. Setting this alongside an explicit
+    /// `effects` list is a compile error (ambiguous order); migrate the
+    /// sugar into the list.
+    ///
+    /// NB the ARITY differs from [`ProcDef::apply_buff`], which is a
+    /// single `Option<String>` rather than a list. Same key, same
+    /// concept, different shape: writing `"apply_buff": ["x"]` on a proc
+    /// is a serde type error, and `"apply_buff": "x"` on an action is
+    /// too. The harmonization the 0.3.0 docs deferred to ROADMAP is
+    /// [`ActionDef::effects`]/[`ProcDef::effects`]: one list shape on
+    /// both entities.
+    ///
+    /// Fail-closed at `sim::compile`: a name that is not a defined buff.
+    #[serde(default)]
+    pub apply_buff: Vec<String>,
+    /// Ordered list of effects this action executes when its cast
+    /// COMPLETES — each `{ "apply_buff": … }` entry is one application of
+    /// the named buff, routed through its [`BuffDef::on_reapply`] policy
+    /// exactly as a proc application is. Empty (the default) means this
+    /// action applies nothing, which is every rtce 0.2.0 config; the
+    /// deprecated [`ActionDef::apply_buff`] sugar desugars into this list
+    /// (naming both on one action is an "ambiguous order" compile
+    /// error).
     ///
     /// This is the first-class replacement for the "icd equals the gating
     /// action's cooldown" trick a 0.2.0 config needed in order to coerce
     /// per-action buff application out of a globally-triggered
     /// [`ProcDef`].
+    ///
+    /// A `{ "cast_action": … }` entry is NOT allowed here — proc-only.
+    /// An action free-casting an action reopens the recursion the
+    /// free-cast guard closed (A→B→A), and a bounded-depth chain design
+    /// should be chosen by a config that needs one (see `ROADMAP.md`);
+    /// `sim::compile` rejects it with exactly that explanation.
     ///
     /// # Where it lands
     ///
@@ -279,7 +303,7 @@ pub struct ActionDef {
     ///
     /// # Within one list
     ///
-    /// Entries are applied in LIST order, and a name repeated in the list
+    /// Entries are applied in LIST order, and a buff repeated in the list
     /// is applied that many times — under `add_independent` that is two
     /// instances; under `refresh` the second application simply replaces
     /// the first.
@@ -331,40 +355,13 @@ pub struct ActionDef {
     ///
     /// # Elsewhere
     ///
-    /// Applied by a proc-triggered FREE cast of this action
-    /// ([`ProcDef::cast_action`]) too, under that free cast's own overlay
-    /// — `apply_buff` is an effect OF the action, like `gain` and
-    /// `damage`, not part of the cast pipeline (cost, cooldown, further
-    /// proc rolls) that the free-cast path deliberately skips.
-    ///
-    /// NB the ARITY differs from [`ProcDef::apply_buff`], which is a
-    /// single `Option<String>` rather than a list. Same key, same
-    /// concept, different shape: writing `"apply_buff": ["x"]` on a proc
-    /// is a serde type error, and `"apply_buff": "x"` on an action is
-    /// too. The harmonization the 0.3.0 docs deferred to ROADMAP is
-    /// [`ActionDef::effects`]/[`ProcDef::effects`]: one list shape on
-    /// both entities.
-    ///
-    /// Fail-closed at `sim::compile`: a name that is not a defined buff.
-    #[serde(default)]
-    pub apply_buff: Vec<String>,
-    /// Ordered list of effects this action executes when its cast
-    /// COMPLETES — the first-class spelling of [`ActionDef::apply_buff`],
-    /// entry for entry: an `{ "apply_buff": … }` entry lands at exactly
-    /// the instant, in exactly the order, and under exactly the frozen
-    /// build that field's docs describe (list order, repeats apply
-    /// twice, the three-axes rule — all of it carries over unchanged).
-    ///
-    /// Default: empty (this action applies nothing — every rtce 0.2.0
-    /// config). Setting it alongside the [`ActionDef::apply_buff`] sugar
-    /// is an "ambiguous order" compile error: migrate the sugar into the
-    /// list.
-    ///
-    /// A `{ "cast_action": … }` entry is NOT allowed here — proc-only.
-    /// An action free-casting an action reopens the recursion the
-    /// free-cast guard closed (A→B→A), and a bounded-depth chain design
-    /// should be chosen by a config that needs one (see `ROADMAP.md`);
-    /// `sim::compile` rejects it with exactly that explanation.
+    /// Run by a proc-triggered FREE cast of this action (a `cast_action`
+    /// proc effect) too, under that free cast's own overlay — an effect
+    /// here is an effect OF the action, like `gain` and `damage`, not
+    /// part of the cast pipeline (cost, cooldown, further proc rolls)
+    /// that the free-cast path deliberately skips. And because
+    /// `cast_action` cannot appear in THIS list, a free cast never chains
+    /// into another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
@@ -406,16 +403,16 @@ pub struct ActionDamage {
     /// [`crate::sim`] module docs), and these expressions are evaluated at
     /// a fixed point within it: AFTER this action's [`ActionDef::gain`] is
     /// credited and after its own cast is counted, and BEFORE both this
-    /// action's [`ActionDef::apply_buff`] and any of this cast's proc
+    /// action's [`ActionDef::effects`] and any of this cast's proc
     /// rolls. So an expression here reads a resource at its POST-gain
     /// amount, and `casts.<this action>` INCLUDES the cast being resolved
     /// (`1` on the first cast, never `0`).
     ///
     /// NEITHER kind of buff this cast applies is visible: not one applied
     /// by its own procs, and not one in its own
-    /// [`ActionDef::apply_buff`] list. Same reason for both, and it is the
+    /// [`ActionDef::effects`] list. Same reason for both, and it is the
     /// point rather than a limitation — a hit cannot be changed by what it
-    /// causes. The `apply_buff` case is the newer and more surprising one,
+    /// causes. The effects-list case is the newer and more surprising one,
     /// since that buff is written on the action ITSELF and still does not
     /// reach the action's own damage.
     ///
@@ -867,8 +864,19 @@ pub enum Trigger {
 
 /// One effect of an action completing or a proc firing. Externally tagged:
 /// `{ "apply_buff": "shock" }` / `{ "cast_action": "comet" }`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// `#[non_exhaustive]`, for [`crate::sim::CompiledEffect`]'s reason: a
+/// later phase adding a third effect kind must land on BOTH enums, so
+/// leaving this one exhaustive would make that a breaking change anyway
+/// and defeat the compiled side's allowance. (Contrast [`NumOrExpr`],
+/// which is deliberately NOT marked: "number or expression" is a closed
+/// set by construction; an effect vocabulary is not — the ROADMAP's
+/// combo-chains entry already sketches growth.) Variants stay freely
+/// constructible downstream; only an exhaustive `match` needs a wildcard
+/// arm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EffectDef {
     /// One application of the named buff (through its `on_reapply` policy).
     ApplyBuff(String),

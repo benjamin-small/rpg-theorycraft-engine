@@ -87,17 +87,17 @@
 //!
 //! - A `damage.stats` expression sees a resource at its POST-`gain`
 //!   amount, and `casts.<this action>` counts from `1` on the first cast.
-//! - The cast does NOT benefit from anything it applies — neither its own
-//!   `apply_buff` nor a buff one of its procs applies. A hit cannot be
-//!   changed by what it causes.
-//! - A proc rolled by this cast DOES see the cast's `apply_buff`
-//!   (`buff.<applied>` reads `1` in its `chance`). Intrinsic effects of
-//!   the action resolve before effects merely TRIGGERED by it, so the
-//!   whole `apply_buff` list precedes the whole proc batch and the two
-//!   never interleave, whatever the procs' name order.
-//! - Within one `apply_buff` list, what a later entry sees splits across
-//!   THREE axes, not two (the full statement is on
-//!   [`crate::simdef::ActionDef::apply_buff`]): sim STATE is SEQUENTIAL
+//! - The cast does NOT benefit from anything it applies — neither a buff
+//!   in its own `effects` list nor one a proc it triggers applies. A hit
+//!   cannot be changed by what it causes.
+//! - A proc rolled by this cast DOES see the buffs the cast's `effects`
+//!   applied (`buff.<applied>` reads `1` in its `chance`). Intrinsic
+//!   effects of the action resolve before effects merely TRIGGERED by
+//!   it, so the whole `effects` list precedes the whole proc batch and
+//!   the two never interleave, whatever the procs' name order.
+//! - Within one action's `effects` list, what a later entry sees splits
+//!   across THREE axes, not two (the full statement is on
+//!   [`crate::simdef::ActionDef::effects`]): sim STATE is SEQUENTIAL
 //!   (`stacks.*`, `buff.*`, resource amounts — a `duration` expression
 //!   reads them fresh per entry); the BUILD is FROZEN once before the
 //!   list runs (so a snapshot [`crate::simdef::TickObjective`] magnitude
