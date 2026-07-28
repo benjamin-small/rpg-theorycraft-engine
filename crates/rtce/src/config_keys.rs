@@ -80,22 +80,33 @@ pub(crate) fn reject_unknown(
         if key.starts_with('_') {
             continue;
         }
-        let what = match nearest(key, known) {
-            Some(best) => {
-                format!("unknown field `{key}` on {context} — did you mean `{best}`?")
-            }
-            None => format!(
-                "unknown field `{key}` on {context}; expected one of: {}",
-                known
-                    .iter()
-                    .map(|k| format!("`{k}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        return Err(PlanError { what });
+        return Err(PlanError {
+            what: unknown_key_message(key, context, known),
+        });
     }
     Ok(())
+}
+
+/// The message [`reject_unknown`] fails with, extracted so a parse-time
+/// mirror of an ENUM config surface (P8b's `EffectDef`, whose "fields"
+/// are its variant tags) produces the identical wording: names the key,
+/// the `context` it sits on, and the nearest `known` name within edit
+/// distance 2 as a did-you-mean — or lists every known name when nothing
+/// is close.
+pub(crate) fn unknown_key_message(key: &str, context: &str, known: &[&str]) -> String {
+    match nearest(key, known) {
+        Some(best) => {
+            format!("unknown field `{key}` on {context} — did you mean `{best}`?")
+        }
+        None => format!(
+            "unknown field `{key}` on {context}; expected one of: {}",
+            known
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// The `known` name nearest to `key` by [`edit_distance`], if any is

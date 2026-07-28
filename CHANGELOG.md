@@ -7,6 +7,66 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added — ordered `effects` list on actions and procs (P8b)
+
+What an action does at cast complete and what a proc does when it fires
+are now ONE ordered list each — `ActionDef::effects` /
+`ProcDef::effects`, externally-tagged entries
+(`{ "apply_buff": "shock" }` / `{ "cast_action": "comet" }`):
+
+```jsonc
+"procs": {
+  "trigger_gem": {
+    "trigger": "on_cast", "chance": "1", "icd": 3.0,
+    "effects": [ { "apply_buff": "shock" },
+                 { "cast_action": "comet" },
+                 { "apply_buff": "shock" } ]   // repeats apply twice
+  }
+}
+```
+
+- **List order is execution order**, and sim state is SEQUENTIAL between
+  entries (the P7b rule): a `cast_action` free cast bumps `casts.<name>`
+  and lands its gains/damage/own-ApplyBuff before the next entry runs,
+  so a later `apply_buff`'s `duration` expression sees it — pinned by a
+  0.2-vs-0.1 uptime contrast where reversing a two-entry list is the
+  only change. A repeated entry applies that many times (the P7d list
+  precedent).
+- **A proc can now do several things** — the 0.3.0 "exactly one of
+  `apply_buff`/`cast_action`" limitation is gone, generalized to "a
+  proc must do something" (an empty list after desugar is the compile
+  error; BOTH sugar fields at once is still refused with its
+  long-standing message).
+- **`cast_action` stays proc-only.** On an `ActionDef` it is a
+  positioned compile error: an action free-casting an action reopens
+  the A→B→A recursion the free-cast guard closed (a free cast rolls no
+  procs, so today's chains are one link long by construction); a
+  bounded-depth chain design is tracked in `ROADMAP.md` for a config
+  that actually needs one.
+- **DEPRECATED (kept for 0.x): `ProcDef::apply_buff`,
+  `ProcDef::cast_action`, `ActionDef::apply_buff`.** Each is sugar for a
+  one-entry (per name) `effects` list and desugars at `sim::compile`
+  into the IDENTICAL compiled form — every 0.3.0 config parses and runs
+  byte-for-byte unchanged (the `diablo4_rotation` EV and MC blocks are
+  the standing proof). Mixing sugar with an explicit `effects` list on
+  ONE entity is a compile error ("ambiguous order — migrate the sugar
+  into the `effects` list"). This also settles the `apply_buff` arity
+  wart the 0.3.0 docs deferred: one list shape, both entities.
+- **Typos inside an effect entry fail closed in the P8a voice**:
+  `{ "apply_buf": "x" }` → ``unknown field `apply_buf` on an effect
+  entry — did you mean `apply_buff`?`` (hand-written `Deserialize`
+  replacing serde's "unknown variant" default); `_`-prefixed annotation
+  keys are accepted inside an entry like everywhere else, and an entry
+  must hold exactly ONE effect key.
+- **Rust API**: `sim::ProcEffect` is renamed `sim::CompiledEffect`, and
+  the compiled `CompiledProc.effect` / `CompiledAction.apply_buff`
+  fields are replaced by `effects: Vec<CompiledEffect>` on both (the
+  structs are `#[non_exhaustive]` and only `compile` constructs them —
+  source-breaking only for code matching the old names; neither
+  consumer does). `ActionDef` / `ProcDef` gain the public `effects`
+  field (source-breaking for exhaustive struct literals of those two
+  types; neither consumer constructs them).
+
 ### Changed — unknown config keys now fail closed (P8a)
 
 Every config struct now REJECTS a key it does not declare, instead of

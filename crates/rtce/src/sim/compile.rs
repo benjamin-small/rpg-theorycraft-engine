@@ -7,7 +7,7 @@
 use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
-use crate::simdef::{NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
+use crate::simdef::{EffectDef, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
 /// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
@@ -130,12 +130,15 @@ pub struct CompiledAction {
     /// out of this map by the executor rather than fed into the `Plan` as
     /// a stat — see `simdef::ActionDamage` docs.
     pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
-    /// Buffs this action applies at cast complete, resolved to indices
-    /// into [`SimPlan::buffs`] and kept in the CONFIG's list order, which
-    /// is the application order (see
+    /// Effects this action executes at cast complete, resolved to indices
+    /// and kept in the CONFIG's order, which is the execution order (see
     /// [`crate::simdef::ActionDef::apply_buff`] for where in the
-    /// completion instant they land and what a repeat means).
-    pub apply_buff: Vec<usize>,
+    /// completion instant they land and what a repeat means). Both the
+    /// deprecated `apply_buff` sugar and an explicit `effects` list
+    /// desugar HERE, so the executor has one path. Only
+    /// [`CompiledEffect::ApplyBuff`] can appear — [`compile`] rejects a
+    /// `cast_action` effect on an action (recursion; see that error).
+    pub effects: Vec<CompiledEffect>,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -190,16 +193,18 @@ pub struct CompiledTick {
     pub snapshot: bool,
 }
 
-/// What a firing [`crate::simdef::ProcDef`] does, resolved to an index —
-/// exactly one of `apply_buff`/`cast_action` was set in the source
-/// `ProcDef` (validated at compile time).
+/// One compiled [`crate::simdef::EffectDef`], resolved to an index —
+/// one entry of a [`CompiledProc::effects`] / [`CompiledAction::effects`]
+/// list (P8b renamed this from `ProcEffect` when actions gained the same
+/// list; the deprecated sugar fields desugar into these lists at
+/// [`compile`], so the executor has exactly one effect path).
 ///
 /// `#[non_exhaustive]` for the same reason as [`CompiledAction`]: a later
 /// phase adding a third effect kind should not be a breaking change for a
 /// downstream `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ProcEffect {
+pub enum CompiledEffect {
     /// Apply the buff at this index in `SimPlan::buffs`.
     ApplyBuff(usize),
     /// Cast the action at this index in `SimPlan::actions`.
@@ -220,8 +225,11 @@ pub struct CompiledProc {
     pub chance: Program,
     /// Internal cooldown in seconds after firing.
     pub icd: f64,
-    /// What firing this proc does, resolved to an index.
-    pub effect: ProcEffect,
+    /// What firing this proc does: its effects, resolved to indices, in
+    /// EXECUTION order. Never empty — [`compile`] rejects a proc with
+    /// nothing to do ("a proc must do something"). A one-entry list is
+    /// what either deprecated sugar field desugars to.
+    pub effects: Vec<CompiledEffect>,
     /// Trigger filter, resolved to indices into [`SimPlan::actions`]:
     /// `None` = every action (the 0.2.0 behavior), `Some(list)` = only
     /// casts of those actions produce a qualifying event. Never
@@ -506,8 +514,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
-    // Actions: cost/gain resource references and `apply_buff` targets
-    // must be defined.
+    // Actions: cost/gain resource references and effect targets must be
+    // defined. The deprecated `apply_buff` sugar and the `effects` list
+    // are validated under their OWN spellings (the messages a config's
+    // author actually wrote), and combining them is refused outright —
+    // desugaring would have to pick where the sugar lands relative to
+    // the list, and a guessed order is a silent wrong answer.
     for (name, action) in &simdef.actions {
         for r in action.cost.keys().chain(action.gain.keys()) {
             if !simdef.resources.contains_key(r) {
@@ -516,11 +528,47 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 });
             }
         }
+        if !action.apply_buff.is_empty() && !action.effects.is_empty() {
+            return Err(PlanError {
+                what: format!(
+                    "action `{name}`: the deprecated `apply_buff` sugar AND an explicit \
+                     `effects` list are both set — ambiguous order; migrate the sugar \
+                     into the `effects` list"
+                ),
+            });
+        }
         for b in &action.apply_buff {
             if !simdef.buffs.contains_key(b) {
                 return Err(PlanError {
                     what: format!("action `{name}`: unknown buff `{b}` in apply_buff"),
                 });
+            }
+        }
+        for effect in &action.effects {
+            match effect {
+                // `cast_action` stays PROC-only: an action free-casting
+                // an action reopens the recursion the free-cast guard
+                // closed (a free cast rolls no procs, so today's chains
+                // are one link long by construction). A bounded-depth
+                // combo design should be chosen by a config that needs
+                // one — see ROADMAP.md — not guessed at here.
+                EffectDef::CastAction(_) => {
+                    return Err(PlanError {
+                        what: format!(
+                            "action `{name}`: a `cast_action` effect is not allowed on an \
+                             action — an action free-casting an action reopens recursion \
+                             (A→B→A), which the free-cast guard exists to close; a \
+                             bounded-depth chain design is tracked in ROADMAP.md"
+                        ),
+                    });
+                }
+                EffectDef::ApplyBuff(b) => {
+                    if !simdef.buffs.contains_key(b) {
+                        return Err(PlanError {
+                            what: format!("action `{name}`: unknown buff `{b}` in effects"),
+                        });
+                    }
+                }
             }
         }
     }
@@ -598,32 +646,68 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
-    // Procs: exactly one of apply_buff/cast_action, and it must exist.
+    // Procs: the effects list, under the same rules as the action side —
+    // sugar and the explicit list validated under their own spellings,
+    // combining them refused — plus the proc-specific floor: a proc with
+    // NOTHING to do after desugar is a config mistake, not a way to
+    // disable one (the old "exactly one of apply_buff/cast_action"
+    // check, generalized; BOTH sugar fields at once stays an error with
+    // its long-standing message).
     for (name, p) in &simdef.procs {
-        match (&p.apply_buff, &p.cast_action) {
-            (Some(_), Some(_)) => {
-                return Err(PlanError {
-                    what: format!("proc `{name}`: exactly one of apply_buff/cast_action, got both"),
-                })
-            }
-            (None, None) => {
-                return Err(PlanError {
-                    what: format!(
-                        "proc `{name}`: exactly one of apply_buff/cast_action, got neither"
-                    ),
-                })
-            }
-            (Some(b), None) if !simdef.buffs.contains_key(b) => {
+        if p.apply_buff.is_some() && p.cast_action.is_some() {
+            return Err(PlanError {
+                what: format!("proc `{name}`: exactly one of apply_buff/cast_action, got both"),
+            });
+        }
+        if (p.apply_buff.is_some() || p.cast_action.is_some()) && !p.effects.is_empty() {
+            return Err(PlanError {
+                what: format!(
+                    "proc `{name}`: the deprecated `apply_buff`/`cast_action` sugar AND an \
+                     explicit `effects` list are both set — ambiguous order; migrate the \
+                     sugar into the `effects` list"
+                ),
+            });
+        }
+        if p.apply_buff.is_none() && p.cast_action.is_none() && p.effects.is_empty() {
+            return Err(PlanError {
+                what: format!(
+                    "proc `{name}`: no effects — a proc must do something; give it an \
+                     `effects` list (or one of the deprecated `apply_buff`/`cast_action` \
+                     sugar fields)"
+                ),
+            });
+        }
+        if let Some(b) = &p.apply_buff {
+            if !simdef.buffs.contains_key(b) {
                 return Err(PlanError {
                     what: format!("proc `{name}`: unknown buff `{b}`"),
-                })
+                });
             }
-            (None, Some(a)) if !simdef.actions.contains_key(a) => {
+        }
+        if let Some(a) = &p.cast_action {
+            if !simdef.actions.contains_key(a) {
                 return Err(PlanError {
                     what: format!("proc `{name}`: unknown action `{a}`"),
-                })
+                });
             }
-            _ => {}
+        }
+        for effect in &p.effects {
+            match effect {
+                EffectDef::ApplyBuff(b) => {
+                    if !simdef.buffs.contains_key(b) {
+                        return Err(PlanError {
+                            what: format!("proc `{name}`: unknown buff `{b}` in effects"),
+                        });
+                    }
+                }
+                EffectDef::CastAction(a) => {
+                    if !simdef.actions.contains_key(a) {
+                        return Err(PlanError {
+                            what: format!("proc `{name}`: unknown action `{a}` in effects"),
+                        });
+                    }
+                }
+            }
         }
         // The trigger filter. `None` is "every action" (0.2.0); an EMPTY
         // list is the config mistake that reads like `None` and means the
@@ -717,6 +801,26 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             })?),
             None => None,
         };
+        // Desugar: each `apply_buff` sugar entry is one ApplyBuff effect,
+        // in list order. Mixing the sugar with an explicit list was
+        // rejected above, so "prepend the sugar" and "use whichever is
+        // set" are the same operation.
+        let effects: Vec<CompiledEffect> = if !a.apply_buff.is_empty() {
+            a.apply_buff
+                .iter()
+                .map(|b| CompiledEffect::ApplyBuff(buff_index(b)))
+                .collect()
+        } else {
+            a.effects
+                .iter()
+                .map(|e| match e {
+                    EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
+                    EffectDef::CastAction(_) => {
+                        unreachable!("`cast_action` on an action rejected above")
+                    }
+                })
+                .collect()
+        };
         actions.push(CompiledAction {
             name: name.clone(),
             cast_time,
@@ -724,7 +828,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             cost,
             gain,
             damage,
-            apply_buff: a.apply_buff.iter().map(|b| buff_index(b)).collect(),
+            effects,
         });
     }
 
@@ -766,21 +870,29 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 what: format!("proc `{name}` icd must be finite and >= 0, got {}", p.icd),
             });
         }
-        let effect = if let Some(b) = &p.apply_buff {
-            ProcEffect::ApplyBuff(buff_index(b))
+        // Desugar: either sugar field is a one-entry effects list (mixing
+        // sugar with an explicit list was rejected above, so this is the
+        // whole story; the "must do something" check above guarantees the
+        // result is non-empty).
+        let effects: Vec<CompiledEffect> = if let Some(b) = &p.apply_buff {
+            vec![CompiledEffect::ApplyBuff(buff_index(b))]
+        } else if let Some(a) = &p.cast_action {
+            vec![CompiledEffect::CastAction(action_index(a))]
         } else {
-            ProcEffect::CastAction(action_index(
-                p.cast_action
-                    .as_ref()
-                    .expect("exactly-one-of validated above"),
-            ))
+            p.effects
+                .iter()
+                .map(|e| match e {
+                    EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
+                    EffectDef::CastAction(a) => CompiledEffect::CastAction(action_index(a)),
+                })
+                .collect()
         };
         procs.push(CompiledProc {
             name: name.clone(),
             trigger: p.trigger,
             chance,
             icd: p.icd,
-            effect,
+            effects,
             actions: p
                 .actions
                 .as_ref()
@@ -820,8 +932,8 @@ mod tests {
     use crate::gamedef::GameDef;
     use crate::plan;
     use crate::simdef::{
-        ActionDamage, ActionDef, BuffDef, NumOrExpr, ProcDef, ReapplyPolicy, ResourceDef, Rule,
-        TickObjective,
+        ActionDamage, ActionDef, BuffDef, EffectDef, NumOrExpr, ProcDef, ReapplyPolicy,
+        ResourceDef, Rule, TickObjective,
     };
     use std::collections::BTreeMap;
 
@@ -881,6 +993,7 @@ mod tests {
                     stats: dmg_stats,
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         actions.insert(
@@ -893,6 +1006,7 @@ mod tests {
                 gain: BTreeMap::new(),
                 damage: None,
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
 
@@ -950,6 +1064,7 @@ mod tests {
                 chance: "lucky_hit_chance / 100 * 0.3".into(),
                 icd: 2.0,
                 apply_buff: Some("combustion".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             },
@@ -1024,7 +1139,8 @@ mod tests {
         assert_eq!(sp.buffs[2].name, "vuln_window");
 
         assert_eq!(sp.procs.len(), 1);
-        assert_eq!(sp.procs[0].effect, ProcEffect::ApplyBuff(1)); // "combustion"
+        // The sugar desugars to a one-entry compiled effects list.
+        assert_eq!(sp.procs[0].effects, vec![CompiledEffect::ApplyBuff(1)]); // "combustion"
 
         assert_eq!(sp.rules.len(), 2);
         assert_eq!(sp.rules[0].action, 1); // "frost_nova"
@@ -1151,11 +1267,11 @@ mod tests {
         let sp = compile(&plan, &simdef, &valid_rotation()).unwrap();
         assert_eq!(sp.actions[1].name, "frost_nova");
         assert_eq!(
-            sp.actions[1].apply_buff,
-            vec![2, 0],
+            sp.actions[1].effects,
+            vec![CompiledEffect::ApplyBuff(2), CompiledEffect::ApplyBuff(0)],
             "list order is application order, NOT the buffs' sorted order"
         );
-        assert!(sp.actions[0].apply_buff.is_empty());
+        assert!(sp.actions[0].effects.is_empty());
         assert_eq!(sp.procs[0].actions.as_deref(), Some([1].as_slice()));
     }
 
@@ -1548,6 +1664,199 @@ mod tests {
         assert!(e.what.contains("must be finite"), "got: {}", e.what);
     }
 
+    // ==================================================================
+    // P8b — the effects list at `sim::compile`: the deprecated sugar
+    // fields desugar into it, five shapes fail closed, and the compiled
+    // representation is IDENTICAL whichever spelling the config used.
+    // ==================================================================
+
+    // The compat proof at the compiled layer: a sugar config and its
+    // explicit-`effects` spelling produce byte-for-byte the same compiled
+    // effect lists — so the executor cannot tell which spelling a config
+    // used, and every 0.3.0 sugar config keeps its exact behavior.
+    #[test]
+    fn sugar_and_explicit_effects_compile_to_identical_effect_lists() {
+        let plan = toy_plan();
+
+        // Sugar spelling: `valid_simdef` as committed — proc `conflagrate`
+        // uses `apply_buff: Some("combustion")`, and we give `frost_nova`
+        // the P7d two-entry action sugar.
+        let mut sugar = valid_simdef();
+        sugar.actions.get_mut("frost_nova").unwrap().apply_buff =
+            vec!["vuln_window".into(), "burning".into()];
+
+        // Explicit spelling: the same config with each sugar field
+        // migrated into a one-entry-per-application `effects` list.
+        let mut explicit = valid_simdef();
+        {
+            let p = explicit.procs.get_mut("conflagrate").unwrap();
+            p.apply_buff = None;
+            p.effects = vec![EffectDef::ApplyBuff("combustion".into())];
+        }
+        {
+            let a = explicit.actions.get_mut("frost_nova").unwrap();
+            a.effects = vec![
+                EffectDef::ApplyBuff("vuln_window".into()),
+                EffectDef::ApplyBuff("burning".into()),
+            ];
+        }
+
+        let sp_sugar = compile(&plan, &sugar, &valid_rotation()).unwrap();
+        let sp_explicit = compile(&plan, &explicit, &valid_rotation()).unwrap();
+
+        // Not vacuous: assert the CONTENT once, then the equality.
+        // Buffs sort "burning"(0) < "combustion"(1) < "vuln_window"(2).
+        assert_eq!(
+            sp_sugar.procs[0].effects,
+            vec![CompiledEffect::ApplyBuff(1)]
+        );
+        assert_eq!(
+            sp_sugar.actions[1].effects,
+            vec![CompiledEffect::ApplyBuff(2), CompiledEffect::ApplyBuff(0)]
+        );
+        assert_eq!(sp_sugar.procs[0].effects, sp_explicit.procs[0].effects);
+        assert_eq!(sp_sugar.actions[1].effects, sp_explicit.actions[1].effects);
+
+        // A `cast_action` sugar proc desugars the same way.
+        let mut sugar_cast = valid_simdef();
+        {
+            let p = sugar_cast.procs.get_mut("conflagrate").unwrap();
+            p.apply_buff = None;
+            p.cast_action = Some("frost_nova".into());
+        }
+        let mut explicit_cast = valid_simdef();
+        {
+            let p = explicit_cast.procs.get_mut("conflagrate").unwrap();
+            p.apply_buff = None;
+            p.effects = vec![EffectDef::CastAction("frost_nova".into())];
+        }
+        let a = compile(&plan, &sugar_cast, &valid_rotation()).unwrap();
+        let b = compile(&plan, &explicit_cast, &valid_rotation()).unwrap();
+        assert_eq!(a.procs[0].effects, vec![CompiledEffect::CastAction(1)]);
+        assert_eq!(a.procs[0].effects, b.procs[0].effects);
+    }
+
+    // Fail-closed 1a: sugar + an explicit `effects` list on one PROC.
+    // Desugaring would have to pick where the sugar lands relative to the
+    // list — ambiguous, so it is refused with the migration named.
+    #[test]
+    fn proc_sugar_plus_an_explicit_effects_list_is_an_ambiguous_order_error() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.procs.get_mut("conflagrate").unwrap().effects =
+            vec![EffectDef::ApplyBuff("combustion".into())];
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("proc `conflagrate`"), "got: {}", e.what);
+        assert!(e.what.contains("ambiguous order"), "got: {}", e.what);
+        assert!(
+            e.what.contains("migrate the sugar into the `effects` list"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // Fail-closed 1b: the same on an ACTION.
+    #[test]
+    fn action_sugar_plus_an_explicit_effects_list_is_an_ambiguous_order_error() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        {
+            let a = simdef.actions.get_mut("frost_nova").unwrap();
+            a.apply_buff = vec!["vuln_window".into()];
+            a.effects = vec![EffectDef::ApplyBuff("burning".into())];
+        }
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("action `frost_nova`"), "got: {}", e.what);
+        assert!(e.what.contains("ambiguous order"), "got: {}", e.what);
+        assert!(
+            e.what.contains("migrate the sugar into the `effects` list"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // Fail-closed 2: a proc with NO effects after desugar — the old
+    // "exactly one of apply_buff/cast_action, got neither" generalizes to
+    // this (and both sugar fields at once stays an error, pinned by the
+    // long-standing `proc_with_both_apply_buff_and_cast_action_is_rejected`).
+    #[test]
+    fn a_proc_with_no_effects_after_desugar_must_do_something() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.procs.get_mut("conflagrate").unwrap().apply_buff = None;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("proc `conflagrate`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("a proc must do something"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // Fail-closed 3 + 4: unknown names INSIDE an effects list, each
+    // positioned on its entity and naming the list.
+    #[test]
+    fn unknown_names_inside_an_effects_list_are_rejected() {
+        let plan = toy_plan();
+        // 3a: unknown buff in a proc's list.
+        let mut simdef = valid_simdef();
+        {
+            let p = simdef.procs.get_mut("conflagrate").unwrap();
+            p.apply_buff = None;
+            p.effects = vec![EffectDef::ApplyBuff("nope".into())];
+        }
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("proc `conflagrate`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("unknown buff `nope` in effects"),
+            "got: {}",
+            e.what
+        );
+        // 4: unknown action in a proc's list.
+        let mut simdef = valid_simdef();
+        {
+            let p = simdef.procs.get_mut("conflagrate").unwrap();
+            p.apply_buff = None;
+            p.effects = vec![EffectDef::CastAction("nope".into())];
+        }
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("proc `conflagrate`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("unknown action `nope` in effects"),
+            "got: {}",
+            e.what
+        );
+        // 3b: unknown buff in an ACTION's list.
+        let mut simdef = valid_simdef();
+        simdef.actions.get_mut("frost_nova").unwrap().effects =
+            vec![EffectDef::ApplyBuff("nope".into())];
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("action `frost_nova`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("unknown buff `nope` in effects"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // Fail-closed 5: `cast_action` stays PROC-only. On an action it is
+    // refused with the recursion rationale spelled out — an action
+    // free-casting an action reopens the A→B→A recursion the free-cast
+    // guard closed, and a bounded-depth chain design should be chosen by
+    // a config that needs one (ROADMAP), not guessed at here.
+    #[test]
+    fn a_cast_action_effect_on_an_action_is_rejected_with_the_recursion_rationale() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.actions.get_mut("frost_nova").unwrap().effects =
+            vec![EffectDef::CastAction("fireball".into())];
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("action `frost_nova`"), "got: {}", e.what);
+        assert!(e.what.contains("recursion"), "got: {}", e.what);
+        assert!(e.what.contains("A→B→A"), "got: {}", e.what);
+        assert!(e.what.contains("ROADMAP"), "got: {}", e.what);
+    }
+
     #[test]
     fn rule_with_no_when_is_always_eligible_and_compiles() {
         let plan = toy_plan();
@@ -1562,6 +1871,7 @@ mod tests {
                 gain: BTreeMap::new(),
                 damage: None,
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         let mut rotation = valid_rotation();

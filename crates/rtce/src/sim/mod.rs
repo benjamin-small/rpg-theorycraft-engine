@@ -44,14 +44,21 @@
 //! ([`crate::simdef::NumOrExpr`], untagged) — every rtce 0.2.0 config,
 //! which only ever wrote numbers there, parses and behaves unchanged.
 //!
-//! Two further fields are cross-REFERENCES rather than expressions, and
-//! `sim::compile` resolves both to indices, fail-closed (P7d):
-//! [`crate::simdef::ActionDef::apply_buff`] (buffs the action applies at
-//! cast complete) and [`crate::simdef::ProcDef::actions`] (a trigger
-//! filter naming the actions whose casts this proc considers; `None` =
-//! all of them, the 0.2.0 behavior). An unknown name in either — or an
-//! EMPTY `actions` list, which would describe a proc that can never
-//! fire — is a compile error.
+//! The remaining fields are cross-REFERENCES rather than expressions, and
+//! `sim::compile` resolves them all to indices, fail-closed: the ordered
+//! `effects` lists (P8b — [`crate::simdef::ActionDef::effects`] runs at
+//! cast complete, [`crate::simdef::ProcDef::effects`] at proc fire; the
+//! 0.x sugar fields `apply_buff`/`cast_action` desugar into them at
+//! compile, and mixing sugar with an explicit list on one entity is an
+//! "ambiguous order" compile error) and
+//! [`crate::simdef::ProcDef::actions`] (a trigger filter naming the
+//! actions whose casts this proc considers; `None` = all of them, the
+//! 0.2.0 behavior). An unknown name in any of them — or an EMPTY
+//! `actions` list, which would describe a proc that can never fire, or a
+//! proc whose effects are empty AFTER desugar ("a proc must do
+//! something"), or a `cast_action` effect on an ACTION (an action
+//! free-casting an action reopens A→B→A recursion; proc-only, see
+//! `ROADMAP.md`) — is a compile error.
 //!
 //! Pipeline STAGES and buckets are deliberately absent from this space —
 //! a sim expression referencing one is a fail-closed "unknown identifier"
@@ -72,7 +79,7 @@
 //! ```text
 //! apply `gain`  →  casts.<action> += 1
 //!   →  evaluate `damage.stats`, measure and credit the hit
-//!   →  apply_buff, in list order
+//!   →  the action's effects (apply_buff entries), in list order
 //!   →  proc rolls: on_cast, then on_hit, then on_crit
 //! ```
 //!
@@ -100,10 +107,15 @@
 //!   application). All three are pinned. The third one is the one that
 //!   surprises: list ORDER alone can change a captured DoT rate.
 //!
-//! A proc-triggered FREE cast ([`crate::simdef::ProcDef::cast_action`])
-//! runs `gain` → damage → `apply_buff` at the firing proc's instant, and
-//! skips the rest of the cast pipeline: no cost, no cooldown, and no
-//! further proc rolls (which is what bounds proc recursion).
+//! A firing PROC runs its own `effects` list in list order, each entry
+//! against the sim state its predecessors left behind (P7b sequential
+//! state — pinned by the 0.2/0.1 order contrast in `exec`'s
+//! `effects_list` tests). A proc-triggered FREE cast (a `cast_action`
+//! effect) runs `gain` → damage → the action's own `effects` at the
+//! firing proc's instant, and skips the rest of the cast pipeline: no
+//! cost, no cooldown, and no further proc rolls (which is what bounds
+//! proc recursion — and since a `cast_action` effect cannot appear on an
+//! ACTION, a free cast cannot chain into another).
 //!
 //! # The fight horizon
 //!
@@ -206,8 +218,8 @@ mod compile;
 mod exec;
 mod report;
 pub use compile::{
-    compile, CompiledAction, CompiledBuff, CompiledProc, CompiledResource, CompiledRule,
-    CompiledTick, CompiledValue, ProcEffect, SimPlan,
+    compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
+    CompiledRule, CompiledTick, CompiledValue, SimPlan,
 };
 pub use exec::{run, Mode, SimScratch};
 pub use report::{

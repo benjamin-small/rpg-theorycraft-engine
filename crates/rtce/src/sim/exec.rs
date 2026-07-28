@@ -212,7 +212,7 @@
 //! [`Plan::evaluate_phase_sampled`]) actually rolled a crit (see
 //! [`Sim::eval_action_damage_sampled`]) — exact, not probabilistic.
 //!
-//! `ProcEffect::CastAction` (a proc casting a free action, [`Sim::free_cast`])
+//! `CompiledEffect::CastAction` (a proc casting a free action, [`Sim::free_cast`])
 //! is scoped identically in both modes: gains, damage, and the action's
 //! own `apply_buff` list (P7d — under THIS cast's overlay), but no cost,
 //! no cooldown, and no further proc rolls (avoids reentrancy). Its damage
@@ -233,7 +233,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use super::compile::{CompiledValue, ProcEffect, SimPlan};
+use super::compile::{CompiledEffect, CompiledValue, SimPlan};
 use super::report::{
     ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
 };
@@ -263,7 +263,7 @@ pub enum Mode {
     /// v1 scope limits rather than oversights:
     ///
     /// - A proc-triggered FREE cast
-    ///   ([`super::ProcEffect::CastAction`]) always contributes its
+    ///   ([`super::CompiledEffect::CastAction`]) always contributes its
     ///   EV/branch-blended damage, and its crit never feeds an `on_crit`
     ///   proc. Tightening this later is additive, not breaking.
     /// - A DoT [`crate::simdef::BuffDef::tick_objective`]'s rate — live or
@@ -1559,11 +1559,16 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
-    /// Apply every buff `action` names in
-    /// [`crate::simdef::ActionDef::apply_buff`], in LIST order, at this
-    /// cast's completion instant — the first-class replacement for the
-    /// `icd == cooldown` proc trick a 0.2.0 config needed to get a buff
-    /// out of ONE specific action.
+    /// Run `action`'s compiled effects list — every buff it names in
+    /// [`crate::simdef::ActionDef::effects`] (or the
+    /// [`crate::simdef::ActionDef::apply_buff`] sugar, which desugars to
+    /// the same compiled list) — in LIST order, at this cast's completion
+    /// instant. The first-class replacement for the `icd == cooldown`
+    /// proc trick a 0.2.0 config needed to get a buff out of ONE specific
+    /// action. Only `ApplyBuff` entries can occur here: `sim::compile`
+    /// rejects a `cast_action` effect on an action (recursion — the
+    /// A→B→A chain the free-cast guard exists to close), which is also
+    /// why a FREE cast running this list still cannot recurse.
     ///
     /// # Where this sits in the completion instant
     ///
@@ -1644,7 +1649,7 @@ impl<'a> Sim<'a> {
         // `sim_plan` is a `&'a` field — reading it out decouples the
         // iteration from `self`'s own borrow (see `Sim`'s docs).
         let sim_plan = self.sim_plan;
-        if sim_plan.actions[action].apply_buff.is_empty() {
+        if sim_plan.actions[action].effects.is_empty() {
             return Ok(());
         }
         let ambient;
@@ -1655,8 +1660,18 @@ impl<'a> Sim<'a> {
                 &ambient
             }
         };
-        for &bi in &sim_plan.actions[action].apply_buff {
-            self.apply_buff(bi, Some(frozen))?;
+        for effect in &sim_plan.actions[action].effects {
+            match *effect {
+                CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, Some(frozen))?,
+                // `sim::compile` rejects a `cast_action` effect on an
+                // action (an action free-casting an action reopens the
+                // A→B→A recursion the free-cast guard closed), so no
+                // `SimPlan` it produced can reach this arm — and
+                // `compile` is the only constructor of one.
+                CompiledEffect::CastAction(_) => {
+                    unreachable!("sim::compile rejects `cast_action` effects on actions")
+                }
+            }
         }
         Ok(())
     }
@@ -2507,13 +2522,7 @@ impl<'a> Sim<'a> {
             if roll < chance {
                 self.procs[pi].fire_count += 1;
                 self.procs[pi].icd_ready_at = now + self.sim_plan.procs[pi].icd;
-                match self.sim_plan.procs[pi].effect {
-                    // The PROC path keeps `None` — a proc-applied snapshot
-                    // captures the ambient effective build, not any cast's
-                    // overlay (see `Sim::eval_objective`).
-                    ProcEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
-                    ProcEffect::CastAction(ai) => self.free_cast(ai)?,
-                }
+                self.run_proc_effects(pi)?;
             }
         }
         Ok(())
@@ -2538,18 +2547,40 @@ impl<'a> Sim<'a> {
     }
 
     /// Fire proc `pi` at `now`: consume the accumulator (EV mode only —
-    /// MC mode's `roll_procs_mc` never calls this, it applies the effect
-    /// inline), start the ICD, apply the effect.
+    /// MC mode's `roll_procs_mc` never calls this, it runs the effects
+    /// inline), start the ICD, run the effects.
     fn fire_proc(&mut self, pi: usize, now: f64) -> Result<(), PlanError> {
         self.procs[pi].acc -= 1.0;
         self.procs[pi].fire_count += 1;
         self.procs[pi].icd_ready_at = now + self.sim_plan.procs[pi].icd;
-        match self.sim_plan.procs[pi].effect {
-            // The PROC path keeps `None` — a proc-applied snapshot
-            // captures the ambient effective build, not any cast's
-            // overlay (see `Sim::eval_objective`).
-            ProcEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
-            ProcEffect::CastAction(ai) => self.free_cast(ai)?,
+        self.run_proc_effects(pi)
+    }
+
+    /// Execute proc `pi`'s compiled effects, in LIST order — the shared
+    /// tail of an EV fire ([`Sim::fire_proc`]) and an MC fire
+    /// ([`Sim::roll_procs_mc`]), so the two modes cannot drift.
+    ///
+    /// Sim state is SEQUENTIAL between entries (the P7b rule, same as the
+    /// action-side list): an `apply_buff` is self-bracketing (flush →
+    /// mutate → refold → reschedule), and a `cast_action` free cast bumps
+    /// `casts.<name>` and lands its gains/damage/own-ApplyBuff before the
+    /// next entry runs — so a later entry's `duration` expression reads
+    /// all of it (the 0.2/0.1 order pin in `mod effects_list`). A repeated
+    /// entry applies that many times (the P7d list precedent).
+    fn run_proc_effects(&mut self, pi: usize) -> Result<(), PlanError> {
+        // `sim_plan` is a `&'a` field — reading it out decouples the
+        // iteration from `self`'s own borrow (see `Sim`'s docs).
+        let sim_plan = self.sim_plan;
+        for effect in &sim_plan.procs[pi].effects {
+            match *effect {
+                // The PROC path keeps `None` — a proc-applied snapshot
+                // captures the ambient effective build, not any cast's
+                // overlay (see `Sim::eval_objective`). After an earlier
+                // entry in THIS list, "ambient" is the refolded state
+                // that entry left behind — sequential, not frozen.
+                CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
+                CompiledEffect::CastAction(ai) => self.free_cast(ai)?,
+            }
         }
         Ok(())
     }
@@ -2931,6 +2962,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         let mut buffs = BTreeMap::new();
@@ -3029,6 +3061,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         let mut buffs = BTreeMap::new();
@@ -3053,6 +3086,7 @@ mod tests {
                 chance: "1".into(),
                 icd,
                 apply_buff: Some("window".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             },
@@ -3125,6 +3159,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         (
@@ -3171,6 +3206,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         (
@@ -3232,6 +3268,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         actions.insert(
@@ -3244,6 +3281,7 @@ mod tests {
                 gain: gain_map,
                 damage: None,
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         (
@@ -3302,6 +3340,7 @@ mod tests {
                     stats,
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         (
@@ -3405,6 +3444,7 @@ mod tests {
                 gain: BTreeMap::new(),
                 damage: None,
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         actions.insert(
@@ -3420,6 +3460,7 @@ mod tests {
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
+                effects: Vec::new(),
             },
         );
         let mut buffs = BTreeMap::new();
@@ -3449,6 +3490,7 @@ mod tests {
                 chance: pulse_chance.into(),
                 icd: pulse_icd,
                 apply_buff: Some("charge".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             },
@@ -3529,6 +3571,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -3626,6 +3669,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -3707,6 +3751,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             actions.insert(
@@ -3722,6 +3767,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -3751,6 +3797,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 10.0,
                     apply_buff: Some("power_up".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -3845,6 +3892,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -3912,6 +3960,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -4003,6 +4052,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             actions.insert(
@@ -4018,6 +4068,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut conditions = BTreeMap::new();
@@ -4044,6 +4095,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 10.0,
                     apply_buff: Some("enrage_window".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -4127,6 +4179,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -4193,6 +4246,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: vec!["window".into()],
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -4340,6 +4394,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -4456,6 +4511,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -4543,6 +4599,7 @@ mod tests {
                 chance: "0.3".into(),
                 icd: 0.0,
                 apply_buff: Some("proc_buff".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             });
@@ -4607,6 +4664,7 @@ mod tests {
                 chance: "0.3".into(),
                 icd: 4.0,
                 apply_buff: Some("proc_buff".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             });
@@ -4674,6 +4732,7 @@ mod tests {
                 chance: "0.3".into(),
                 icd: 5.0,
                 apply_buff: Some("proc_buff".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             });
@@ -4739,6 +4798,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -4763,6 +4823,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 0.0,
                     apply_buff: Some("proc_buff".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -4796,7 +4857,7 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // `ProcEffect::CastAction`: an `on_cast` proc (chance 1, icd 0) fires
+        // `CompiledEffect::CastAction`: an `on_cast` proc (chance 1, icd 0) fires
         // a free "nuke" cast (instant, no cost/cooldown) on every one of
         // "trigger"'s 5 casts (1s cast time, 5s scenario → completions at
         // t=1..5). `free_cast`'s documented scope: gains + damage only, no
@@ -4822,6 +4883,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             actions.insert(
@@ -4837,6 +4899,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut procs = BTreeMap::new();
@@ -4848,6 +4911,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 0.0,
                     apply_buff: None,
+                    effects: Vec::new(),
                     cast_action: Some("nuke".into()),
                     actions: None,
                 },
@@ -4911,6 +4975,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -4973,6 +5038,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {
@@ -5037,6 +5103,7 @@ mod tests {
                 chance: "0.3".into(),
                 icd: 0.0,
                 apply_buff: Some("proc_buff".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             });
@@ -5112,6 +5179,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             // Proc-cast only (never in the rotation), and deliberately inert:
@@ -5127,6 +5195,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -5151,6 +5220,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 0.0,
                     apply_buff: None,
+                    effects: Vec::new(),
                     cast_action: Some("ping".into()),
                     actions: None,
                 },
@@ -5164,6 +5234,7 @@ mod tests {
                     chance: "casts.ping".into(),
                     icd: 0.0,
                     apply_buff: Some("y".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -5251,6 +5322,7 @@ mod tests {
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -5289,6 +5361,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 100.0, // fires on the first hit only
                     apply_buff: Some("focus".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -5301,6 +5374,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 0.0,
                     apply_buff: Some("marker".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -5897,6 +5971,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -5921,6 +5996,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 100.0,
                     apply_buff: Some("boost".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -6267,6 +6343,7 @@ mod tests {
                         stats: nuke_stats,
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let rotation = Rotation {
@@ -6407,6 +6484,7 @@ mod tests {
                             stats,
                         }),
                         apply_buff: Vec::new(),
+                        effects: Vec::new(),
                     },
                 );
             }
@@ -6648,6 +6726,7 @@ mod tests {
                 chance: "0.3".into(),
                 icd: 4.0,
                 apply_buff: Some("proc_buff".into()),
+                effects: Vec::new(),
                 cast_action: None,
                 actions: None,
             });
@@ -6750,6 +6829,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut filler_stats = BTreeMap::new();
@@ -6767,6 +6847,7 @@ mod tests {
                         stats: filler_stats,
                     }),
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let mut buffs = BTreeMap::new();
@@ -6791,6 +6872,7 @@ mod tests {
                     chance: chance.into(),
                     icd: 0.0,
                     apply_buff: Some("poison".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -6855,6 +6937,7 @@ mod tests {
                     chance: "time >= 10".into(),
                     icd: 0.0,
                     apply_buff: Some("empower".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -7745,6 +7828,7 @@ mod tests {
                 gain: BTreeMap::new(),
                 damage: None,
                 apply_buff,
+                effects: Vec::new(),
             }
         }
 
@@ -7768,6 +7852,7 @@ mod tests {
                     stats,
                 }),
                 apply_buff,
+                effects: Vec::new(),
             }
         }
 
@@ -7964,6 +8049,7 @@ mod tests {
                     chance: "buff.window".into(),
                     icd: 0.0,
                     apply_buff: Some("mark".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: None,
                 },
@@ -8143,6 +8229,7 @@ mod tests {
                             chance: "1".into(),
                             icd: 0.0,
                             apply_buff: Some("ail".into()),
+                            effects: Vec::new(),
                             cast_action: None,
                             actions: None,
                         },
@@ -8452,6 +8539,7 @@ mod tests {
                         chance: "1".into(),
                         icd,
                         apply_buff: Some("ail".into()),
+                        effects: Vec::new(),
                         cast_action: None,
                         actions: None,
                     },
@@ -8531,6 +8619,7 @@ mod tests {
                         chance: chance.into(),
                         icd: 0.0,
                         apply_buff: Some("ail".into()),
+                        effects: Vec::new(),
                         cast_action: None,
                         actions: None,
                     },
@@ -8760,6 +8849,7 @@ mod tests {
                     chance: "1".into(),
                     icd: 1000.0,
                     apply_buff: None,
+                    effects: Vec::new(),
                     cast_action: Some("bonus".into()),
                     actions: None,
                 },
@@ -8831,6 +8921,7 @@ mod tests {
                     chance: chance.into(),
                     icd: 0.0,
                     apply_buff: Some("tag".into()),
+                    effects: Vec::new(),
                     cast_action: None,
                     actions: filter,
                 },
@@ -9045,6 +9136,253 @@ mod tests {
     }
 
     // ==================================================================
+    // P8b — the ORDERED effects list on procs: list order is execution
+    // order, sim state is sequential between entries, and repeats apply
+    // that many times. (The action-side list is the P7d `apply_buff`
+    // machinery under a new field name — its order/repeat/freeze pins in
+    // `mod action_scoped` all still run — so what needs NEW pins here is
+    // the PROC side, where a list, and a `cast_action` mid-list, are
+    // genuinely new.)
+    // ==================================================================
+    mod effects_list {
+        use super::*;
+        use crate::simdef::EffectDef;
+
+        /// `hit = dmg` and nothing else — DoT-free, crit-free; the pins
+        /// below are all uptime/stack shaped.
+        fn flat_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "pipeline": [ { "name": "hit", "expr": "dmg" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        fn flat_build() -> BuildState {
+            serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap()
+        }
+
+        fn dummy(seconds: u32) -> Scenario {
+            serde_json::from_str(&format!(
+                r#"{{ "phases": [ {{ "name": "p", "weight": {seconds} }} ] }}"#
+            ))
+            .unwrap()
+        }
+
+        /// A 1s-cast damaging `filler` (the rotation's only rule, so hit N
+        /// completes at t=N), a zero-damage utility `ping` that only the
+        /// proc can cast, and one proc slot firing ONCE at t=1 (`chance`
+        /// `"time == 1"`, on_cast — rolled at cast COMPLETE, so it sees
+        /// exactly one instant where `time == 1`) whose `effects` list the
+        /// test supplies. `timed`'s duration reads `casts.ping` LIVE at
+        /// application — the probe for whether a `cast_action` earlier in
+        /// the same list already landed.
+        fn one_shot_simdef(effects: Vec<EffectDef>) -> SimDef {
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "filler".to_string(),
+                ActionDef {
+                    extra: Default::default(),
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: Some(ActionDamage {
+                        extra: Default::default(),
+                        stats: BTreeMap::new(),
+                    }),
+                    apply_buff: Vec::new(),
+                    effects: Vec::new(),
+                },
+            );
+            actions.insert(
+                "ping".to_string(),
+                ActionDef {
+                    extra: Default::default(),
+                    cast_time: "1".into(),
+                    cooldown: NumOrExpr::Num(0.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: None,
+                    apply_buff: Vec::new(),
+                    effects: Vec::new(),
+                },
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "timed".to_string(),
+                BuffDef {
+                    extra: Default::default(),
+                    duration: NumOrExpr::Expr("1 + casts.ping".into()),
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: None,
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                },
+            );
+            let mut procs = BTreeMap::new();
+            procs.insert(
+                "echo".to_string(),
+                ProcDef {
+                    extra: Default::default(),
+                    trigger: Trigger::OnCast,
+                    chance: "time == 1".into(),
+                    icd: 0.0,
+                    apply_buff: None,
+                    effects,
+                    cast_action: None,
+                    actions: None,
+                },
+            );
+            SimDef {
+                extra: Default::default(),
+                resources: BTreeMap::new(),
+                actions,
+                buffs,
+                procs,
+                damage_objective: "hit".into(),
+            }
+        }
+
+        fn run_ev(simdef: &SimDef) -> SimReport {
+            let plan = flat_plan();
+            let rotation = Rotation {
+                extra: Default::default(),
+                rules: vec![Rule {
+                    extra: Default::default(),
+                    action: "filler".into(),
+                    when: None,
+                }],
+            };
+            let sim_plan = sim_compile(&plan, simdef, &rotation).unwrap();
+            run(&plan, &sim_plan, &flat_build(), &dummy(10), Mode::Expected).unwrap()
+        }
+
+        // --------------------------------------------------------------
+        // THE ORDER PIN. One proc fire at t=1, effects
+        // `[cast_action ping, apply_buff timed]`, `timed.duration =
+        // "1 + casts.ping"`, 10s fight. Hand-worked:
+        //
+        //   cast-first:  free-cast `ping` lands FIRST → casts.ping = 1
+        //                → `timed` applies with duration 1 + 1 = 2
+        //                → window [1,3) → uptime 2/10 = 0.2
+        //   reversed:    `timed` applies FIRST, casts.ping still 0
+        //                → duration 1 + 0 = 1 → window [1,2)
+        //                → uptime 1/10 = 0.1
+        //
+        // The REORDER IS THE MUTATION: reversing the executor's effect
+        // loop turns 0.2 into 0.1 and vice versa — nothing else in the
+        // report moves (`ping` casts once either way).
+        // --------------------------------------------------------------
+        #[test]
+        fn proc_effects_execute_in_list_order_and_a_later_entry_sees_an_earlier_cast() {
+            let cast_first = run_ev(&one_shot_simdef(vec![
+                EffectDef::CastAction("ping".into()),
+                EffectDef::ApplyBuff("timed".into()),
+            ]));
+            assert_eq!(cast_first.proc_counts["echo"], 1, "one fire, at t=1");
+            assert_eq!(cast_first.actions["ping"].casts, 1);
+            assert!(
+                close(cast_first.buffs["timed"].uptime, 0.2),
+                "cast-first: got {} — want 0.2 (duration 1 + casts.ping = 2 \
+                 over 10s; 0.1 would mean the apply ran before the free cast)",
+                cast_first.buffs["timed"].uptime
+            );
+
+            let buff_first = run_ev(&one_shot_simdef(vec![
+                EffectDef::ApplyBuff("timed".into()),
+                EffectDef::CastAction("ping".into()),
+            ]));
+            assert_eq!(buff_first.proc_counts["echo"], 1);
+            assert_eq!(buff_first.actions["ping"].casts, 1);
+            assert!(
+                close(buff_first.buffs["timed"].uptime, 0.1),
+                "buff-first: got {} — want 0.1 (casts.ping is still 0 when \
+                 `timed` applies; 0.2 would mean the list order was ignored)",
+                buff_first.buffs["timed"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Two DISTINCT `apply_buff` entries: both land, from the one
+        // fire. `timed` (duration "1 + casts.ping" = 1, no ping in this
+        // list) → [1,2) → 0.1; `steady` (duration 3) → [1,4) → 0.3.
+        // --------------------------------------------------------------
+        #[test]
+        fn two_distinct_apply_buff_entries_both_apply() {
+            let mut simdef = one_shot_simdef(vec![
+                EffectDef::ApplyBuff("timed".into()),
+                EffectDef::ApplyBuff("steady".into()),
+            ]);
+            simdef.buffs.insert(
+                "steady".to_string(),
+                BuffDef {
+                    extra: Default::default(),
+                    duration: NumOrExpr::Num(3.0),
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: None,
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                },
+            );
+            let report = run_ev(&simdef);
+            assert!(
+                close(report.buffs["timed"].uptime, 0.1),
+                "timed: got {}",
+                report.buffs["timed"].uptime
+            );
+            assert!(
+                close(report.buffs["steady"].uptime, 0.3),
+                "steady: got {} — 0.0 would mean only the first entry ran",
+                report.buffs["steady"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // A REPEATED entry applies twice (the P7d list precedent, now on
+        // the proc side). `stack` is add_independent/unbounded, duration
+        // 2: one fire at t=1 applying it twice → 2 instances over [1,3) →
+        // uptime 2/10 = 0.2, avg_stacks 2 × 2 / 10 = 0.4. DEDUP is the
+        // mutation: one instance → avg_stacks 0.2.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_repeated_apply_buff_entry_applies_twice() {
+            let mut simdef = one_shot_simdef(vec![
+                EffectDef::ApplyBuff("stack".into()),
+                EffectDef::ApplyBuff("stack".into()),
+            ]);
+            simdef.buffs.insert(
+                "stack".to_string(),
+                BuffDef {
+                    extra: Default::default(),
+                    duration: NumOrExpr::Num(2.0),
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: None,
+                    max_stacks: 0,
+                    on_reapply: ReapplyPolicy::AddIndependent,
+                },
+            );
+            let report = run_ev(&simdef);
+            assert!(
+                close(report.buffs["stack"].uptime, 0.2),
+                "stack uptime: got {}",
+                report.buffs["stack"].uptime
+            );
+            assert!(
+                close(report.buffs["stack"].avg_stacks, 0.4),
+                "stack avg_stacks: got {} — want 2 instances × 2s / 10 = 0.4 \
+                 (0.2 would mean the repeated entry was deduped)",
+                report.buffs["stack"].avg_stacks
+            );
+        }
+    }
+
+    // ==================================================================
     // P8a follow-up — the ZERO-EVALUATION hole (spec-review probe): a
     // utility-only rotation completes without a single `Plan`
     // evaluation, so the per-evaluation validation in
@@ -9075,6 +9413,7 @@ mod tests {
                     gain: BTreeMap::new(),
                     damage: None,
                     apply_buff: Vec::new(),
+                    effects: Vec::new(),
                 },
             );
             let simdef = SimDef {

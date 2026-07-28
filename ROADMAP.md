@@ -156,15 +156,24 @@ NOT decided in 0.3.0. Three groups:
   `SimScratch`, the `ProcDef` effect arity, the untested
   `refresh`+live-DoT path, `expr::MAX_STACK`).
 
-- [ ] Harmonize `apply_buff`'s ARITY between `ActionDef` (a
-      `Vec<String>` list) and `ProcDef` (a single `Option<String>`) —
-      0.4.0, alongside the `deny_unknown_fields` sweep below, since both
-      are config-compatibility changes. Same key, same concept, different
-      shape: a config author who learns the list form on an action gets a
-      serde type error writing it on a proc, and vice versa. Fixing it
-      means accepting BOTH spellings in BOTH places via an untagged
-      string-or-list, which is additive for JSON but changes the Rust
-      field types.
+- [x] ~~Harmonize `apply_buff`'s ARITY between `ActionDef` (a
+      `Vec<String>` list) and `ProcDef` (a single `Option<String>`)~~ —
+      **landed in P8b** (Unreleased), by a different shape than the
+      untagged string-or-list this entry guessed at: the ordered
+      `effects` list (`"effects": [ { "apply_buff": … }, … ]`) is one
+      list form on BOTH entities, and the old fields stay as 0.x sugar
+      that desugars into it at `sim::compile` (mixing sugar with an
+      explicit list on one entity is an "ambiguous order" compile
+      error). See the CHANGELOG's Unreleased entry.
+- [ ] `cast_action` effects on ACTIONS (combo chains) — deferred, and the
+      `sim::compile` error for one points at this entry. A proc-fired
+      free cast cannot recurse because a free cast rolls no procs; an
+      ACTION free-casting an action has no such natural bound (A→B→A),
+      so allowing it means choosing a bounded-recursion design — depth
+      cap, visited-set, or an explicit chain type — and that choice
+      should be driven by a real combo config (PoE2 trigger chains are
+      the likely candidate), not guessed at. Until then `cast_action`
+      stays proc-only, enforced fail-closed on `ActionDef::effects`.
 - [ ] `ProcDef::actions` expressiveness (P7d review) — 0.4.0 candidate,
       and only if a real config asks. Today the filter is an inclusive
       list of CASTING actions: no negation, no "every action except"
@@ -307,10 +316,14 @@ NOT decided in 0.3.0. Three groups:
       `Plan::scratch` / `Plan::evaluate` shape, which is the point of
       having the type at all) or remove it. Removing is breaking, so
       0.4.0 either way.
-- [ ] A `ProcDef` can do exactly ONE of `apply_buff` / `cast_action`, and
-      the limitation is enforced but not stated on the type (0.3.0 release
-      review). Either document it as permanent or allow both; a proc that
-      applies a buff AND free-casts is a plausible ARPG mechanic.
+- [x] ~~A `ProcDef` can do exactly ONE of `apply_buff` / `cast_action`,
+      and the limitation is enforced but not stated on the type (0.3.0
+      release review)~~ — **landed in P8b** (Unreleased): "allow both"
+      won, as the ordered `ProcDef::effects` list — a proc that applies a
+      buff AND free-casts is now one list with two entries, order
+      explicit and pinned (the 0.2/0.1 order contrast). The exactly-one
+      check generalized to "a proc must do something" (empty after
+      desugar is the error; both SUGAR fields at once is still refused).
 - [ ] Coverage gaps recorded rather than closed in 0.3.0 (release
       review): `refresh` with a LIVE `tick_objective` — the 0.2.0 default
       DoT shape — has no behavioral test, no live tick objective runs

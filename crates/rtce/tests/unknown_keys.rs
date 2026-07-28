@@ -52,8 +52,9 @@ const EMPTY_ROTATION: &str = r#"{ "rules": [] }"#;
 /// The number of config structs in the P8a fail-closed sweep. A task
 /// adding a config struct (e.g. P8c's `defaults` block) bumps this AND
 /// adds the struct's row below — the `cases.len()` assertion at the end
-/// of the table is what keeps the two honest.
-const CONFIG_STRUCT_COUNT: usize = 16;
+/// of the table is what keeps the two honest. (17th: P8b's `EffectDef`,
+/// a parse-time rejection site like the hand-written mirrors.)
+const CONFIG_STRUCT_COUNT: usize = 17;
 
 #[test]
 fn every_config_struct_rejects_a_typoed_key_with_its_context_named() {
@@ -187,6 +188,16 @@ fn every_config_struct_rejects_a_typoed_key_with_its_context_named() {
             ),
             "chanse",
             "proc `lucky`",
+        ),
+        (
+            "EffectDef",
+            parse_err::<SimDef>(
+                r#"{ "procs": { "lucky": { "trigger": "on_cast", "chance": "1",
+                                           "effects": [ { "apply_buf": "x" } ] } },
+                     "damage_objective": "hit" }"#,
+            ),
+            "apply_buf",
+            "an effect entry",
         ),
         (
             "Rotation",

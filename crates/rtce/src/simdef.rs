@@ -254,6 +254,15 @@ pub struct ActionDef {
     /// Empty (the default) means this action applies nothing, which is
     /// every rtce 0.2.0 config.
     ///
+    /// DEPRECATED (kept for 0.x; prefer [`ActionDef::effects`]): sugar
+    /// for an `effects` list of `{ "apply_buff": … }` entries, one per
+    /// name, in this list's order — the desugared form compiles
+    /// byte-for-byte identically, and EVERYTHING documented below (the
+    /// instant, list order, repeats, the three axes) applies to the list
+    /// form unchanged. Setting this alongside an explicit `effects` list
+    /// is a compile error (ambiguous order); migrate the sugar into the
+    /// list.
+    ///
     /// This is the first-class replacement for the "icd equals the gating
     /// action's cooldown" trick a 0.2.0 config needed in order to coerce
     /// per-action buff application out of a globally-triggered
@@ -332,13 +341,32 @@ pub struct ActionDef {
     /// single `Option<String>` rather than a list. Same key, same
     /// concept, different shape: writing `"apply_buff": ["x"]` on a proc
     /// is a serde type error, and `"apply_buff": "x"` on an action is
-    /// too. Harmonizing them means accepting both spellings in both
-    /// places, which is a config-compatibility change; it is tracked in
-    /// ROADMAP for 0.4.0 rather than smuggled in here.
+    /// too. The harmonization the 0.3.0 docs deferred to ROADMAP is
+    /// [`ActionDef::effects`]/[`ProcDef::effects`]: one list shape on
+    /// both entities.
     ///
     /// Fail-closed at `sim::compile`: a name that is not a defined buff.
     #[serde(default)]
     pub apply_buff: Vec<String>,
+    /// Ordered list of effects this action executes when its cast
+    /// COMPLETES — the first-class spelling of [`ActionDef::apply_buff`],
+    /// entry for entry: an `{ "apply_buff": … }` entry lands at exactly
+    /// the instant, in exactly the order, and under exactly the frozen
+    /// build that field's docs describe (list order, repeats apply
+    /// twice, the three-axes rule — all of it carries over unchanged).
+    ///
+    /// Default: empty (this action applies nothing — every rtce 0.2.0
+    /// config). Setting it alongside the [`ActionDef::apply_buff`] sugar
+    /// is an "ambiguous order" compile error: migrate the sugar into the
+    /// list.
+    ///
+    /// A `{ "cast_action": … }` entry is NOT allowed here — proc-only.
+    /// An action free-casting an action reopens the recursion the
+    /// free-cast guard closed (A→B→A), and a bounded-depth chain design
+    /// should be chosen by a config that needs one (see `ROADMAP.md`);
+    /// `sim::compile` rejects it with exactly that explanation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<EffectDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this action.
@@ -357,6 +385,7 @@ impl ActionDef {
         "gain",
         "damage",
         "apply_buff",
+        "effects",
     ];
 }
 
@@ -836,8 +865,86 @@ pub enum Trigger {
     OnCrit,
 }
 
-/// One proc: a chance-triggered effect (apply a buff, or cast a free
-/// action) rolled on a trigger event, subject to an internal cooldown.
+/// One effect of an action completing or a proc firing. Externally tagged:
+/// `{ "apply_buff": "shock" }` / `{ "cast_action": "comet" }`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectDef {
+    /// One application of the named buff (through its `on_reapply` policy).
+    ApplyBuff(String),
+    /// Free-cast the named action (gains + damage + its OWN ApplyBuff
+    /// effects; no cost, no cooldown, no proc rolls — the P7d free-cast
+    /// rules).
+    CastAction(String),
+}
+
+/// Hand-written (P8a discipline, anticipated by the P8 spec): the derived
+/// externally-tagged deserializer already rejected an unknown tag, but in
+/// serde's own vocabulary ("unknown variant `apply_buf`…") — without the
+/// crate's did-you-mean, and rejecting `_`-prefixed ANNOTATION keys that
+/// every other nesting level accepts. This visitor speaks the crate's
+/// shared `config_keys` wording instead ("unknown field `apply_buf` on
+/// an effect entry — did you mean `apply_buff`?"), skips `_` keys, and
+/// insists on exactly ONE effect key per entry — an entry IS one effect,
+/// so `{}` and `{ "apply_buff": …, "cast_action": … }` are both spelled
+/// out rather than half-read. Accepted inputs are otherwise exactly the
+/// derive's; serialization is unchanged (the derive above).
+impl<'de> Deserialize<'de> for EffectDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        /// The two effect keys, in declaration order — the `known` list
+        /// for the did-you-mean.
+        const KNOWN: &[&str] = &["apply_buff", "cast_action"];
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = EffectDef;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an effect entry: `{ \"apply_buff\": … }` or `{ \"cast_action\": … }`")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<EffectDef, A::Error> {
+                use serde::de::Error as _;
+                let mut effect: Option<EffectDef> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    let parsed = match key.as_str() {
+                        "apply_buff" => EffectDef::ApplyBuff(map.next_value()?),
+                        "cast_action" => EffectDef::CastAction(map.next_value()?),
+                        _ if key.starts_with('_') => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                        _ => {
+                            return Err(A::Error::custom(crate::config_keys::unknown_key_message(
+                                &key,
+                                "an effect entry",
+                                KNOWN,
+                            )));
+                        }
+                    };
+                    if effect.is_some() {
+                        return Err(A::Error::custom(
+                            "an effect entry takes exactly one of `apply_buff` or \
+                             `cast_action`, got more than one",
+                        ));
+                    }
+                    effect = Some(parsed);
+                }
+                effect.ok_or_else(|| {
+                    A::Error::custom(
+                        "an effect entry needs exactly one of `apply_buff` or `cast_action`",
+                    )
+                })
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+/// One proc: a chance-triggered, ICD-gated ordered list of effects
+/// ([`ProcDef::effects`] — apply buffs, cast free actions) rolled on a
+/// trigger event. The 0.x sugar fields [`ProcDef::apply_buff`] /
+/// [`ProcDef::cast_action`] each spell a one-entry list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcDef {
     /// Which event this proc rolls its chance against.
@@ -854,20 +961,31 @@ pub struct ProcDef {
     /// would DELETE the internal cooldown instead of tightening it.
     #[serde(default)]
     pub icd: f64,
-    /// Buff to apply when this proc fires. Exactly one of `apply_buff` /
-    /// `cast_action` must be set — zero or both is a compile error.
+    /// Buff to apply when this proc fires.
     ///
-    /// NB a proc applies AT MOST ONE buff, where
-    /// [`ActionDef::apply_buff`] takes a LIST. Same key, same concept,
-    /// different arity — so `["x"]` here is a serde type error, and a
-    /// bare `"x"` on an action is too. Harmonizing the two is a
-    /// config-compatibility change (it needs an untagged accept-both) and
-    /// is tracked in ROADMAP for 0.4.0.
+    /// DEPRECATED (kept for 0.x; prefer [`ProcDef::effects`]): sugar for
+    /// a one-entry `effects` list — `"apply_buff": "x"` desugars at
+    /// `sim::compile` into `"effects": [ { "apply_buff": "x" } ]`,
+    /// byte-for-byte the same compiled form. Setting it alongside an
+    /// explicit `effects` list is a compile error (ambiguous order), and
+    /// setting BOTH sugar fields at once stays the error it always was.
+    /// A proc must end up with at least one effect after desugar.
+    ///
+    /// NB the sugar applies AT MOST ONE buff, where
+    /// [`ActionDef::apply_buff`] takes a LIST — so `["x"]` here is a
+    /// serde type error, and a bare `"x"` on an action is too. The
+    /// harmonization the 0.3.0 docs deferred to ROADMAP is `effects`
+    /// itself: one list shape, both entities, any number of entries.
     #[serde(default)]
     pub apply_buff: Option<String>,
     /// Action to cast for free (does not consume the rotation's decision
-    /// slot) when this proc fires. Exactly one of `apply_buff` /
-    /// `cast_action` must be set — zero or both is a compile error.
+    /// slot) when this proc fires.
+    ///
+    /// DEPRECATED (kept for 0.x; prefer [`ProcDef::effects`]): sugar for
+    /// a one-entry `effects` list, under exactly the rules on
+    /// [`ProcDef::apply_buff`]. Unlike the buff effect, `cast_action` is
+    /// PROC-only in the list form too — see [`ActionDef::effects`] for
+    /// why an action cannot free-cast an action.
     #[serde(default)]
     pub cast_action: Option<String>,
     /// Trigger filter: this proc's [`ProcDef::trigger`] only considers
@@ -905,6 +1023,23 @@ pub struct ProcDef {
     /// (omit the key) for "every action".
     #[serde(default)]
     pub actions: Option<Vec<String>>,
+    /// Ordered list of effects this proc executes when it FIRES — the
+    /// first-class spelling of what [`ProcDef::apply_buff`] /
+    /// [`ProcDef::cast_action`] each express one entry of. Executed in
+    /// LIST order at the firing instant; a repeated entry applies that
+    /// many times (the [`ActionDef::apply_buff`] list precedent). Between
+    /// entries the sim-state tail is SEQUENTIAL (P7b): an `apply_buff`
+    /// refolds the effective state, a `cast_action` free cast bumps
+    /// `casts.<name>` and lands its gains/damage/own-ApplyBuff — so a
+    /// later entry's `duration` expression sees all of it.
+    ///
+    /// Default: empty — but a proc must DO something, so a proc whose
+    /// list is empty after the sugar fields desugar is a fail-closed
+    /// `sim::compile` error. Setting this alongside either sugar field is
+    /// an "ambiguous order" compile error: migrate the sugar into the
+    /// list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<EffectDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this proc.
@@ -923,6 +1058,7 @@ impl ProcDef {
         "apply_buff",
         "cast_action",
         "actions",
+        "effects",
     ];
 }
 
@@ -1372,6 +1508,11 @@ mod tests {
              `Default` — a new ActionDef field belongs in BOTH"
         );
         assert_eq!(
+            bare.effects, derived.effects,
+            "a config that names no `effects` means the empty list (P8b) \
+             in both spellings of the default"
+        );
+        assert_eq!(
             bare.extra, derived.extra,
             "a config that says nothing collects nothing (P8a) — both \
              spellings of the default must be the empty map"
@@ -1386,6 +1527,163 @@ mod tests {
         .unwrap();
         assert_eq!(def.actions["a"].cooldown, NumOrExpr::Num(0.0));
         assert!(def.actions["a"].cost.is_empty());
+    }
+
+    // ==================================================================
+    // P8b — the effects list at the parse layer. The JSON shape is the
+    // design spec's, verbatim: externally tagged entries, list order
+    // preserved, a repeated entry kept (repeats apply twice — the
+    // executor half is pinned in `sim::exec`'s `effects_list` module).
+    // ==================================================================
+    #[test]
+    fn effects_lists_parse_and_round_trip_the_spec_json() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "actions": {
+                "frost_nova": { "cast_time": "0",
+                                "effects": [ { "apply_buff": "vuln_window" } ] },
+                "comet":      { "cast_time": "1" }
+              },
+              "buffs": { "vuln_window": { "duration": 4.0 },
+                         "shock":       { "duration": 2.0 } },
+              "procs": {
+                "trigger_gem": { "trigger": "on_cast", "chance": "1", "icd": 3.0,
+                                 "effects": [ { "apply_buff": "shock" },
+                                              { "cast_action": "comet" },
+                                              { "apply_buff": "shock" } ] }
+              },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            def.procs["trigger_gem"].effects,
+            vec![
+                EffectDef::ApplyBuff("shock".into()),
+                EffectDef::CastAction("comet".into()),
+                EffectDef::ApplyBuff("shock".into()),
+            ],
+            "list order and the repeat are the config's own — preserved verbatim"
+        );
+        assert_eq!(
+            def.actions["frost_nova"].effects,
+            vec![EffectDef::ApplyBuff("vuln_window".into())]
+        );
+        assert!(def.actions["comet"].effects.is_empty());
+        assert_eq!(def.procs["trigger_gem"].apply_buff, None);
+        assert_eq!(def.procs["trigger_gem"].cast_action, None);
+
+        // Round-trip: the externally-tagged shape serializes back as the
+        // same single-key objects, and reparses to the same lists.
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            json.contains(r#"{"apply_buff":"shock"}"#),
+            "externally tagged, snake_case: {json}"
+        );
+        assert!(
+            json.contains(r#"{"cast_action":"comet"}"#),
+            "externally tagged, snake_case: {json}"
+        );
+        let round: SimDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round.procs["trigger_gem"].effects,
+            def.procs["trigger_gem"].effects
+        );
+        assert_eq!(
+            round.actions["frost_nova"].effects,
+            def.actions["frost_nova"].effects
+        );
+        // An EMPTY list does not serialize at all (skip-serializing-if),
+        // so round-tripping a pre-P8b config never grows an `effects` key.
+        assert!(
+            !json.contains(r#""comet":{"cast_time":"1","effects""#),
+            "an empty effects list must not appear in the output: {json}"
+        );
+        let sugar: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
+        assert!(
+            !serde_json::to_string(&sugar).unwrap().contains("effects"),
+            "a config that never wrote `effects` round-trips without it"
+        );
+    }
+
+    // Fail-closed INSIDE an effect entry (P8a discipline): a typo'd key
+    // must not be serde's unhelpful default. Before the hand-written
+    // visitor, serde's derived externally-tagged enum said "unknown
+    // variant `apply_buf`, expected `apply_buff` or `cast_action`" —
+    // serviceable, but off-vocabulary ("variant") and without the shared
+    // did-you-mean; this pins the P8a wording instead.
+    #[test]
+    fn a_typoed_key_inside_an_effect_entry_is_rejected_with_a_did_you_mean() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{
+              "procs": { "lucky": { "trigger": "on_cast", "chance": "1",
+                                    "effects": [ { "apply_buf": "x" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("unknown field `apply_buf`"),
+            "got: {e}"
+        );
+        assert!(e.to_string().contains("an effect entry"), "got: {e}");
+        assert!(
+            e.to_string().contains("did you mean `apply_buff`"),
+            "got: {e}"
+        );
+    }
+
+    // …and the `_` annotation namespace stays open inside an effect
+    // entry, like at every other nesting level (P8a).
+    #[test]
+    fn an_underscore_key_inside_an_effect_entry_is_accepted() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "procs": { "lucky": { "trigger": "on_cast", "chance": "1",
+                                    "effects": [ { "apply_buff": "x",
+                                                   "_src": "aspect" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            def.procs["lucky"].effects,
+            vec![EffectDef::ApplyBuff("x".into())]
+        );
+    }
+
+    // An effect entry is exactly one effect: an empty object (or one
+    // holding only annotations) and a two-effect object are both rejected
+    // with the expectation spelled out.
+    #[test]
+    fn an_effect_entry_takes_exactly_one_effect_key() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{
+              "procs": { "lucky": { "trigger": "on_cast", "chance": "1",
+                                    "effects": [ { "_note": "oops" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("an effect entry needs exactly one of `apply_buff` or `cast_action`"),
+            "got: {e}"
+        );
+        let e = serde_json::from_str::<SimDef>(
+            r#"{
+              "procs": { "lucky": { "trigger": "on_cast", "chance": "1",
+                                    "effects": [ { "apply_buff": "x",
+                                                   "cast_action": "y" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("an effect entry takes exactly one of `apply_buff` or `cast_action`, got more than one"),
+            "got: {e}"
+        );
     }
 
     #[test]
