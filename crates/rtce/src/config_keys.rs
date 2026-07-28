@@ -26,8 +26,9 @@
 //!   accepted and DROPPED on parse — the same fate they had under the
 //!   0.3.0 derived `Deserialize`, so nothing regresses.
 //!
-//! A new config struct (e.g. P8c's `defaults` block) should take the
-//! FIRST shape unless a consumer already constructs it in Rust.
+//! A new config struct should take the FIRST shape unless a consumer
+//! already constructs it in Rust — as P8c's `defaults` block
+//! ([`crate::simdef::SimDefaults`]) did.
 //!
 //! # Staleness
 //!

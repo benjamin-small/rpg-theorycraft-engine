@@ -7,7 +7,7 @@
 use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
-use crate::simdef::{EffectDef, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
+use crate::simdef::{EffectDef, Measure, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
 /// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
@@ -139,6 +139,12 @@ pub struct CompiledAction {
     /// [`CompiledEffect::ApplyBuff`] can appear — [`compile`] rejects a
     /// `cast_action` effect on an action (recursion; see that error).
     pub effects: Vec<CompiledEffect>,
+    /// The RESOLVED measurement instant for this action's casts (P8c):
+    /// [`crate::simdef::ActionDef::measure`] where the config named one,
+    /// else [`crate::simdef::SimDefaults::measure`] — the executor never
+    /// consults the `defaults` block again. See [`Measure`] for what the
+    /// instant governs and its interactions.
+    pub measure: Measure,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -422,6 +428,11 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
     // was the standing example). Each entity's registry name is the error
     // context; `_`-prefixed keys are the annotation namespace and pass.
     crate::config_keys::reject_unknown("the simdef", SimDef::KNOWN_KEYS, &simdef.extra)?;
+    crate::config_keys::reject_unknown(
+        "the defaults block",
+        crate::simdef::SimDefaults::KNOWN_KEYS,
+        &simdef.defaults.extra,
+    )?;
     for (name, r) in &simdef.resources {
         crate::config_keys::reject_unknown(
             &format!("resource `{name}`"),
@@ -829,6 +840,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             gain,
             damage,
             effects,
+            measure: a.measure.unwrap_or(simdef.defaults.measure),
         });
     }
 
@@ -984,6 +996,7 @@ mod tests {
             "fireball".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1.0 / base_aps".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost,
@@ -1000,6 +1013,7 @@ mod tests {
             "frost_nova".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
@@ -1072,6 +1086,7 @@ mod tests {
 
         SimDef {
             extra: Default::default(),
+            defaults: Default::default(),
             resources,
             actions,
             buffs,
@@ -1865,6 +1880,7 @@ mod tests {
             "basic_bolt".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),

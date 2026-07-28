@@ -446,6 +446,80 @@ fn main() {
     );
     println!("  footgun pins hold: 2175 → 1837.5 bolt damage at IDENTICAL 0.95 uptime ✓");
 
+    // ══════ Contrast: the config that FIXES the cast-grid footgun ══════
+    //
+    // P8c's measurement knob. Keep `shock` at the on-grid 2.0 and add
+    //
+    //     "defaults": { "measure": "cast_start" }
+    //
+    // — every cast is now measured at the instant it BEGINS, and the
+    // grid collision dissolves: the expiry-vs-completion race happens at
+    // completions, but nothing is measured there anymore.
+    //
+    //   bolt N casts at t = 2(N−1). The previous bolt's completion at
+    //   t = 2N−3 applied shock for [2N−3, 2N−1) — so every bolt from the
+    //   SECOND on starts strictly inside the previous completion's
+    //   window and measures shocked (power_surge is live from t=1 on and
+    //   never lapses, so it is surged too):
+    //     bolt t=0            unbuffed  →       150
+    //     bolt t=2,4,…,18     shocked + surged (9 casts) → 9 × 225 = 2025
+    //     bolt total                                     =      2175
+    //
+    //   Restored to the off-grid number — same 10 casts, same 0.95
+    //   uptimes. slam starts at odd t ≥ 1, always inside both windows
+    //   (10 × 337.5 = 3375). comet is a proc-triggered FREE cast and is
+    //   deliberately NOT governed by the knob: it begins and completes
+    //   at the firing proc's instant and measures the live world there
+    //   (720 + 4 × 900 = 4320, unchanged). Total 9870 — the 2.5s run's
+    //   number, recovered by config instead of by nudging the duration.
+    let fixed_json = simdef_json.replace(r#""duration": 2.5"#, r#""duration": 2.0"#);
+    let fixed_json = fixed_json.replacen(
+        r#"{
+      "actions""#,
+        r#"{
+      "defaults": { "measure": "cast_start" },
+      "actions""#,
+        1,
+    );
+    let fixed: SimDef = serde_json::from_str(&fixed_json).expect("valid simdef");
+    assert!(
+        matches!(fixed.buffs["shock"].duration, NumOrExpr::Num(d) if d == 2.0),
+        "the fix run must keep shock ON the cast grid"
+    );
+    let fixed_plan = sim_compile(&plan, &fixed, &rotation).expect("simdef compiles");
+    let unfooted = run(&plan, &fixed_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
+
+    println!(
+        "\n  with `shock` at 2.0 AND `defaults.measure: \"cast_start\"`: bolt {:.4}, \
+         total {:.4} — the 2.5 run's numbers, restored by config",
+        unfooted.actions["bolt"].damage, unfooted.total.total_damage
+    );
+    assert_eq!(unfooted.actions["bolt"].casts, 10);
+    assert!(
+        close(unfooted.actions["bolt"].damage, 2175.0),
+        "bolt under cast_start on the grid: got {} — want 150 + 9×225, \
+         every bolt after the first measured inside the previous \
+         completion's shock window",
+        unfooted.actions["bolt"].damage
+    );
+    assert!(
+        close(unfooted.actions["comet"].damage, 4320.0),
+        "comet must be untouched — a free cast measures live at its own \
+         instant, outside this knob: got {}",
+        unfooted.actions["comet"].damage
+    );
+    assert!(
+        close(unfooted.total.total_damage, 9870.0),
+        "got {}",
+        unfooted.total.total_damage
+    );
+    assert!(
+        close(unfooted.buffs["shock"].uptime, 0.95),
+        "uptime stays 0.95 in every one of these runs: got {}",
+        unfooted.buffs["shock"].uptime
+    );
+    println!("  measurement pins hold: 1837.5 → 2175 bolt damage, by `defaults.measure` ✓");
+
     // ── Monte Carlo ───────────────────────────────────────────────────
     //
     // Nothing here samples either: no `events` block in the gamedef, and a

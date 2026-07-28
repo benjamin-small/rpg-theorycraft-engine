@@ -263,24 +263,19 @@ NOT decided in 0.3.0. Three groups:
       which is a `GameDef`-level addition (new `FoldKind`, or a per-
       contribution flag) rather than a `SimDef` one — so the shape should
       be chosen by a config that actually needs `×1.331`, not guessed at.
-- [ ] **Should a same-list `apply_buff` capture freeze the PHASE too?**
-      (0.3.0 release review) — OPEN, deliberately not decided in 0.3.0.
-      `Sim::apply_action_buffs` freezes the BUILD before the list runs,
-      but `Sim::apply_buff` refolds per entry and
-      `Sim::refresh_effective_state` rebuilds `effective_phase` from
-      `Sim::condition_value` each time — so a snapshot capture reads a
-      frozen build against a LIVE phase. A list of `["mark", "poison"]`
-      where `mark` drives both a bucket contribution and a condition gives
-      the poison the condition and not the contribution, and reordering
-      the two doubles the DoT at an identical reported `uptime` and
-      `avg_stacks` (pinned:
-      `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
-      400 vs 800). Arguably wrong — one application instant should
-      plausibly present one world. NOT changed in 0.3.0: it is
-      long-standing behavior, it would move numbers for any config with a
-      condition-reading snapshot DoT, and the property the freeze was
-      built for (the damaging and utility paths agreeing) holds in both
-      orderings either way.
+- [x] ~~**Should a same-list `apply_buff` capture freeze the PHASE
+      too?**~~ — **answered YES in P8c** (Unreleased): a cast's
+      `ApplyBuff` captures read the cast's ONE world snapshot — build
+      AND phase, captured together at the action's resolved `measure`
+      instant — so both orderings of `["mark", "poison"]` now capture
+      the pre-list world. The 400-vs-800 pin became an
+      equality-plus-literal pin,
+      `a_same_list_snapshot_capture_reads_one_frozen_world` (both 400,
+      the old poison-first value). This is the P8 phase's single
+      deliberate behavior change; sim-FIELD expressions (`duration` et
+      al.) keep their live sequential reads, and the proc path keeps its
+      live ambient capture. See the CHANGELOG migration note for exactly
+      which configs move.
 - [ ] **Should `Trigger::OnHit` scale with `hits_per_use`?** (0.3.0
       release review) — OPEN. Today it rolls once per damaging CAST, so a
       5-hit skill offers one roll, and a lucky-hit-style ARPG proc has to

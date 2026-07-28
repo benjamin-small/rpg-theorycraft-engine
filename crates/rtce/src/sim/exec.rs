@@ -56,7 +56,7 @@
 //! | `ActionDef::cooldown` | at cast start, before the cost is deducted | [`Sim::begin_cast`] |
 //! | `ActionDef::cost` values | at cast start — and at every decision that CHECKS affordability | [`Sim::begin_cast`], [`Sim::afford`] |
 //! | `ActionDef::gain` values | at cast complete | [`Sim::apply_gain`] |
-//! | `ActionDamage::stats` values | at cast complete, ONCE per cast | [`Sim::overlay_build_for_action`] |
+//! | `ActionDamage::stats` values | at the action's MEASURED instant (cast complete by default; cast start under `measure: "cast_start"` — P8c), ONCE per cast | [`Sim::capture_world`] |
 //!
 //! Two consequences worth stating outright:
 //!
@@ -146,10 +146,10 @@
 //! "cast-complete order" section — with the diagram, which belongs in
 //! PUBLIC docs since `mod exec` is private and never renders.
 //! [`Sim::complete_cast`] and [`Sim::free_cast`] are its two
-//! implementations, and [`Sim::apply_action_buffs`] documents the frozen
-//! build its snapshot half rests on. Deliberately not restated here: six
-//! near-copies of this paragraph is how its wording drifted the first
-//! time.
+//! implementations, and [`Sim::apply_action_buffs`] documents the one
+//! measured world ([`WorldSnapshot`], P8c) its snapshot half reads.
+//! Deliberately not restated here: six near-copies of this paragraph is
+//! how its wording drifted the first time.
 //!
 //! # Event queue and the spec's named event kinds
 //!
@@ -242,7 +242,7 @@ use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
 use crate::rng::{mix_seed, Pcg32};
 use crate::scenario::{Phase, Scenario};
-use crate::simdef::{ReapplyPolicy, Trigger};
+use crate::simdef::{Measure, ReapplyPolicy, Trigger};
 
 /// Execution fidelity for [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,19 +779,33 @@ struct ProcRt {
     fire_count: u64,
 }
 
-/// Everything about ONE cast, measured together at its completion instant
-/// (see [`Sim::measure_cast`]) so every `Plan` query for that cast reads
-/// the same world.
-struct CastMeasurement {
-    /// The effective damage build with this action's evaluated
-    /// `damage.stats` overlaid.
+/// ONE cast's world, captured whole at the action's resolved
+/// [`Measure`] instant (see [`Sim::capture_world`]) so every `Plan`
+/// evaluation in that cast's completion transaction reads the same
+/// world: the damage query, `hits_per_use`, the EV `on_crit` weight, and
+/// the tick capture of every `ApplyBuff` entry in the action's effects
+/// list (P8c — build AND phase, one world per cast).
+struct WorldSnapshot {
+    /// The build every `Plan` evaluation of this cast reads: the
+    /// effective damage build with this action's evaluated `damage.stats`
+    /// overlaid (a damaging action), or the plain effective build (a
+    /// utility action — captured only when its effects list will read
+    /// it).
     build: BuildState,
-    /// Evaluated `hits_per_use` (`1.0` when the map omits it).
-    hits: f64,
+    /// The effective phase at the measured instant — the ONE-WORLD half
+    /// (P8c): this cast's damage query and its `ApplyBuff` tick captures
+    /// read THIS phase, never the live one, so a condition an earlier
+    /// effects-list entry drives cannot leak into a later entry's
+    /// capture (the 0.3.0 400-vs-800 list-reorder incoherence).
+    phase: Phase,
+    /// Evaluated `hits_per_use` (`1.0` when the map omits it); `None` for
+    /// a utility action — there is no damage query to run.
+    hits: Option<f64>,
     /// `Mode::Expected` only, and only when the caller rolls procs: the
     /// probability THIS hit crits, used to weight `on_crit` accumulation.
-    /// `None` in `Mode::MonteCarlo` (the branch is sampled outright) and
-    /// for a proc-triggered free cast (which rolls no procs).
+    /// `None` in `Mode::MonteCarlo` (the branch is sampled outright), for
+    /// a proc-triggered free cast (which rolls no procs), and for a
+    /// utility action.
     crit_chance: Option<f64>,
 }
 
@@ -834,6 +848,20 @@ struct Sim<'a> {
     seq: u64,
     heap: BinaryHeap<QueueItem>,
     mid_cast: bool,
+    /// The [`WorldSnapshot`] captured at cast START for the single
+    /// in-flight cast, when its resolved measure is
+    /// [`Measure::CastStart`] — set by [`Sim::begin_cast`] when it
+    /// schedules a timed cast, consumed (`take`n) by
+    /// [`Sim::complete_cast`]. `None` while no cast is in flight, for
+    /// every `cast_complete`-measured action, and for instant casts
+    /// (which always measure in the completion transaction — the two
+    /// instants coincide there, see [`Measure`]). At most one cast is
+    /// ever in flight (`mid_cast` gates the rotation) and nothing that
+    /// resolves between a begin and its completion (buff expiries, phase
+    /// boundaries, wakes) can start another, so ONE slot is the whole
+    /// storage story — the queue's `CastComplete` entry stays `Copy` and
+    /// never carries the snapshot.
+    pending_snapshot: Option<WorldSnapshot>,
 
     actions: Vec<ActionRt>,
     resources: Vec<ResourceRt>,
@@ -910,6 +938,7 @@ impl<'a> Sim<'a> {
             seq: 0,
             heap: BinaryHeap::new(),
             mid_cast: false,
+            pending_snapshot: None,
             actions: (0..n_actions)
                 .map(|_| ActionRt {
                     cooldown_ready_at: 0.0,
@@ -1199,38 +1228,41 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
-    /// Evaluate the `Plan` objective at index `obj` against the current
-    /// effective phase — the one place a tick objective is read, so a live
-    /// rate and a freshly-captured snapshot rate are always sampled the
-    /// same way.
+    /// Evaluate the `Plan` objective at index `obj` — the one place a
+    /// tick objective is read, so a live rate and a freshly-captured
+    /// snapshot rate are always sampled the same way.
     ///
-    /// `overlay` is the build to evaluate against. `None` means the
-    /// current effective build (base + every live buff's contributions);
-    /// `Some(b)` evaluates against `b` INSTEAD — for a capture that should
-    /// inherit the magnitude of a specific CAST, since PoE2's ailments
-    /// take the hit that applied them, and that hit's build is the
-    /// effective build with the action's `damage.stats` overlaid (see
-    /// [`Sim::overlay_build_for_action`]).
+    /// `world` is the world to evaluate against. `None` means the LIVE
+    /// one — the current effective build (base + every live buff's
+    /// contributions) against the current effective phase; `Some(w)`
+    /// evaluates against the snapshot's build AND phase instead (P8c: one
+    /// world per measured cast, both halves from the same instant).
     ///
-    /// Which caller passes which is, as of P7d, a deliberate SPLIT:
+    /// Which caller passes which is a deliberate SPLIT (P7d for the
+    /// build, P8c for the phase):
     ///
     /// - a LIVE tick rate's refold ([`Sim::refresh_after_change`]) passes
     ///   `None` — no cast is in the picture at all; it is the ambient
     ///   rate, by definition.
     /// - an action-effects ([`crate::simdef::ActionDef::effects`])
-    ///   application passes
-    ///   `Some(the completing cast's build)` — or `None` for a UTILITY
-    ///   action, which runs no damage query and so has no overlay to
-    ///   inherit.
-    /// - a PROC application passes `None`, deliberately UNCHANGED in P7d.
-    ///   Switching it is a behavior change with its own numbers (it is
-    ///   load-bearing for the P7c-T2 snapshot pins), not a cleanup — and
-    ///   a proc has no single cast whose magnitude it obviously inherits
-    ///   in the first place (an `on_cast` proc fires from utility actions
-    ///   with no damage at all).
+    ///   application passes `Some(the completing cast's snapshot)` — the
+    ///   hit's overlaid build (or the plain effective build for a UTILITY
+    ///   action) and the phase of the measured instant, so an ailment
+    ///   inherits the magnitude of the hit that applied it and no list
+    ///   entry's condition leaks into a later entry's capture.
+    /// - a PROC application passes `None`, deliberately UNCHANGED in P7d
+    ///   AND P8c: a proc-applied capture reads the live ambient world at
+    ///   the fire — sequential across a proc's own effects list, per the
+    ///   P8b rule. Switching it is a behavior change with its own numbers
+    ///   (it is load-bearing for the P7c-T2 snapshot pins), not a cleanup
+    ///   — and a proc has no single cast whose magnitude it obviously
+    ///   inherits in the first place (an `on_cast` proc fires from
+    ///   utility actions with no damage at all).
     ///
     /// The split is pinned as its own control by
-    /// `an_action_applied_snapshot_captures_the_overlay_and_a_proc_applied_one_does_not`.
+    /// `an_action_applied_snapshot_captures_the_overlay_and_a_proc_applied_one_does_not`,
+    /// and the phase half by
+    /// `a_same_list_snapshot_capture_reads_one_frozen_world`.
     ///
     /// EV-blended in BOTH modes: this calls `Plan::evaluate_phase`, never
     /// `evaluate_phase_sampled`, so a rate captured during a Monte Carlo
@@ -1244,14 +1276,17 @@ impl<'a> Sim<'a> {
     fn eval_objective(
         &mut self,
         obj: usize,
-        overlay: Option<&BuildState>,
+        world: Option<&WorldSnapshot>,
     ) -> Result<f64, PlanError> {
         // `plan`, `effective_*` and `scratch` are DISJOINT fields of
         // `self`, which is why none of this needs a clone.
-        let build = overlay.unwrap_or(&self.effective_damage_build);
-        let objs =
-            self.plan
-                .evaluate_phase(build, &self.effective_phase, &mut self.scratch.eval)?;
+        let (build, phase) = match world {
+            Some(w) => (&w.build, &w.phase),
+            None => (&self.effective_damage_build, &self.effective_phase),
+        };
+        let objs = self
+            .plan
+            .evaluate_phase(build, phase, &mut self.scratch.eval)?;
         Ok(objs[obj])
     }
 
@@ -1336,16 +1371,18 @@ impl<'a> Sim<'a> {
     /// Both paths are pinned by
     /// `expr_duration_reads_the_live_state_on_both_application_paths`.
     ///
-    /// `overlay` is forwarded verbatim to [`Sim::eval_objective`] for a
+    /// `world` is forwarded verbatim to [`Sim::eval_objective`] for a
     /// SNAPSHOT capture, and is unused for everything else. `None` — the
-    /// effective build — is what every PROC application passes and what
-    /// rtce 0.2.0 always did; `Some(cast_build)` is what an action-effects
-    /// ([`crate::simdef::ActionDef::effects`]) application passes, so an
-    /// ailment inherits the magnitude of the hit that applied it (see
-    /// [`Sim::apply_action_buffs`]). It deliberately does NOT reach
-    /// `duration`, which reads sim STATE through the slot array rather
-    /// than a build, and is therefore identical on both paths.
-    fn apply_buff(&mut self, bi: usize, overlay: Option<&BuildState>) -> Result<(), PlanError> {
+    /// live effective build and phase — is what every PROC application
+    /// passes and what rtce 0.2.0 always did; `Some(snapshot)` is what an
+    /// action-effects ([`crate::simdef::ActionDef::effects`]) application
+    /// passes, so an ailment inherits the ONE world its cast measured
+    /// (P8c): the hit's build overlay and the phase of the measured
+    /// instant together (see [`Sim::apply_action_buffs`]). It
+    /// deliberately does NOT reach `duration`, which reads sim STATE
+    /// through the slot array rather than a build, and is therefore live
+    /// and sequential on both paths — the P8c scope boundary.
+    fn apply_buff(&mut self, bi: usize, world: Option<&WorldSnapshot>) -> Result<(), PlanError> {
         let now = self.time;
         self.refresh_time_varying_slots();
         let duration = self.eval_quantity(&self.sim_plan.buffs[bi].duration, || {
@@ -1370,7 +1407,7 @@ impl<'a> Sim<'a> {
         let tick = self.sim_plan.buffs[bi].tick_objective;
         let snapshot = tick.is_some_and(|t| t.snapshot);
         let incoming_rate = match tick {
-            Some(t) if t.snapshot => self.eval_objective(t.objective, overlay)?,
+            Some(t) if t.snapshot => self.eval_objective(t.objective, world)?,
             _ => 0.0,
         };
 
@@ -1591,62 +1628,60 @@ impl<'a> Sim<'a> {
     /// `an_action_applied_buff_does_not_amplify_the_cast_that_applied_it`
     /// and `a_procs_chance_sees_the_buff_the_same_cast_applied`.
     ///
-    /// # The build a snapshot capture reads, and why it is FROZEN
+    /// # The world a snapshot capture reads: ONE, the cast's own (P8c)
     ///
-    /// `measured` is the cast's measured build — this action's
-    /// `damage.stats` folded onto the effective build — or `None` for a
-    /// UTILITY action, which runs no damage query and so has no overlay
-    /// to inherit. It matters only to a SNAPSHOT `tick_objective`: a PoE2
+    /// `world` is the cast's [`WorldSnapshot`], captured at the action's
+    /// resolved [`Measure`] instant by [`Sim::capture_world`] — the
+    /// hit's `damage.stats` overlay folded onto the effective build (or
+    /// the plain effective build for a UTILITY action, which runs no
+    /// damage query), together with the effective PHASE of that same
+    /// instant. It matters only to a SNAPSHOT `tick_objective`: a PoE2
     /// ailment takes the magnitude of the hit that applied it, so an
-    /// action-applied capture reads the hit's build rather than the
-    /// ambient one. (The PROC path is deliberately left on the ambient
-    /// build — see [`Sim::eval_objective`].)
+    /// action-applied capture reads the hit's world rather than the
+    /// ambient one. (The PROC path is deliberately left on the live
+    /// ambient world — see [`Sim::eval_objective`].)
     ///
-    /// A utility action's build is CAPTURED HERE, once, before the loop —
-    /// not left as `None` for [`Sim::apply_buff`] to resolve per entry
-    /// against the live effective build. That is the whole point: it
-    /// makes the two paths agree. Every entry in one list, on either
-    /// path, captures against the SAME frozen build. Left live, a utility
-    /// action's second entry would see the first entry's `contributions`
-    /// and a damaging action's would not (its overlay was cloned before
-    /// the loop), so the same `apply_buff` list would mean two different
-    /// things depending on whether the action happened to deal damage.
+    /// Capturing ONCE, before the list runs, is the whole point: every
+    /// entry in one list, on either action path (damaging or utility),
+    /// captures against the SAME world. Left live, a list's second entry
+    /// would see the first entry's `contributions` and driven conditions,
+    /// so the same list would mean different things depending on entry
+    /// order — the 0.3.0 400-vs-800 incoherence, where the build was
+    /// frozen but the phase was not and a pure reorder of
+    /// `["mark", "poison"]` doubled the DoT at identical reported uptime.
     ///
-    /// # What this freeze does NOT freeze
+    /// # What the snapshot does NOT freeze
     ///
-    /// The BUILD, and only the build. It is NOT "the world as the cast
-    /// found it" — [`Sim::apply_buff`] flushes and refolds per entry, and
-    /// [`Sim::refresh_effective_state`] rebuilds `effective_phase` from
-    /// [`Sim::condition_value`] each time, so `self.effective_phase` is
-    /// LIVE while `frozen` is not. Three axes, stated canonically on
+    /// `Plan` evaluations, and only those. [`Sim::apply_buff`] still
+    /// flushes and refolds per entry, and a [`BuffDef::duration`]
+    /// expression still reads the LIVE slot array — sim state stays
+    /// SEQUENTIAL across the list (`"2 * (1 + stacks.earlier)"` works and
+    /// means what it says). Two axes, stated canonically on
     /// [`crate::simdef::ActionDef::effects`]:
     ///
     /// - sim STATE (slot array): sequential — refreshed per entry.
-    /// - the BUILD (stats + `contributions`): frozen — this clone.
-    /// - CONDITIONS (the effective phase): LIVE — rebuilt per entry.
+    /// - the measured WORLD (build + phase): frozen — this snapshot.
     ///
-    /// So a snapshot capture DOES see a condition an earlier entry in the
-    /// same list drives, while not seeing that entry's contributions. All
-    /// three are pinned:
+    /// Both are pinned:
     /// `apply_buff_applies_the_list_in_order_and_a_repeat_applies_twice`,
     /// `a_snapshot_capture_is_frozen_across_the_list_on_both_action_paths`,
-    /// and
-    /// `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`
-    /// (which also pins that the two ACTION PATHS still agree in both
-    /// list orders — the path symmetry this freeze exists for is intact;
-    /// it is the two-way partition in the docs that was wrong).
+    /// and `a_same_list_snapshot_capture_reads_one_frozen_world` (which
+    /// also pins that the two ACTION PATHS agree in both list orders).
     ///
-    /// The clone is paid only when the list is non-empty, so an action
-    /// that applies nothing — every action in every 0.2.0 config — costs
-    /// exactly the early return.
+    /// The snapshot was captured only because this list is non-empty (or
+    /// the action deals damage), so an action that applies nothing —
+    /// every action in every 0.2.0 config — costs exactly the early
+    /// return.
     ///
     /// [`Sim::apply_buff`] is self-bracketing (flush → mutate → refold →
     /// reschedule), so this loop is just N applications; nothing here has
     /// to know what any policy does.
+    ///
+    /// [`BuffDef::duration`]: crate::simdef::BuffDef::duration
     fn apply_action_buffs(
         &mut self,
         action: usize,
-        measured: Option<&BuildState>,
+        world: Option<&WorldSnapshot>,
     ) -> Result<(), PlanError> {
         // `sim_plan` is a `&'a` field — reading it out decouples the
         // iteration from `self`'s own borrow (see `Sim`'s docs).
@@ -1654,17 +1689,13 @@ impl<'a> Sim<'a> {
         if sim_plan.actions[action].effects.is_empty() {
             return Ok(());
         }
-        let ambient;
-        let frozen: &BuildState = match measured {
-            Some(b) => b,
-            None => {
-                ambient = self.effective_damage_build.clone();
-                &ambient
-            }
-        };
+        let world = world.expect(
+            "a cast with a non-empty effects list always has a snapshot — \
+             capture_world returns Some whenever the list is non-empty",
+        );
         for effect in &sim_plan.actions[action].effects {
             match *effect {
-                CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, Some(frozen))?,
+                CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, Some(world))?,
                 // `sim::compile` rejects a `cast_action` effect on an
                 // action (an action free-casting an action reopens the
                 // A→B→A recursion the free-cast guard closed), so no
@@ -2192,8 +2223,23 @@ impl<'a> Sim<'a> {
             });
         }
         if ct == 0.0 {
+            // An instant cast: begin and complete coincide, so the
+            // completion transaction measures it whatever the resolved
+            // `measure` says — the two instants are identical by
+            // construction (see [`Measure`]), and the capture keeps its
+            // documented intra-instant position there.
             self.complete_cast(action)
         } else {
+            if self.sim_plan.actions[action].measure == Measure::CastStart {
+                debug_assert!(
+                    self.pending_snapshot.is_none(),
+                    "one cast in flight means at most one pending snapshot"
+                );
+                // The cast-start world: cost paid, cooldown armed — the
+                // world this cast leaves behind as it starts (`casts.<self>`
+                // not yet counted, `gain` not yet credited).
+                self.pending_snapshot = self.capture_world(action, true)?;
+            }
             self.mid_cast = true;
             self.schedule(now + ct, Event::CastComplete { action })
         }
@@ -2201,41 +2247,55 @@ impl<'a> Sim<'a> {
 
     fn complete_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
+        // A `cast_start` snapshot captured by `begin_cast`, if any —
+        // taken FIRST, so nothing later in this transaction (a proc's
+        // free cast, notably) could ever see a stale one.
+        let pending = self.pending_snapshot.take();
         self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
 
         let mut is_crit = false;
-        let measured = self.measure_cast(action, now, true)?;
-        if let Some(m) = &measured {
-            let dmg = if self.rng.is_some() {
-                let (dmg, crit) = self.eval_action_damage_sampled(&m.build, m.hits)?;
-                is_crit = crit;
-                dmg
-            } else {
-                self.eval_action_damage(&m.build, m.hits)?
-            };
-            self.total_damage += dmg;
-            self.phase_damage[self.current_phase] += dmg;
-            self.actions[action].damage += dmg;
+        let snap = match pending {
+            Some(s) => Some(s),
+            // The default instant (`cast_complete`): measure here, in the
+            // transaction — after `gain` and the `casts` increment,
+            // before this cast's effects and proc rolls.
+            None => self.capture_world(action, true)?,
+        };
+        if let Some(s) = &snap {
+            if let Some(hits) = s.hits {
+                let dmg = if self.rng.is_some() {
+                    let (dmg, crit) = self.eval_action_damage_sampled(&s.build, &s.phase, hits)?;
+                    is_crit = crit;
+                    dmg
+                } else {
+                    self.eval_action_damage(&s.build, &s.phase, hits)?
+                };
+                self.total_damage += dmg;
+                self.phase_damage[self.current_phase] += dmg;
+                self.actions[action].damage += dmg;
+            }
         }
 
         self.mid_cast = false;
         // The action's OWN effects, before anything this cast merely
         // triggers — see `Sim::apply_action_buffs` for the ordering and
-        // for why a snapshot capture reads this cast's overlay.
-        self.apply_action_buffs(action, measured.as_ref().map(|m| &m.build))?;
+        // for the one measured world its captures read.
+        self.apply_action_buffs(action, snap.as_ref())?;
+        let damaging = self.sim_plan.actions[action].damage.is_some();
         if self.rng.is_some() {
             self.roll_procs_mc(Trigger::OnCast, true, action)?;
-            if measured.is_some() {
+            if damaging {
                 self.roll_procs_mc(Trigger::OnHit, true, action)?;
                 self.roll_procs_mc(Trigger::OnCrit, is_crit, action)?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0, action)?;
-            if let Some(m) = &measured {
-                let crit_chance = m
-                    .crit_chance
-                    .expect("measure_cast(.., true) fills crit_chance in EV mode");
+            if damaging {
+                let crit_chance = snap.as_ref().and_then(|s| s.crit_chance).expect(
+                    "capture_world(.., true) fills crit_chance for a \
+                     damaging action in EV mode",
+                );
                 self.roll_procs_ev(Trigger::OnHit, 1.0, action)?;
                 self.roll_procs_ev(Trigger::OnCrit, crit_chance, action)?;
             }
@@ -2243,58 +2303,82 @@ impl<'a> Sim<'a> {
         Ok(())
     }
 
-    /// Measure `action`'s completing cast at `now` — `None` when the
-    /// action deals no damage and there is nothing to measure.
+    /// Capture `action`'s [`WorldSnapshot`] at the CURRENT instant — the
+    /// measured world every `Plan` evaluation of this cast will read.
+    /// `None` when the cast will run no `Plan` evaluation at all (a
+    /// utility action with an empty effects list), so the 0.2.0 default
+    /// path pays nothing it did not already pay.
+    ///
+    /// WHEN this runs is the action's resolved [`Measure`]:
+    /// [`Sim::complete_cast`] calls it in the completion transaction
+    /// (`cast_complete`, the default), and [`Sim::begin_cast`] calls it
+    /// at cast start for a SCHEDULED `cast_start` cast. An instant cast
+    /// always measures in the completion transaction — the two instants
+    /// coincide there (see [`Measure`]).
     ///
     /// Everything is taken TOGETHER, here: `damage.stats` (and
-    /// `hits_per_use`) are evaluated once into one overlay, and — when
-    /// `needs_crit_chance` and the run is `Mode::Expected` — EV's
-    /// `on_crit` weight is read off that same overlay and the same
-    /// effective phase the damage query will use. Deferring the crit query
-    /// to its point of use would read a LATER state (this cast's own
-    /// `on_cast`/`on_hit` procs can apply buffs and spend resources in
-    /// between), so one hit's two `Plan` queries could disagree about the
-    /// world the hit landed in — and a proc triggered BY this hit cannot
-    /// retroactively change whether this hit crit. Pinned by
+    /// `hits_per_use`) are evaluated once into one overlay, the effective
+    /// PHASE is cloned beside it, and — when `needs_crit_chance` and the
+    /// run is `Mode::Expected` — EV's `on_crit` weight is read off that
+    /// same overlay and phase. Deferring any of these to its point of use
+    /// would read a LATER world (this cast's own effects and procs can
+    /// move buffs and resources in between), so one cast's `Plan` queries
+    /// could disagree about the world the cast landed in — and a proc
+    /// triggered BY this hit cannot retroactively change whether this hit
+    /// crit. Pinned by
     /// `ev_on_crit_weight_is_measured_before_this_casts_own_procs`.
     ///
     /// `needs_crit_chance` is `false` for a proc-triggered free cast,
     /// which rolls no procs and would otherwise pay for a `Plan` query
     /// nothing reads.
     ///
-    /// # Intra-instant ordering at cast complete
+    /// # Intra-instant ordering under the default measure
     ///
-    /// The completion instant has internal order (stated in full in
-    /// [`super`]'s "cast-complete order" section), and a `damage.stats`
-    /// expression sees the state AT THIS POINT in it — AFTER
-    /// [`Sim::apply_gain`] and this cast's own `casts` increment, and
-    /// BEFORE both this cast's own
+    /// Under `cast_complete` the completion instant has internal order
+    /// (stated in full in [`super`]'s "cast-complete order" section), and
+    /// a `damage.stats` expression sees the state AT THIS POINT in it —
+    /// AFTER [`Sim::apply_gain`] and this cast's own `casts` increment,
+    /// and BEFORE both this cast's own
     /// [`crate::simdef::ActionDef::effects`] and any of its proc rolls.
     /// Concretely: a resource named in a `damage.stats` expression reads
     /// its POST-gain amount, `casts.<this action>` INCLUDES the cast being
     /// measured (so it counts from 1 on the first cast, never 0), and
     /// NEITHER a buff this cast applies itself NOR one applied by a proc
     /// it triggers is visible — a hit cannot be changed by what it causes.
-    /// All of it is documented on [`crate::simdef::ActionDamage`].
-    fn measure_cast(
+    /// Under `cast_start` both sim-state readings shift to the cast-start
+    /// world instead (post-cost, pre-gain, in-flight cast uncounted). All
+    /// of it is documented on [`crate::simdef::ActionDamage`] and
+    /// [`Measure`].
+    fn capture_world(
         &mut self,
         action: usize,
-        now: f64,
         needs_crit_chance: bool,
-    ) -> Result<Option<CastMeasurement>, PlanError> {
-        if self.sim_plan.actions[action].damage.is_none() {
+    ) -> Result<Option<WorldSnapshot>, PlanError> {
+        let now = self.time;
+        let damaging = self.sim_plan.actions[action].damage.is_some();
+        if !damaging && self.sim_plan.actions[action].effects.is_empty() {
             return Ok(None);
         }
         self.refresh_time_varying_slots();
-        let build = self.overlay_build_for_action(action, now)?;
-        let hits = self.eval_hits_per_use(action, now)?;
-        let crit_chance = if needs_crit_chance && self.rng.is_none() {
-            Some(self.eval_action_crit_chance(&build)?)
+        let (build, hits, crit_chance) = if damaging {
+            let build = self.overlay_build_for_action(action, now)?;
+            let hits = self.eval_hits_per_use(action, now)?;
+            let crit_chance = if needs_crit_chance && self.rng.is_none() {
+                Some(self.eval_action_crit_chance(&build)?)
+            } else {
+                None
+            };
+            (build, Some(hits), crit_chance)
         } else {
-            None
+            // A utility action with effects: its captures read the plain
+            // effective build — the frozen-build rule P7d set, captured
+            // HERE so both action paths share one code path (and, P8c,
+            // one phase).
+            (self.effective_damage_build.clone(), None, None)
         };
-        Ok(Some(CastMeasurement {
+        Ok(Some(WorldSnapshot {
             build,
+            phase: self.effective_phase.clone(),
             hits,
             crit_chance,
         }))
@@ -2356,12 +2440,18 @@ impl<'a> Sim<'a> {
 
     /// `damage_objective × hits` for one completed cast, EV mode:
     /// `Plan::evaluate_phase`'s branch-blended value over the cast's
-    /// already-built overlay (see [`Sim::overlay_build_for_action`]).
-    fn eval_action_damage(&mut self, build: &BuildState, hits: f64) -> Result<f64, PlanError> {
-        // Disjoint fields of `self` — see `Sim::eval_objective`.
-        let objs =
-            self.plan
-                .evaluate_phase(build, &self.effective_phase, &mut self.scratch.eval)?;
+    /// measured world — both halves from its [`WorldSnapshot`], so a
+    /// `cast_start`-measured cast is priced in the phase it was measured
+    /// in, not the one it happens to complete in.
+    fn eval_action_damage(
+        &mut self,
+        build: &BuildState,
+        phase: &Phase,
+        hits: f64,
+    ) -> Result<f64, PlanError> {
+        let objs = self
+            .plan
+            .evaluate_phase(build, phase, &mut self.scratch.eval)?;
         Ok(objs[self.sim_plan.damage_objective] * hits)
     }
 
@@ -2370,6 +2460,10 @@ impl<'a> Sim<'a> {
     /// convention and the fail-soft `0.0` when this game has no `"crit"`
     /// event. Used to weight `on_crit` proc accumulation (see
     /// [`Sim::roll_procs_ev`]'s doc comment).
+    ///
+    /// Reads the LIVE `effective_phase`, which is correct by
+    /// construction: the only caller is [`Sim::capture_world`], at the
+    /// measured instant — where the live phase IS the snapshot's.
     fn eval_action_crit_chance(&mut self, build: &BuildState) -> Result<f64, PlanError> {
         self.plan
             .crit_chance(build, &self.effective_phase, &mut self.scratch.eval)
@@ -2384,10 +2478,10 @@ impl<'a> Sim<'a> {
     fn eval_action_damage_sampled(
         &mut self,
         build: &BuildState,
+        phase: &Phase,
         hits: f64,
     ) -> Result<(f64, bool), PlanError> {
         let plan = self.plan;
-        let phase = &self.effective_phase;
         let rng = self.rng.as_mut().expect("caller checked rng.is_some()");
         let (objs, mask) =
             plan.evaluate_phase_sampled(build, phase, rng, &mut self.scratch.eval)?;
@@ -2613,17 +2707,26 @@ impl<'a> Sim<'a> {
         self.actions[action].casts += 1;
         // Same instants as a normal completion — a free cast BEGINS and
         // COMPLETES at the firing proc's instant, so `gain` and
-        // `damage.stats` are both evaluated at `now`. No crit chance: this
-        // path rolls no procs (see this method's doc comment).
-        let measured = self.measure_cast(action, now, false)?;
-        if let Some(m) = &measured {
-            let dmg = self.eval_action_damage(&m.build, m.hits)?;
-            self.total_damage += dmg;
-            self.phase_damage[self.current_phase] += dmg;
-            self.actions[action].damage += dmg;
+        // `damage.stats` are both evaluated at `now`, against the LIVE
+        // ambient world. The P8c boundary, stated outright: a free cast
+        // is measured at ITS OWN instant, never frozen to the snapshot of
+        // the outer cast whose proc fired it — an earlier effect in the
+        // firing proc's list (an `apply_buff`, say) IS visible here, per
+        // the P8b sequential rule. Pinned by
+        // `a_free_cast_measures_live_ambient_not_the_outer_casts_snapshot`.
+        // No crit chance: this path rolls no procs (see this method's doc
+        // comment).
+        let snap = self.capture_world(action, false)?;
+        if let Some(s) = &snap {
+            if let Some(hits) = s.hits {
+                let dmg = self.eval_action_damage(&s.build, &s.phase, hits)?;
+                self.total_damage += dmg;
+                self.phase_damage[self.current_phase] += dmg;
+                self.actions[action].damage += dmg;
+            }
         }
-        // Under THIS free cast's own overlay — see the doc comment.
-        self.apply_action_buffs(action, measured.as_ref().map(|m| &m.build))?;
+        // Under THIS free cast's own world — see the doc comment.
+        self.apply_action_buffs(action, snap.as_ref())?;
         Ok(())
     }
 
@@ -2957,6 +3060,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -2986,6 +3090,7 @@ mod tests {
         procs.insert("spark".to_string(), proc);
         SimDef {
             extra: Default::default(),
+            defaults: Default::default(),
             resources: BTreeMap::new(),
             actions,
             buffs,
@@ -3056,6 +3161,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -3098,6 +3204,7 @@ mod tests {
         (
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3154,6 +3261,7 @@ mod tests {
             "spender".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: cost_map,
@@ -3169,6 +3277,7 @@ mod tests {
         (
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3201,6 +3310,7 @@ mod tests {
             "nova".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "0".into(),
                 cooldown,
                 cost: BTreeMap::new(),
@@ -3216,6 +3326,7 @@ mod tests {
         (
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3263,6 +3374,7 @@ mod tests {
             "spender".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: cost_map,
@@ -3279,6 +3391,7 @@ mod tests {
             "generator".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -3291,6 +3404,7 @@ mod tests {
         (
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3335,6 +3449,7 @@ mod tests {
             "beam".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -3350,6 +3465,7 @@ mod tests {
         (
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3442,6 +3558,7 @@ mod tests {
             "charge_gen".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(gen_cooldown),
                 cost: BTreeMap::new(),
@@ -3455,6 +3572,7 @@ mod tests {
             "filler".to_string(),
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -3501,6 +3619,7 @@ mod tests {
         );
         SimDef {
             extra: Default::default(),
+            defaults: Default::default(),
             resources: BTreeMap::new(),
             actions,
             buffs,
@@ -3566,6 +3685,7 @@ mod tests {
                 "spam".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -3580,6 +3700,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3664,6 +3785,7 @@ mod tests {
                 "spender".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost,
@@ -3678,6 +3800,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3749,6 +3872,7 @@ mod tests {
                 "empower".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(10.0),
                     cost: BTreeMap::new(),
@@ -3762,6 +3886,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -3808,6 +3933,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3887,6 +4013,7 @@ mod tests {
                 "a".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -3901,6 +4028,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3958,6 +4086,7 @@ mod tests {
                 "instant_nop".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -3969,6 +4098,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4050,6 +4180,7 @@ mod tests {
                 "empower".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(10.0),
                     cost: BTreeMap::new(),
@@ -4063,6 +4194,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4106,6 +4238,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -4174,6 +4307,7 @@ mod tests {
                 "spam".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4188,6 +4322,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4241,6 +4376,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4269,6 +4405,7 @@ mod tests {
             (
                 SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -4389,6 +4526,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4403,6 +4541,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4506,6 +4645,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4520,6 +4660,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4793,6 +4934,7 @@ mod tests {
                 "spam".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4834,6 +4976,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -4881,6 +5024,7 @@ mod tests {
                 "trigger".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4894,6 +5038,7 @@ mod tests {
                 "nuke".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4922,6 +5067,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4970,6 +5116,7 @@ mod tests {
                 "spam".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4984,6 +5131,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -5033,6 +5181,7 @@ mod tests {
                 "spam".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -5047,6 +5196,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -5177,6 +5327,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -5193,6 +5344,7 @@ mod tests {
                 "ping".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -5245,6 +5397,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -5317,6 +5470,7 @@ mod tests {
                 "strike".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -5385,6 +5539,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -5969,6 +6124,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -6007,6 +6163,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources,
                 actions,
                 buffs,
@@ -6338,6 +6495,7 @@ mod tests {
                 "nuke".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(1000.0),
                     cost: BTreeMap::new(),
@@ -6479,6 +6637,7 @@ mod tests {
                     name.to_string(),
                     ActionDef {
                         extra: Default::default(),
+                        measure: None,
                         cast_time: "0".into(),
                         cooldown: NumOrExpr::Num(1000.0),
                         cost: BTreeMap::new(),
@@ -6827,6 +6986,7 @@ mod tests {
                 "opener".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(1000.0),
                     cost: BTreeMap::new(),
@@ -6842,6 +7002,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -6883,6 +7044,7 @@ mod tests {
             );
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7524,24 +7686,19 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // `Sim::eval_objective`'s `overlay` parameter, pinned directly.
-        //
-        // P7d will pass `Some(overlaid_build)` for an `ActionDef.apply_buff`
-        // capture, so that a PoE2 ailment inherits the magnitude of the hit
-        // that applied it; every call site TODAY passes `None`. A parameter
-        // whose interesting branch no test reaches is the same
-        // documented-but-unpinned hazard that cost this task a review round
-        // over the capture instant — so it is pinned here, at the unit
-        // level, rather than left for P7d to discover.
+        // `Sim::eval_objective`'s `world` parameter, pinned directly at the
+        // unit level (a parameter whose interesting branch no test reaches
+        // is the documented-but-unpinned hazard the P7 record names).
         //
         // Against the same fixture: `dot = dmg × 0.5 × boost × dot_scale`,
-        // so the effective build (dmg 100) reads 50, and an overlay with
-        // dmg = 300 must read 150 — the overlay REPLACES the build the
-        // objective is evaluated against, and nothing else about the
-        // capture changes.
+        // so the effective build (dmg 100) in the live phase reads 50. A
+        // snapshot world REPLACES BOTH halves (P8c — one world): its build
+        // (dmg 300 → 150 in the same phase) AND its phase (a `dot_scale: 2`
+        // phase override → 300) — either half read live instead of from
+        // the snapshot breaks one of the two literals.
         // ------------------------------------------------------------------
         #[test]
-        fn eval_objective_reads_the_overlay_when_given_one_and_the_fold_when_not() {
+        fn eval_objective_reads_the_snapshot_world_when_given_one_and_the_live_one_when_not() {
             let plan = dot_plan();
             let build = dot_build();
             let simdef = dot_simdef(
@@ -7566,15 +7723,38 @@ mod tests {
 
             assert!(
                 close(sim.eval_objective(obj, None).unwrap(), 50.0),
-                "`None` must read the effective build: dmg 100 × 0.5 = 50"
+                "`None` must read the live world: dmg 100 × 0.5 = 50"
             );
 
             let overlaid: BuildState =
                 serde_json::from_str(r#"{ "stats": { "dmg": 300.0, "dot_scale": 1.0 } }"#).unwrap();
+            let same_phase = WorldSnapshot {
+                build: overlaid.clone(),
+                phase: sim.effective_phase.clone(),
+                hits: None,
+                crit_chance: None,
+            };
             assert!(
-                close(sim.eval_objective(obj, Some(&overlaid)).unwrap(), 150.0),
-                "`Some` must read the OVERLAY: dmg 300 × 0.5 = 150 (50 would \
-                 mean the parameter was accepted and ignored)"
+                close(sim.eval_objective(obj, Some(&same_phase)).unwrap(), 150.0),
+                "the snapshot's BUILD must be read: dmg 300 × 0.5 = 150 (50 \
+                 would mean the world was accepted and ignored)"
+            );
+
+            let boosted_phase: Phase = serde_json::from_str(
+                r#"{ "name": "p", "weight": 10, "stats": { "dot_scale": 2.0 } }"#,
+            )
+            .unwrap();
+            let other_phase = WorldSnapshot {
+                build: overlaid,
+                phase: boosted_phase,
+                hits: None,
+                crit_chance: None,
+            };
+            assert!(
+                close(sim.eval_objective(obj, Some(&other_phase)).unwrap(), 300.0),
+                "the snapshot's PHASE must be read too (P8c): dmg 300 × 0.5 \
+                 × dot_scale 2 = 300 (150 would mean the phase half is \
+                 still live)"
             );
         }
 
@@ -7826,6 +8006,7 @@ mod tests {
         fn utility(cast_time: &str, cooldown: f64, apply_buff: Vec<String>) -> ActionDef {
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: cast_time.into(),
                 cooldown: NumOrExpr::Num(cooldown),
                 cost: BTreeMap::new(),
@@ -7847,6 +8028,7 @@ mod tests {
         ) -> ActionDef {
             ActionDef {
                 extra: Default::default(),
+                measure: None,
                 cast_time: cast_time.into(),
                 cooldown: NumOrExpr::Num(cooldown),
                 cost: BTreeMap::new(),
@@ -7938,6 +8120,7 @@ mod tests {
             buffs.insert("window".to_string(), window);
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7997,6 +8180,7 @@ mod tests {
             buffs.insert("empower".to_string(), empower_buff(100.0));
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8060,6 +8244,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8145,6 +8330,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8241,6 +8427,7 @@ mod tests {
                 }
                 SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8328,6 +8515,7 @@ mod tests {
                 buffs.insert("ail".to_string(), snapshot_buff(100.0));
                 SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8385,50 +8573,45 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // The THIRD axis, and the one the "frozen at the world the cast
-        // found" phrasing used to hide: a same-list snapshot capture reads a
-        // FROZEN BUILD against the LIVE EFFECTIVE PHASE. Contributions are
-        // frozen; CONDITIONS are not. `Sim::apply_buff` refolds per entry,
-        // and `Sim::refresh_effective_state` rebuilds `effective_phase` from
-        // `Sim::condition_value` each time, so an earlier entry's condition
-        // is already in force when a later entry captures.
+        // THE ONE-WORLD FIX (P8c — the phase's single deliberate behavior
+        // change). Through 0.3.0 a same-list snapshot capture read a FROZEN
+        // BUILD against the LIVE EFFECTIVE PHASE: contributions frozen,
+        // conditions not, so reordering `["mark", "poison"]` DOUBLED the DoT
+        // (800 vs 400) at identical reported uptime — pinned by this test's
+        // previous incarnation,
+        // `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
+        // and flagged there as the open 0.4.0 question. P8c answers it: a
+        // capture reads the cast's ONE measured world — build AND phase both
+        // from the snapshot — so both orderings now capture the pre-list
+        // world.
         //
         // `marked_dot_plan`, where `dot = dmg × 0.5 × boost × (1 + marked)`.
-        // One `mark` buff drives BOTH axes at `+100` / `1.0`, so each axis
-        // independently DOUBLES a captured rate and the two are separable.
-        // A 2s cast on a 1000s cooldown completes at t=2 of a 10s fight; both
-        // buffs last 100s, so the DoT ticks [2,10] = 8s. Only the LIST ORDER
-        // differs between the two runs.
+        // One `mark` buff drives BOTH axes at `+100` / `1.0`. A 2s cast on a
+        // 1000s cooldown completes at t=2 of a 10s fight; both buffs last
+        // 100s, so the DoT ticks [2,10] = 8s. Only the LIST ORDER differs
+        // between the two runs — and it no longer matters:
         //
-        //   ["mark", "poison"]  mark folds first, then poison captures:
-        //     boost  frozen at 1 (mark's contribution is NOT seen)
-        //     marked LIVE at 1   (mark's condition IS seen)
-        //     R = 100 × 0.5 × 1 × (1 + 1) = 100  →  8 × 100 = 800 DoT
+        //   either order: poison captures the world the cast MEASURED,
+        //     before any list entry ran — boost 1, marked 0
+        //     R = 100 × 0.5 × 1 × (1 + 0) = 50  →  8 × 50 = 400 DoT
         //
-        //   ["poison", "mark"]  poison captures before mark exists at all:
-        //     boost 1, marked 0
-        //     R = 100 × 0.5 × 1 × (1 + 0) =  50  →  8 ×  50 = 400 DoT
+        // 400 is the old poison-first value: the fix collapses the pair onto
+        // the ordering that already captured the pre-list world, it does not
+        // invent a third number.
         //
-        // A pure reorder of one two-entry list DOUBLES the DoT. That is the
-        // cost of the live-phase axis, and it is pinned here rather than
-        // merely described because the integrated `uptime`/`avg_stacks`
-        // columns a reader would check are identical in both runs.
+        // What a later entry sees is now TWO axes, not three: sim STATE is
+        // sequential (`duration` still reads earlier entries' live windows —
+        // the 0.2/0.1 order pin in `mod effects_list` and the pandemic 0.75
+        // pin in `mod expr_fields` are byte-identical, since "one world"
+        // governs Plan evaluations and never sim-FIELD reads), and the
+        // measured WORLD (build + phase alike) is the snapshot's.
         //
-        // What is NOT broken, and is asserted just as hard: the design goal
-        // `Sim::apply_action_buffs` actually states — the damaging and
-        // utility paths agree — holds in BOTH orderings. The hole is in the
-        // documented partition, not in the path symmetry.
-        //
-        // Mutations: freezing the phase alongside the build collapses both
-        // orderings to 400; leaving the build live alongside the phase sends
-        // ["mark","poison"] to 8 × (100 × 0.5 × 2 × 2) = 1600.
-        //
-        // Whether the phase SHOULD be frozen with the build is an open 0.4.0
-        // question in ROADMAP.md — a behavior change, deliberately not made
-        // in 0.3.0.
+        // Mutations, both run: restoring the live-phase read sends
+        // ["mark","poison"] back to 8 × (100 × 0.5 × 1 × 2) = 800; leaving
+        // the build live too sends it to 8 × (100 × 0.5 × 2 × 2) = 1600.
         // ------------------------------------------------------------------
         #[test]
-        fn a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase() {
+        fn a_same_list_snapshot_capture_reads_one_frozen_world() {
             let plan = marked_dot_plan();
             let build = boosted_dot_build();
             let simdef = |action: ActionDef| {
@@ -8439,6 +8622,7 @@ mod tests {
                 buffs.insert("poison".to_string(), snapshot_buff(100.0));
                 SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8471,23 +8655,27 @@ mod tests {
             ));
             let (poison_first_util, _) = dot_of(utility("2", 1000.0, list("poison", "mark")));
 
+            // The EQUALITY is the fix: list order no longer moves a capture.
             assert!(
-                close(mark_first_dmg, 800.0),
-                "[mark, poison]: got {mark_first_dmg} — want 8s × R=100, i.e. \
-                 the capture reading `marked` LIVE (400 would mean the phase \
-                 is frozen with the build; 1600 would mean the build went \
-                 live too)"
+                close(mark_first_dmg, poison_first_dmg),
+                "one world per cast — the two orderings of one two-entry \
+                 list must capture the same rate: {mark_first_dmg} vs \
+                 {poison_first_dmg} (800 vs 400 is the 0.3.0 live-phase \
+                 incoherence this fix removes)"
+            );
+            // And the LITERAL pins which world that is: the pre-list one.
+            assert!(
+                close(mark_first_dmg, 400.0),
+                "[mark, poison]: got {mark_first_dmg} — want 8s × R=50, the \
+                 capture reading the cast's measured world from BEFORE the \
+                 list ran (800 would mean the phase went live again; 1600 \
+                 would mean the build did too)"
             );
             assert!(
                 close(poison_first_dmg, 400.0),
-                "[poison, mark]: got {poison_first_dmg} — want 8s × R=50, the \
-                 capture landing before `mark` exists on either axis"
-            );
-            assert!(
-                close(mark_first_dmg, 2.0 * poison_first_dmg),
-                "a pure reorder of one two-entry list must still double the \
-                 DoT until 0.4.0 decides otherwise: {mark_first_dmg} vs \
-                 {poison_first_dmg}"
+                "[poison, mark]: got {poison_first_dmg} — want the unchanged \
+                 old poison-first value; the fix moves mark-first DOWN, it \
+                 does not move this ordering at all"
             );
 
             // The stated design goal, still met: the two action paths agree.
@@ -8550,6 +8738,7 @@ mod tests {
                 );
                 let simdef = SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8630,6 +8819,7 @@ mod tests {
                 );
                 let simdef = SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8718,6 +8908,7 @@ mod tests {
                 buffs.insert(strong.to_string(), cond(1.0));
                 let simdef = SimDef {
                     extra: Default::default(),
+                    defaults: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8785,6 +8976,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8860,6 +9052,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8932,6 +9125,7 @@ mod tests {
             );
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -9189,6 +9383,7 @@ mod tests {
                 "filler".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -9205,6 +9400,7 @@ mod tests {
                 "ping".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -9243,6 +9439,7 @@ mod tests {
             );
             SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -9456,6 +9653,267 @@ mod tests {
     }
 
     // ==================================================================
+    // P8c — WorldSnapshot measurement: `defaults.measure` /
+    // `ActionDef::measure` pick the instant a cast's world is captured
+    // at (`cast_complete`, the 0.3.0 default, or `cast_start`), and
+    // every `Plan` evaluation in that cast's completion transaction
+    // reads the ONE captured world. The scope boundary — sim-FIELD
+    // expressions (`duration`/`cost`/`gain`) keep their live P7b
+    // instants — is pinned by `mod expr_fields` staying byte-identical,
+    // and the one-world fix itself is re-pinned in `mod action_scoped`'s
+    // `a_same_list_snapshot_capture_reads_one_frozen_world`.
+    // ==================================================================
+    mod measurement {
+        use super::*;
+        use crate::scenario::Scenario;
+
+        fn dummy(seconds: u32) -> Scenario {
+            serde_json::from_str(&format!(
+                r#"{{ "phases": [ {{ "name": "p", "weight": {seconds} }} ] }}"#
+            ))
+            .unwrap()
+        }
+
+        /// Parse-and-run helper: every fixture in this module is written
+        /// as the JSON a config author would write, since the knob under
+        /// test IS config surface.
+        fn ev_json(
+            plan: &Plan,
+            build: &BuildState,
+            simdef_json: &str,
+            rotation_json: &str,
+            seconds: u32,
+        ) -> SimReport {
+            let simdef: SimDef = serde_json::from_str(simdef_json).unwrap();
+            let rotation: Rotation = serde_json::from_str(rotation_json).unwrap();
+            let sim_plan = sim_compile(plan, &simdef, &rotation).unwrap();
+            run(plan, &sim_plan, build, &dummy(seconds), Mode::Expected).unwrap()
+        }
+
+        // --------------------------------------------------------------
+        // The instant itself, isolated through the sim clock: `beam` is
+        // a 1s cast whose overlay sets `dmg = 10 * time`, cast
+        // back-to-back over a 5s fight — starts t=0..4, completions
+        // t=1..5 (the horizon drains the last one).
+        //
+        //   cast_complete (default):  10 × (1+2+3+4+5) = 150
+        //   cast_start:               10 × (0+1+2+3+4) = 100
+        //
+        // The explicit `cast_complete` spelling is asserted equal to the
+        // omitted-block run — the default × override discipline's
+        // identity cell. The mutation is capturing at the other instant:
+        // the two literals swap.
+        // --------------------------------------------------------------
+        #[test]
+        fn the_measured_instant_moves_a_time_reading_overlay_stat() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{ "beam": {{ "cast_time": "1",
+                             "damage": {{ "stats": {{ "dmg": "10 * time" }} }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "beam" } ] }"#;
+
+            let omitted = ev_json(&plan, &build, &with_defaults(""), rot, 5);
+            assert_eq!(omitted.actions["beam"].casts, 5);
+            assert!(
+                close(omitted.total.total_damage, 150.0),
+                "default (cast_complete): got {} — want 10×(1+2+3+4+5)",
+                omitted.total.total_damage
+            );
+
+            let explicit = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "measure": "cast_complete" },"#),
+                rot,
+                5,
+            );
+            assert!(
+                close(explicit.total.total_damage, omitted.total.total_damage),
+                "an explicit cast_complete must be the omitted default: {} vs {}",
+                explicit.total.total_damage,
+                omitted.total.total_damage
+            );
+
+            let at_start = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "measure": "cast_start" },"#),
+                rot,
+                5,
+            );
+            assert_eq!(
+                at_start.actions["beam"].casts, 5,
+                "the cadence is untouched"
+            );
+            assert!(
+                close(at_start.total.total_damage, 100.0),
+                "cast_start: got {} — want 10×(0+1+2+3+4), each cast measured \
+                 at the instant it BEGAN",
+                at_start.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The per-action override, both instants live in ONE run.
+        // `early` overrides to cast_start; `late` says nothing and gets
+        // the (omitted) default. Both are 1s casts on a 4s cooldown over
+        // a 5s fight, rules [early, late]:
+        //   t=0 early begins (cd→4), completes t=1
+        //   t=1 late  begins (cd→5), completes t=2
+        //   t=2 both on cooldown → Wake at 4
+        //   t=4 early begins, completes t=5 (horizon, drained)
+        // With `dmg = 10 * time`:
+        //   early (cast_start):    10 × (0 + 4) = 40
+        //   late  (cast_complete): 10 × 2       = 20
+        // Mutations: resolving the override backwards gives early 60
+        // (its completions 1+5); applying it globally gives late 10.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_per_action_measure_override_coexists_with_the_default() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let simdef = r#"{
+              "actions": {
+                "early": { "cast_time": "1", "cooldown": 4.0,
+                           "measure": "cast_start",
+                           "damage": { "stats": { "dmg": "10 * time" } } },
+                "late":  { "cast_time": "1", "cooldown": 4.0,
+                           "damage": { "stats": { "dmg": "10 * time" } } }
+              },
+              "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "early" }, { "action": "late" } ] }"#;
+            let report = ev_json(&plan, &build, simdef, rot, 5);
+            assert_eq!(report.actions["early"].casts, 2);
+            assert_eq!(report.actions["late"].casts, 1);
+            assert!(
+                close(report.actions["early"].damage, 40.0),
+                "early (cast_start): got {} — want 10×(0+4)",
+                report.actions["early"].damage
+            );
+            assert!(
+                close(report.actions["late"].damage, 20.0),
+                "late (default): got {} — want 10×2, measured at completion",
+                report.actions["late"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // `casts.<self>` at the two instants. Under the default the
+        // overlay evaluates AFTER the completing cast is counted (P7b:
+        // counts from 1, never 0); under cast_start the in-flight cast
+        // has not been counted yet. `pulse` is a 1s cast over 3s, `dmg =
+        // 100 * casts.pulse`:
+        //   cast_complete: 100 × (1+2+3) = 600
+        //   cast_start:    100 × (0+1+2) = 300
+        // --------------------------------------------------------------
+        #[test]
+        fn casts_self_excludes_the_in_flight_cast_under_cast_start() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{ "pulse": {{ "cast_time": "1",
+                             "damage": {{ "stats": {{ "dmg": "100 * casts.pulse" }} }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "pulse" } ] }"#;
+            let complete = ev_json(&plan, &build, &with_defaults(""), rot, 3);
+            assert!(
+                close(complete.total.total_damage, 600.0),
+                "default: got {} — want 100×(1+2+3), the completing cast \
+                 included (the documented P7b reading)",
+                complete.total.total_damage
+            );
+            let start = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "measure": "cast_start" },"#),
+                rot,
+                3,
+            );
+            assert!(
+                close(start.total.total_damage, 300.0),
+                "cast_start: got {} — want 100×(0+1+2), the in-flight cast \
+                 NOT yet counted",
+                start.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The free-cast boundary: a proc-fired `cast_action` free cast
+        // inside a measured cast's transaction measures at ITS OWN
+        // instant, live — never the outer cast's snapshot.
+        //
+        // `hit = dmg * boost` (product bucket). `striker` is a one-shot
+        // 1s cast measured at CAST START (t=0 — nothing live, boost 1).
+        // Its completion transaction at t=1 rolls `gift`, whose effects
+        // list first applies `empower` (+100 to `boost` → ×2) and THEN
+        // free-casts `comet`:
+        //   striker = 100 × 1 = 100   (its own snapshot, from t=0)
+        //   comet   = 100 × 2 = 200   (live ambient at the fire, WITH
+        //                              empower — sequential proc effects,
+        //                              the P8b rule)
+        // Mutation: freezing the free cast to the OUTER cast's snapshot
+        // reads boost 1 → comet 100.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_free_cast_measures_live_ambient_not_the_outer_casts_snapshot() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "buckets": { "boost": { "fold": "product" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * boost" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let simdef = r#"{
+              "actions": {
+                "striker": { "cast_time": "1", "cooldown": 1000.0,
+                             "measure": "cast_start",
+                             "damage": { "stats": {} } },
+                "comet":   { "cast_time": "0", "damage": { "stats": {} } }
+              },
+              "buffs": {
+                "empower": { "duration": 100.0,
+                             "contributions": [ { "bucket": "boost", "value": 100.0 } ] }
+              },
+              "procs": {
+                "gift": { "trigger": "on_cast", "chance": "1",
+                          "actions": ["striker"],
+                          "effects": [ { "apply_buff": "empower" },
+                                       { "cast_action": "comet" } ] }
+              },
+              "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "striker" } ] }"#;
+            let report = ev_json(&plan, &build, simdef, rot, 10);
+            assert_eq!(report.actions["striker"].casts, 1);
+            assert_eq!(report.actions["comet"].casts, 1);
+            assert!(
+                close(report.actions["striker"].damage, 100.0),
+                "striker: got {} — its cast-start snapshot predates empower",
+                report.actions["striker"].damage
+            );
+            assert!(
+                close(report.actions["comet"].damage, 200.0),
+                "comet: got {} — a free cast measures the LIVE ambient world \
+                 at its own instant (100 would mean it was frozen to the \
+                 outer cast's snapshot)",
+                report.actions["comet"].damage
+            );
+        }
+    }
+
+    // ==================================================================
     // P8a follow-up — the ZERO-EVALUATION hole (spec-review probe): a
     // utility-only rotation completes without a single `Plan`
     // evaluation, so the per-evaluation validation in
@@ -9480,6 +9938,7 @@ mod tests {
                 "shout".to_string(),
                 ActionDef {
                     extra: Default::default(),
+                    measure: None,
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -9491,6 +9950,7 @@ mod tests {
             );
             let simdef = SimDef {
                 extra: Default::default(),
+                defaults: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),

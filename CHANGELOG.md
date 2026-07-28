@@ -7,6 +7,94 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Fixed — one world per measured cast (P8c: the phase's ONE deliberate behavior change)
+
+Through 0.3.0, a snapshot `tick_objective` captured by an ACTION's
+`apply_buff`/`effects` list read a FROZEN build against the LIVE
+effective phase — so one buff driving both a bucket contribution and a
+condition landed on a later entry's capture through one axis and not the
+other, and a pure reorder of `["mark", "poison"]` DOUBLED the DoT at an
+identical reported uptime (the 0.3.0 pin
+`a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
+400 vs 800, flagged there as an open question).
+
+Now every `Plan` evaluation in one cast's completion transaction reads
+the cast's ONE `WorldSnapshot` — effective build AND effective phase,
+captured together at the action's measured instant: the damage query,
+`hits_per_use`, the EV `on_crit` weight, and every `ApplyBuff` entry's
+tick capture. Both orderings of the list above now capture the pre-list
+world; the pin is re-derived as an EQUALITY plus the literal
+(`a_same_list_snapshot_capture_reads_one_frozen_world`: both 400 — the
+old poison-first value; the fix moves mark-first DOWN, it invents no
+third number).
+
+Scope, precisely:
+
+- **Sim-FIELD expressions are untouched.** `duration`/`cost`/`gain`
+  keep their P7b instants and live sequential sim-state reads (the
+  pandemic `buff_remaining` idiom, the P8b 0.2/0.1 effects-order pin,
+  and the whole `expr_fields` net are byte-identical). "One world"
+  governs `Plan` evaluations, never sim-state reads.
+- **The proc path is untouched.** A proc-applied buff still captures
+  the live ambient world at the fire, sequentially across the proc's
+  own effects list; a proc-fired `cast_action` FREE cast is measured
+  live at its own instant, never frozen to the triggering cast's
+  snapshot (pinned by
+  `a_free_cast_measures_live_ambient_not_the_outer_casts_snapshot`).
+
+**Migration note — who moves:** numbers change ONLY for a config where
+one action's `apply_buff`/`effects` list contains BOTH a buff that
+drives a condition AND a later snapshot `tick_objective` whose objective
+reads that condition (the captured rate drops to the pre-list value).
+Neither consumer qualifies: `../diablo4-calc` and `../poe2-calcs` define
+no `tick_objective` at all in any committed config, and both were
+re-verified byte-identical (d4 default eval `17574.299999999996`, full
+workspace green; poe2 `rtce_parity` 63/63). Every rtce example is
+byte-identical, `diablo4_rotation`'s EV and MC blocks included.
+
+### Added — the `defaults` block and `measure` (P8c)
+
+```jsonc
+{
+  "defaults": { "measure": "cast_complete" },   // | "cast_start"
+  "actions": { "bolt": { "measure": "cast_start", ... } }  // per-action
+}
+```
+
+- **`defaults`** — package-wide semantic defaults, the new home for
+  P8's knobs (`proc_rolls` and `event_order` join it in later slices).
+  Omitted (every 0.2.0/0.3.0 config) = every knob at its 0.3.0-behavior
+  value; the block round-trips away unless it carries content, and it
+  gets the full P8a unknown-key treatment ("unknown field `measur` on
+  the defaults block — did you mean `measure`?").
+- **`measure`** — the instant a cast's world is captured at:
+  `cast_complete` (default — today's instant, byte-identical) or
+  `cast_start` (the world the cast leaves behind as it begins: cost
+  paid, cooldown armed, `casts.<self>` NOT yet counted, `gain` not yet
+  credited). `ActionDef.measure` overrides per action. Instant casts:
+  the two coincide by construction. The snapshot rides the in-flight
+  cast; the completion transaction reads it instead of measuring
+  afresh, and everything else about the transaction's order is
+  unchanged.
+- Teaching contrast in `examples/poe2_triggers.rs`: the cast-grid
+  footgun (`shock` at an on-cadence 2.0s, bolt damage 2175 → 1837.5 at
+  identical 0.95 uptime) is now FIXABLE by config —
+  `defaults.measure: "cast_start"` restores 2175 (150 + 9×225,
+  hand-worked: every bolt after the first starts strictly inside the
+  previous completion's shock window). The `sim` module's footgun
+  section now ends with that config.
+
+### Changed — Rust API (P8c)
+
+- `SimDef` gains the public `defaults: SimDefaults` field and
+  `ActionDef` the public `measure: Option<Measure>` field
+  (source-breaking for exhaustive struct literals of those types;
+  neither consumer constructs them). `Measure` is `#[non_exhaustive]`
+  from birth, for `EffectDef`'s reason: a third measurement instant
+  (projectile impact, say) is plausible, and it would land on this enum.
+- `sim::CompiledAction` gains `measure: Measure`, the RESOLVED instant
+  (`#[non_exhaustive]`, only `compile` constructs it).
+
 ### Added — ordered `effects` list on actions and procs (P8b)
 
 What an action does at cast complete and what a proc does when it fires

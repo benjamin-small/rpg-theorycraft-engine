@@ -25,6 +25,12 @@ use std::collections::BTreeMap;
 /// config's provenance notes survive a load-and-save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SimDef {
+    /// Package-wide semantic defaults (P8c's `measure`, with later knobs
+    /// joining it) — see [`SimDefaults`]. Omitted = every knob at its
+    /// 0.3.0-behavior value, which is what every 0.2.0/0.3.0 config gets
+    /// without naming the block.
+    #[serde(default, skip_serializing_if = "SimDefaults::is_vacuous")]
+    pub defaults: SimDefaults,
     /// Resource registry (mana, spirit, …), by name.
     #[serde(default)]
     pub resources: BTreeMap<String, ResourceDef>,
@@ -52,8 +58,118 @@ impl SimDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
     /// Staleness here only degrades the did-you-mean, never
     /// correctness — see `config_keys`' module docs ("Staleness").
-    pub(crate) const KNOWN_KEYS: &'static [&'static str] =
-        &["resources", "actions", "buffs", "procs", "damage_objective"];
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
+        "defaults",
+        "resources",
+        "actions",
+        "buffs",
+        "procs",
+        "damage_objective",
+    ];
+}
+
+/// Package-wide semantic defaults — the P8 `defaults` block. Each field
+/// is a small named enum whose default value reproduces the 0.3.0
+/// behavior exactly, so an omitted block (every 0.2.0/0.3.0 config) is a
+/// provable no-op; naming a field changes ONE semantic knob for the whole
+/// `SimDef`, and per-entity overrides (e.g. [`ActionDef::measure`]) win
+/// over it.
+///
+/// Later P8 slices add `proc_rolls` and `event_order` here; the block is
+/// the intended home for every future knob of this kind.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SimDefaults {
+    /// The instant a cast's world is measured at, for every action that
+    /// does not override it — see [`Measure`] for the full semantics.
+    /// Defaults to [`Measure::CastComplete`], the 0.3.0 behavior.
+    #[serde(default)]
+    pub measure: Measure,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this block.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl SimDefaults {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["measure"];
+
+    /// `true` when serializing this block would write nothing a reader
+    /// needs: every knob at its default AND no `_` annotations to carry.
+    /// Used by [`SimDef`]'s `skip_serializing_if`, so a config that never
+    /// wrote a `defaults` block round-trips without one — while a block
+    /// holding only annotations still survives (annotations are the one
+    /// content `extra` is FOR).
+    #[must_use]
+    pub fn is_vacuous(&self) -> bool {
+        self.measure == Measure::default() && self.extra.is_empty()
+    }
+}
+
+/// The instant ONE cast's world is measured at — the moment the
+/// executor captures the cast's world snapshot (its effective build and
+/// effective phase, taken together), which every `Plan` evaluation in
+/// that cast's completion transaction then reads: the damage overlay
+/// ([`ActionDamage::stats`], whose [`NumOrExpr`] values evaluate AT the
+/// measured instant), `hits_per_use`, the crit chance / EV `on_crit`
+/// weight, and the tick capture of every `ApplyBuff` entry in the
+/// action's [`ActionDef::effects`] list (build AND phase — one world per
+/// cast, P8c).
+///
+/// Configured package-wide via [`SimDefaults::measure`] and overridden
+/// per action via [`ActionDef::measure`]. **Default:
+/// [`Measure::CastComplete`]** — the 0.3.0 instant, byte-identical for
+/// every config that names neither field.
+///
+/// # Interactions worth knowing before switching
+///
+/// - **`casts.<self>`** in a `damage.stats` expression: under
+///   `cast_complete` it INCLUDES the completing cast (counts from `1` on
+///   the first cast — the P7b rule); under `cast_start` the in-flight
+///   cast has not been counted yet, so it does NOT (counts from `0`).
+///   The same shift applies to every sim-state read in the overlay: a
+///   resource reads its cast-start amount (post-cost, pre-`gain`), not
+///   its post-`gain` one.
+/// - **Sim-FIELD expressions are NOT governed by this knob.**
+///   `duration`, `cost`, `gain` and `cooldown` keep their own documented
+///   instants ([`NumOrExpr`]'s table) and their live sequential
+///   sim-state reads — "one world" governs `Plan` evaluations, never
+///   sim-state reads. A pandemic-style `duration` still reads the live
+///   `buff_remaining.<self>` at application.
+/// - **A proc-fired free cast is measured at ITS OWN instant, live** —
+///   it is never frozen to the triggering cast's snapshot, whatever
+///   either action's `measure` says (a free cast begins and completes at
+///   the firing proc's instant, so the two measures coincide there).
+/// - **Instant casts** (`cast_time` `0`): cast start and cast complete
+///   are the same instant, so the two measures are identical by
+///   construction — the capture always runs in the completion
+///   transaction, at its documented intra-instant position (post-`gain`,
+///   post-`casts` increment).
+///
+/// `#[non_exhaustive]` for [`EffectDef`]'s reason: a third measurement
+/// instant (a projectile-impact delay, say) is plausible and would have
+/// to land here, so an exhaustive `match` downstream would make that a
+/// breaking change for no gain. (Contrast [`NumOrExpr`], deliberately
+/// exhaustive: "number or expression" is a closed set by construction; a
+/// measurement-instant vocabulary is not.) Variants stay freely
+/// constructible; only an exhaustive `match` needs a wildcard arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Measure {
+    /// Measure in the completion transaction — after `gain` is credited
+    /// and the cast is counted, before the action's effects and its proc
+    /// rolls. The 0.3.0 instant, and the default.
+    #[default]
+    CastComplete,
+    /// Measure when the cast BEGINS — after the cost is paid and the
+    /// cooldown armed, i.e. against the world the cast leaves behind as
+    /// it starts. The snapshot then rides the in-flight cast to its
+    /// completion transaction, where every `Plan` evaluation reads it.
+    CastStart,
 }
 
 /// A literal number or an expression string, evaluated at a documented
@@ -88,7 +204,7 @@ impl SimDef {
 /// | [`ActionDef::cooldown`] | at cast start |
 /// | [`ActionDef::cost`] values | at cast start — and at every decision that merely CHECKS affordability |
 /// | [`ActionDef::gain`] values | at cast complete |
-/// | [`ActionDamage::stats`] values | at cast complete |
+/// | [`ActionDamage::stats`] values | at the action's MEASURED instant — cast complete by default, cast start under [`Measure::CastStart`] |
 ///
 /// A cost expression is therefore RE-CHECKED at each decision point, never
 /// PREDICTED: the executor's resource-affordability wake time is solved
@@ -248,6 +364,17 @@ pub struct ActionDef {
     /// This action's damage effect, if any (omit for utility-only casts).
     #[serde(default)]
     pub damage: Option<ActionDamage>,
+    /// Per-action override of [`SimDefaults::measure`] — the instant THIS
+    /// action's casts are measured at (see [`Measure`] for the semantics,
+    /// the default, and the interactions). `None` (the default) defers to
+    /// the `defaults` block; two actions in one rotation may resolve to
+    /// different instants.
+    ///
+    /// Irrelevant for an action only ever cast FREE by a proc's
+    /// `cast_action` effect: a free cast begins and completes at the
+    /// firing proc's instant and is always measured live there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<Measure>,
     /// Buffs this action applies when its cast COMPLETES — one
     /// application per entry, in list order.
     ///
@@ -308,60 +435,55 @@ pub struct ActionDef {
     /// instances; under `refresh` the second application simply replaces
     /// the first.
     ///
-    /// # What a later entry sees: THREE axes, not two
+    /// # What a later entry sees: TWO axes — one world per cast (P8c)
     ///
-    /// This is the most surprising thing on this field, and it does not
-    /// reduce to a clean "sequential vs frozen" split. Each axis is
-    /// deliberate and each is pinned:
+    /// Each axis is deliberate and each is pinned:
     ///
     /// - **Sim STATE is SEQUENTIAL.** The slot array is refreshed per
     ///   application, so a later entry sees earlier entries' live windows,
     ///   STACK COUNTS and resource amounts. A [`BuffDef::duration`]
     ///   expression reads this axis: `"2 * (1 + stacks.earlier)"` works
     ///   and means what it says.
-    /// - **The BUILD is FROZEN.** It is captured ONCE before the list
-    ///   runs, so a later entry does NOT see earlier entries'
-    ///   `contributions`. A SNAPSHOT [`TickObjective`] magnitude reads
-    ///   this axis: an `["empower", "ailment"]` list does not give the
-    ///   ailment `empower`'s bucket multiplier; put `empower` on an
-    ///   earlier CAST if that is what you want.
-    /// - **CONDITIONS are LIVE.** They are NOT part of the frozen build.
-    ///   The effective phase is rebuilt from every live buff on every
-    ///   application, so a snapshot magnitude DOES see a condition an
-    ///   earlier entry drives — even though it does not see that same
-    ///   entry's contributions. One buff driving both therefore lands on
-    ///   a capture through one axis and not the other.
+    /// - **The measured WORLD is the cast's ONE snapshot** — the
+    ///   effective build AND the effective phase, captured together at
+    ///   the action's [`Measure`] instant, before the list runs. A
+    ///   SNAPSHOT [`TickObjective`] magnitude reads this axis: an
+    ///   `["empower", "ailment"]` list gives the ailment neither
+    ///   `empower`'s bucket contribution nor a condition `empower`
+    ///   drives — put `empower` on an earlier CAST if that is what you
+    ///   want. LIST ORDER cannot change a captured rate.
     ///
-    /// The consequence is worth stating plainly: **for a snapshot
-    /// `tick_objective` whose objective reads a condition, LIST ORDER
-    /// alone changes the captured rate**, and nothing in
+    /// The second axis is P8c's one deliberate behavior fix. Through
+    /// 0.3.0 the build was frozen but the PHASE stayed live, so for a
+    /// snapshot `tick_objective` whose objective read a condition, list
+    /// order alone doubled the captured rate — invisibly, since
     /// [`crate::sim::SimReport`]'s integrated columns (`uptime`,
-    /// `avg_stacks`) shows it. Pinned by
-    /// `a_same_list_snapshot_capture_reads_a_frozen_build_but_a_live_phase`,
-    /// where reordering a two-entry list doubles the DoT at an identical
-    /// reported uptime. Whether the phase SHOULD be frozen alongside the
-    /// build is an open 0.4.0 question in `ROADMAP.md`; it is a behavior
-    /// change and was deliberately not made in 0.3.0.
+    /// `avg_stacks`) were identical either way. Both orderings now
+    /// capture the pre-list world; pinned — the equality AND the
+    /// literal — by `a_same_list_snapshot_capture_reads_one_frozen_world`.
     ///
-    /// What the freeze DOES buy, and what it was for, still holds: the two
-    /// action paths agree, in every list order. A DAMAGING action freezes
-    /// its [`ActionDamage::stats`] overlay (so an ailment inherits the
+    /// What the snapshot buys, and what the P7d build-freeze was always
+    /// for, still holds: the two action paths agree, in every list
+    /// order. A DAMAGING action's world carries its
+    /// [`ActionDamage::stats`] overlay (so an ailment inherits the
     /// magnitude of the hit that applied it — PoE2 semantics), and a
-    /// UTILITY action, which runs no damage query, freezes the plain
-    /// effective build; the same list means the same thing on both. The
-    /// PROC path is deliberately different and unchanged: a proc-applied
-    /// buff captures the ambient effective build, with no action's overlay
-    /// on it.
+    /// UTILITY action's carries the plain effective build; the same list
+    /// means the same thing on both. The PROC path is deliberately
+    /// different and unchanged: a proc-applied buff captures the LIVE
+    /// ambient world at the fire, with no action's overlay on it —
+    /// sequential across the proc's own effects list (the P8b rule).
     ///
     /// # Elsewhere
     ///
     /// Run by a proc-triggered FREE cast of this action (a `cast_action`
-    /// proc effect) too, under that free cast's own overlay — an effect
-    /// here is an effect OF the action, like `gain` and `damage`, not
-    /// part of the cast pipeline (cost, cooldown, further proc rolls)
-    /// that the free-cast path deliberately skips. And because
-    /// `cast_action` cannot appear in THIS list, a free cast never chains
-    /// into another.
+    /// proc effect) too, under that free cast's own world — measured
+    /// LIVE at the firing proc's instant, never the triggering cast's
+    /// snapshot ([`Measure`]'s free-cast boundary). An effect here is an
+    /// effect OF the action, like `gain` and `damage`, not part of the
+    /// cast pipeline (cost, cooldown, further proc rolls) that the
+    /// free-cast path deliberately skips. And because `cast_action`
+    /// cannot appear in THIS list, a free cast never chains into
+    /// another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
@@ -381,6 +503,7 @@ impl ActionDef {
         "cost",
         "gain",
         "damage",
+        "measure",
         "apply_buff",
         "effects",
     ];
@@ -394,19 +517,24 @@ impl ActionDef {
 pub struct ActionDamage {
     /// Stat name → override value, applied only while resolving this
     /// action's damage. Literal or expression; an expression is evaluated
-    /// AT CAST COMPLETE, ONCE per cast (the same evaluated overlay feeds
-    /// the damage query and the `on_crit` proc weight), and need only be
-    /// FINITE — a stat may legitimately be negative. `hits_per_use` lives
-    /// in this map and follows the same rule. See [`NumOrExpr`].
+    /// at the action's MEASURED instant ([`Measure`] — cast complete by
+    /// default, cast start under `measure: "cast_start"`), ONCE per cast
+    /// (the same evaluated overlay feeds the damage query and the
+    /// `on_crit` proc weight), and need only be FINITE — a stat may
+    /// legitimately be negative. `hits_per_use` lives in this map and
+    /// follows the same rule. See [`NumOrExpr`].
     ///
-    /// The completion instant has internal ORDER (stated in full in the
-    /// [`crate::sim`] module docs), and these expressions are evaluated at
-    /// a fixed point within it: AFTER this action's [`ActionDef::gain`] is
-    /// credited and after its own cast is counted, and BEFORE both this
-    /// action's [`ActionDef::effects`] and any of this cast's proc
-    /// rolls. So an expression here reads a resource at its POST-gain
-    /// amount, and `casts.<this action>` INCLUDES the cast being resolved
-    /// (`1` on the first cast, never `0`).
+    /// Under the DEFAULT measure the completion instant has internal
+    /// ORDER (stated in full in the [`crate::sim`] module docs), and
+    /// these expressions are evaluated at a fixed point within it: AFTER
+    /// this action's [`ActionDef::gain`] is credited and after its own
+    /// cast is counted, and BEFORE both this action's
+    /// [`ActionDef::effects`] and any of this cast's proc rolls. So an
+    /// expression here reads a resource at its POST-gain amount, and
+    /// `casts.<this action>` INCLUDES the cast being resolved (`1` on the
+    /// first cast, never `0`). Under `cast_start` both readings shift to
+    /// the cast-start world: the resource is post-cost/pre-gain, and the
+    /// in-flight cast is NOT counted — see [`Measure`].
     ///
     /// NEITHER kind of buff this cast applies is visible: not one applied
     /// by its own procs, and not one in its own
@@ -531,14 +659,19 @@ pub struct TickObjective {
     ///   This is PoE2 ailment semantics, and what
     ///   [`ReapplyPolicy::Strongest`] compares instances by.
     ///
-    /// A capture is taken at the application instant against the state the
-    /// instance LANDS ON — before this application's own effects fold in.
-    /// So if the buff's own [`BuffDef::contributions`] feed the objective
-    /// it ticks, it SELF-AMPLIFIES on reapplication, one application
-    /// behind: the first instance captures the un-buffed rate, the second
-    /// captures it with one stack live, and so on. Deliberate, and the
-    /// same instant [`BuffDef::duration`] is evaluated at; if you want the
-    /// first instance to see itself, it cannot be expressed here.
+    /// A PROC-applied capture is taken at the application instant against
+    /// the live state the instance LANDS ON — before this application's
+    /// own effects fold in. So if the buff's own
+    /// [`BuffDef::contributions`] feed the objective it ticks, it
+    /// SELF-AMPLIFIES on reapplication, one application behind: the first
+    /// instance captures the un-buffed rate, the second captures it with
+    /// one stack live, and so on. Deliberate, and the same instant
+    /// [`BuffDef::duration`] is evaluated at; if you want the first
+    /// instance to see itself, it cannot be expressed here. (An
+    /// ACTION-applied capture — an [`ActionDef::effects`] entry — reads
+    /// the applying CAST's one measured world instead, at that action's
+    /// [`Measure`] instant: build and phase together, P8c. The
+    /// self-amplification story is the same, one application behind.)
     ///
     /// What each [`ReapplyPolicy`] does with a captured rate differs
     /// sharply — see the variants; `refresh` re-captures unconditionally,
@@ -1511,6 +1644,16 @@ mod tests {
         assert_eq!(bare.gain, derived.gain);
         assert!(bare.damage.is_none() && derived.damage.is_none());
         assert_eq!(
+            bare.measure, derived.measure,
+            "a config that names no `measure` defers to the defaults \
+             block (P8c) in both spellings of the default"
+        );
+        assert!(
+            bare.measure.is_none(),
+            "the deferred spelling is None, not a baked-in Measure value \
+             — resolution against `defaults.measure` happens at sim::compile"
+        );
+        assert_eq!(
             bare.apply_buff, derived.apply_buff,
             "serde's per-field defaults must agree with the derived \
              `Default` — a new ActionDef field belongs in BOTH"
@@ -1690,6 +1833,85 @@ mod tests {
         assert!(
             e.to_string()
                 .contains("an effect entry takes exactly one of `apply_buff` or `cast_action`, got more than one"),
+            "got: {e}"
+        );
+    }
+
+    // ==================================================================
+    // P8c — the `defaults` block and `measure` at the parse layer.
+    // ==================================================================
+
+    // Backward-compatibility contract at the parse layer: a config that
+    // never wrote `defaults` (every 0.2.0/0.3.0 config) gets every knob
+    // at its 0.3.0-behavior value, and round-trips WITHOUT the block.
+    #[test]
+    fn an_omitted_defaults_block_means_cast_complete_and_never_reappears() {
+        let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
+        assert_eq!(def.defaults.measure, Measure::CastComplete);
+        assert_eq!(def.defaults, SimDefaults::default());
+        assert_eq!(def.actions["fireball"].measure, None);
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            !json.contains("defaults") && !json.contains("measure"),
+            "a config that never wrote the block round-trips without it: {json}"
+        );
+    }
+
+    #[test]
+    fn the_defaults_block_and_per_action_measure_parse_and_round_trip() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "defaults": { "measure": "cast_start" },
+              "actions": {
+                "bolt": { "cast_time": "1", "measure": "cast_complete" },
+                "beam": { "cast_time": "1" }
+              },
+              "damage_objective": "hit"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(def.defaults.measure, Measure::CastStart);
+        assert_eq!(def.actions["bolt"].measure, Some(Measure::CastComplete));
+        assert_eq!(def.actions["beam"].measure, None, "deferral is None");
+
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(round.defaults, def.defaults);
+        assert_eq!(round.actions["bolt"].measure, def.actions["bolt"].measure);
+        assert_eq!(round.actions["beam"].measure, None);
+    }
+
+    // A `defaults` block holding ONLY `_` annotations is not vacuous —
+    // annotations must survive a load-and-save, like at every other
+    // nesting level (P8a).
+    #[test]
+    fn a_defaults_block_holding_only_annotations_survives_round_trips() {
+        let def: SimDef = serde_json::from_str(
+            r#"{ "defaults": { "_why": "cast-start package" },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap();
+        assert_eq!(def.defaults.measure, Measure::CastComplete);
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(
+            json.contains(r#""_why":"cast-start package""#),
+            "annotations survive: {json}"
+        );
+    }
+
+    // A malformed `measure` VALUE is a parse error naming the variants —
+    // serde's derived enum message, the same voice `on_reapply` and
+    // `trigger` already speak (an unknown KEY inside the block is the
+    // sim::compile walk's job instead — see `tests/unknown_keys.rs`).
+    #[test]
+    fn a_malformed_measure_value_names_the_two_variants() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{ "defaults": { "measure": "cast_startt" },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("expected `cast_complete` or `cast_start`"),
             "got: {e}"
         );
     }

@@ -78,15 +78,24 @@
 //!
 //! ```text
 //! apply `gain`  →  casts.<action> += 1
-//!   →  evaluate `damage.stats`, measure and credit the hit
+//!   →  measure the cast's WORLD*, evaluate its damage, credit the hit
 //!   →  the action's effects (apply_buff entries), in list order
 //!   →  proc rolls: on_cast, then on_hit, then on_crit
 //! ```
 //!
+//! *Under the default `measure: "cast_complete"`. An action measured at
+//! `cast_start` ([`crate::simdef::Measure`], P8c) captured its world —
+//! `damage.stats` overlay, `hits_per_use`, crit weight, effective build
+//! and phase, all together — when the cast BEGAN; the transaction then
+//! reads that snapshot at this same step instead of measuring afresh,
+//! and everything else in the diagram is unchanged.
+//!
 //! Reading it off, in the order a config author trips over them:
 //!
 //! - A `damage.stats` expression sees a resource at its POST-`gain`
-//!   amount, and `casts.<this action>` counts from `1` on the first cast.
+//!   amount, and `casts.<this action>` counts from `1` on the first cast
+//!   (both shift to the cast-start readings under `cast_start` — see
+//!   [`crate::simdef::Measure`]).
 //! - The cast does NOT benefit from anything it applies — neither a buff
 //!   in its own `effects` list nor one a proc it triggers applies. A hit
 //!   cannot be changed by what it causes.
@@ -96,16 +105,16 @@
 //!   it, so the whole `effects` list precedes the whole proc batch and
 //!   the two never interleave, whatever the procs' name order.
 //! - Within one action's `effects` list, what a later entry sees splits
-//!   across THREE axes, not two (the full statement is on
+//!   across TWO axes (the full statement is on
 //!   [`crate::simdef::ActionDef::effects`]): sim STATE is SEQUENTIAL
 //!   (`stacks.*`, `buff.*`, resource amounts — a `duration` expression
-//!   reads them fresh per entry); the BUILD is FROZEN once before the
-//!   list runs (so a snapshot [`crate::simdef::TickObjective`] magnitude
-//!   does NOT see earlier entries' `contributions`); and CONDITIONS are
-//!   LIVE (a snapshot capture DOES see a condition an earlier entry
-//!   drives, because the effective phase is rebuilt on every
-//!   application). All three are pinned. The third one is the one that
-//!   surprises: list ORDER alone can change a captured DoT rate.
+//!   reads them fresh per entry), while the measured WORLD — build AND
+//!   phase — is the cast's ONE snapshot (so a snapshot
+//!   [`crate::simdef::TickObjective`] magnitude sees neither an earlier
+//!   entry's `contributions` nor a condition it drives). One world per
+//!   cast is P8c's deliberate fix: through 0.3.0 the build was frozen
+//!   but the phase was live, and reordering a two-entry list could
+//!   double a captured DoT at identical reported uptime.
 //!
 //! A firing PROC runs its own `effects` list in list order, each entry
 //! against the sim state its predecessors left behind (P7b sequential
@@ -192,13 +201,30 @@
 //! looks low while the uptimes look perfect, this is the first thing to
 //! check.
 //!
-//! Whether this ordering is the RIGHT semantics is an open question for a
-//! later version, recorded in `ROADMAP.md`: a `CastComplete` arguably
+//! **And here is the config that fixes it** (P8c): measure the cast at
+//! the instant it BEGINS instead of the instant it completes —
+//!
+//! ```json
+//! { "defaults": { "measure": "cast_start" } }
+//! ```
+//!
+//! (package-wide; or per action, `"measure": "cast_start"` on the
+//! [`crate::simdef::ActionDef`]). The expiry-vs-completion race still
+//! happens, but nothing is measured at completions anymore: every cast
+//! after the first STARTS strictly inside the previous completion's
+//! window, so the refreshing cast benefits from its own buff again.
+//! `poe2_triggers` runs this as a contrast — `shock` at the on-grid 2.0
+//! with `cast_start` restores bolt damage 1837.5 → 2175, the off-grid
+//! number, at the same 0.95 uptime. See [`crate::simdef::Measure`] for
+//! what else the knob moves (`casts.<self>`, resource readings) before
+//! adopting it wholesale.
+//!
+//! Whether the event ORDERING itself is the right semantics is a separate
+//! question, still recorded in `ROADMAP.md`: a `CastComplete` arguably
 //! ought to resolve before a coincident `BuffExpire`, since a cast that
 //! refreshes a buff at the instant it lapses should plausibly keep it up.
-//! Deliberately NOT decided here — the ordering is long-standing behavior,
-//! orthogonal to the horizon rule above, and changing it would move
-//! numbers for every config that hits it.
+//! P8c fixes the footgun at the MEASUREMENT level without touching the
+//! queue; the ordering-level knob is P8d's.
 //!
 //! # Sim slot layout
 //!
