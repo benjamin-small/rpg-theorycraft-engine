@@ -128,6 +128,56 @@ impl Symbols for WithEventFactors<'_> {
     }
 }
 
+/// The ONE source of truth for build finiteness: every `BuildState` stat
+/// value and contribution value must be finite. Called from `Plan`'s
+/// scenario-level resolution (`run`), its per-phase resolution
+/// (`validate_and_resolve_build_for_phase`, the sim's per-cast path), and
+/// `sim::run`'s entry walk — so the three levels agree on the message BY
+/// CONSTRUCTION, not by copy-paste. Finiteness only: stat NAMES and
+/// bucket references stay validated where they resolve.
+pub(crate) fn validate_finite_build(build: &BuildState) -> Result<(), PlanError> {
+    for (name, v) in &build.stats {
+        if !v.is_finite() {
+            return Err(PlanError {
+                what: format!("build stat `{name}` must be finite, got {v}"),
+            });
+        }
+    }
+    // A NaN/inf value would FOLD (Σ or Π) into every branch and come back
+    // as `Ok(NaN)` total damage — the 0.3.0 release review's standing
+    // repro. Fail closed instead.
+    for c in &build.contributions {
+        if !c.value.is_finite() {
+            return Err(PlanError {
+                what: format!(
+                    "contribution value into bucket `{}` must be finite, got {}",
+                    c.bucket, c.value
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The ONE source of truth for phase stat-override finiteness — the same
+/// silent-NaN class as `validate_finite_build`, shared by the same three
+/// call sites (plus phase uptimes, which stay inline where the condition
+/// registry is at hand). Mirrors the `Phase.uptimes` "must be finite"
+/// style.
+pub(crate) fn validate_finite_phase_stats(phase: &Phase) -> Result<(), PlanError> {
+    for (name, v) in &phase.stats {
+        if !v.is_finite() {
+            return Err(PlanError {
+                what: format!(
+                    "phase `{}` stat `{name}` must be finite, got {v}",
+                    phase.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Compile a `GameDef` into a `Plan`: validate names (no collisions across
 /// stats/conditions/buckets/stages, no more than `MAX_EVENTS` events, no
 /// stage seeing a later stage, `event_factors` reserved and legal only in
@@ -516,18 +566,7 @@ impl Plan {
                     });
                 }
             }
-            // A NaN stat override would poison every stage it reaches and
-            // still come back `Ok` — same silent-NaN class as uptimes.
-            for (name, v) in &phase.stats {
-                if !v.is_finite() {
-                    return Err(PlanError {
-                        what: format!(
-                            "phase `{}` stat `{name}` must be finite, got {v}",
-                            phase.name
-                        ),
-                    });
-                }
-            }
+            validate_finite_phase_stats(phase)?;
         }
         let weight_sum: f64 = scenario.phases.iter().map(|p| p.weight).sum();
         // Fail-closed on NaN too: `weight_sum > 0.0` is false for NaN, so
@@ -539,7 +578,9 @@ impl Plan {
             });
         }
 
-        // Resolve + validate build ONCE: stats and contribution tags.
+        // Resolve + validate build ONCE: finiteness (the shared walk),
+        // then stats and contribution tags.
+        validate_finite_build(build)?;
         for slot in scratch.stat_base.iter_mut() {
             *slot = 0.0;
         }
@@ -547,11 +588,6 @@ impl Plan {
             let i = self.stat_id(name).ok_or_else(|| PlanError {
                 what: format!("unknown stat `{name}`"),
             })?;
-            if !v.is_finite() {
-                return Err(PlanError {
-                    what: format!("build stat `{name}` must be finite, got {v}"),
-                });
-            }
             scratch.stat_base[i] = *v;
         }
         // Contribution tags validate per call (cheap linear scans over
@@ -560,17 +596,6 @@ impl Plan {
             if !self.bucket_names.iter().any(|b| b == &c.bucket) {
                 return Err(PlanError {
                     what: format!("unknown bucket `{}`", c.bucket),
-                });
-            }
-            // A NaN/inf value would FOLD (Σ or Π) into every branch and
-            // come back as `Ok(NaN)` total damage — the 0.3.0 release
-            // review's standing repro. Fail closed instead.
-            if !c.value.is_finite() {
-                return Err(PlanError {
-                    what: format!(
-                        "contribution value into bucket `{}` must be finite, got {}",
-                        c.bucket, c.value
-                    ),
                 });
             }
             if let Some(e) = &c.event {
@@ -844,17 +869,8 @@ impl Plan {
                 });
             }
         }
-        // Same silent-NaN class as uptimes (see `run`).
-        for (name, v) in &phase.stats {
-            if !v.is_finite() {
-                return Err(PlanError {
-                    what: format!(
-                        "phase `{}` stat `{name}` must be finite, got {v}",
-                        phase.name
-                    ),
-                });
-            }
-        }
+        validate_finite_phase_stats(phase)?;
+        validate_finite_build(build)?;
 
         for slot in scratch.stat_base.iter_mut() {
             *slot = 0.0;
@@ -863,26 +879,12 @@ impl Plan {
             let i = self.stat_id(name).ok_or_else(|| PlanError {
                 what: format!("unknown stat `{name}`"),
             })?;
-            if !v.is_finite() {
-                return Err(PlanError {
-                    what: format!("build stat `{name}` must be finite, got {v}"),
-                });
-            }
             scratch.stat_base[i] = *v;
         }
         for c in &build.contributions {
             if !self.bucket_names.iter().any(|b| b == &c.bucket) {
                 return Err(PlanError {
                     what: format!("unknown bucket `{}`", c.bucket),
-                });
-            }
-            // See `run`: a NaN/inf contribution folds to `Ok(NaN)`.
-            if !c.value.is_finite() {
-                return Err(PlanError {
-                    what: format!(
-                        "contribution value into bucket `{}` must be finite, got {}",
-                        c.bucket, c.value
-                    ),
                 });
             }
             if let Some(e) = &c.event {

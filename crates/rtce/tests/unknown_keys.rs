@@ -49,10 +49,17 @@ fn sim_compile_err(simdef_json: &str, rotation_json: &str) -> String {
 
 const EMPTY_ROTATION: &str = r#"{ "rules": [] }"#;
 
+/// The number of config structs in the P8a fail-closed sweep. A task
+/// adding a config struct (e.g. P8c's `defaults` block) bumps this AND
+/// adds the struct's row below — the `cases.len()` assertion at the end
+/// of the table is what keeps the two honest.
+const CONFIG_STRUCT_COUNT: usize = 16;
+
 #[test]
 fn every_config_struct_rejects_a_typoed_key_with_its_context_named() {
     // (site, error, typo'd key, required context fragment) — one row per
-    // config struct in the P8a sweep, all 16.
+    // config struct in the P8a sweep (`CONFIG_STRUCT_COUNT` of them,
+    // asserted below the table).
     let cases: Vec<(&str, String, &str, &str)> = vec![
         (
             "GameDef",
@@ -200,6 +207,13 @@ fn every_config_struct_rejects_a_typoed_key_with_its_context_named() {
             "rotation rule 0 (action `bolt`)",
         ),
     ];
+
+    assert_eq!(
+        cases.len(),
+        CONFIG_STRUCT_COUNT,
+        "one row per config struct in the sweep — a new config struct \
+         needs a row here (and a bump of CONFIG_STRUCT_COUNT)"
+    );
 
     for (site, err, key, context) in cases {
         assert!(

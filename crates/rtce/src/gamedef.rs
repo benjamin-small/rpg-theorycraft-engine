@@ -83,6 +83,8 @@ pub struct EventDef {
 
 impl EventDef {
     /// The declared field names, for `plan::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["chance", "factor"];
 }
 
@@ -108,6 +110,14 @@ pub struct StageDef {
 // an `extra` field): a parse-side mirror with `#[serde(flatten)]` collects
 // leftover keys, and `config_keys::reject_unknown` fails closed on any
 // non-`_` one right there, with the context the struct itself carries.
+//
+// The exhaustive `Ok(Struct { field: r.field, … })` literals are
+// LOAD-BEARING, here and in all seven mirrors (`build.rs`,
+// `scenario.rs` follow this same pattern): adding a struct field breaks
+// them at compile time, forcing the mirror and its `known` list to be
+// updated together. `..Default::default()` would compile straight
+// through a new field — demoting that compile-time drift guard to a
+// confusing RUNTIME rejection of a legitimate field.
 
 impl<'de> Deserialize<'de> for GameDef {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

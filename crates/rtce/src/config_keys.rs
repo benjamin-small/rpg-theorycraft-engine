@@ -29,6 +29,24 @@
 //! A new config struct (e.g. P8c's `defaults` block) should take the
 //! FIRST shape unless a consumer already constructs it in Rust.
 //!
+//! # Staleness
+//!
+//! A `KNOWN_KEYS` list (or a mirror's inline `known` slice) that lags
+//! its struct can never cause a false accept OR a false reject:
+//! rejection is driven by what lands in `extra`, which serde fills with
+//! exactly the keys the struct does NOT declare — a real field never
+//! reaches it — and [`reject_unknown`] reads `known` only to pick the
+//! suggestion. A missing entry therefore only degrades the did-you-mean
+//! (or the expected-one-of list), never correctness.
+//!
+//! The two spellings of `known` are chosen, not accidental: the
+//! flatten-bearing structs carry a `KNOWN_KEYS` const next to their
+//! fields because their walk sites live a module away (`plan::compile`/
+//! `sim::compile`), while each hand-written mirror passes an inline
+//! slice — it is used exactly once, two lines from the `Repr` that
+//! defines the same fields, and a const would only move it away from
+//! them.
+//!
 //! # Duplicate keys
 //!
 //! Stated for the record (and pinned in this module's tests), since

@@ -50,6 +50,8 @@ pub struct SimDef {
 
 impl SimDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] =
         &["resources", "actions", "buffs", "procs", "damage_objective"];
 }
@@ -125,8 +127,9 @@ pub enum NumOrExpr {
 /// "expected a number (literal) or a string (expression)" — instead of
 /// serde's "data did not match any variant of untagged enum". The
 /// accepted inputs are exactly the untagged derive's: any JSON number →
-/// [`NumOrExpr::Num`] (integers via the same lossless-`f64` widening
-/// serde itself applies), any JSON string → [`NumOrExpr::Expr`].
+/// [`NumOrExpr::Num`] (integers via the same `u64`/`i64` → `f64`
+/// conversion the derive applied — lossy above 2^53, identically so),
+/// any JSON string → [`NumOrExpr::Expr`].
 /// Serialization is unchanged (still the untagged derive above).
 impl<'de> Deserialize<'de> for NumOrExpr {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -211,6 +214,8 @@ pub struct ResourceDef {
 
 impl ResourceDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["max", "regen_per_sec"];
 }
 
@@ -343,6 +348,8 @@ pub struct ActionDef {
 
 impl ActionDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "cast_time",
         "cooldown",
@@ -398,6 +405,8 @@ pub struct ActionDamage {
 
 impl ActionDamage {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["stats"];
 }
 
@@ -759,6 +768,8 @@ pub struct BuffDef {
 
 impl BuffDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "duration",
         "contributions",
@@ -903,6 +914,8 @@ pub struct ProcDef {
 
 impl ProcDef {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "trigger",
         "chance",
@@ -932,6 +945,8 @@ pub struct Rotation {
 
 impl Rotation {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["rules"];
 }
 
@@ -956,6 +971,8 @@ pub struct Rule {
 
 impl Rule {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["action", "when"];
 }
 

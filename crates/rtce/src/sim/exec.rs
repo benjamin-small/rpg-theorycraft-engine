@@ -418,39 +418,12 @@ pub fn run(
         // so `validate_and_resolve_build_for_phase`'s per-evaluation
         // checks never run on that route, while the NaN still flows
         // through `write_stat_condition_slots` into rule gates and
-        // resource regen. Validate once here, before the event loop.
-        for (name, v) in &phase.stats {
-            if !v.is_finite() {
-                return Err(PlanError {
-                    what: format!(
-                        "phase `{}` stat `{name}` must be finite, got {v}",
-                        phase.name
-                    ),
-                });
-            }
-        }
+        // resource regen. Validate once here, before the event loop —
+        // through the SAME validators `Plan` resolution calls, so the
+        // two levels agree on the message by construction.
+        crate::plan::validate_finite_phase_stats(phase)?;
     }
-    // The build half of the same entry walk (finiteness only — stat names
-    // and bucket references stay validated where they resolve). Messages
-    // mirror `Plan`'s build-resolution errors, so the two levels never
-    // disagree on the same bad input.
-    for (name, v) in &build.stats {
-        if !v.is_finite() {
-            return Err(PlanError {
-                what: format!("build stat `{name}` must be finite, got {v}"),
-            });
-        }
-    }
-    for c in &build.contributions {
-        if !c.value.is_finite() {
-            return Err(PlanError {
-                what: format!(
-                    "contribution value into bucket `{}` must be finite, got {}",
-                    c.bucket, c.value
-                ),
-            });
-        }
-    }
+    crate::plan::validate_finite_build(build)?;
     let duration: f64 = scenario.phases.iter().map(|p| p.weight).sum();
     if !duration.is_finite() || duration <= 0.0 {
         return Err(PlanError {

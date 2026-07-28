@@ -53,6 +53,12 @@
 //!    against "burst" and "sustained" framings without rewriting the
 //!    algorithm.
 //!
+//! Across all of it, an unknown config key FAILS CLOSED with a
+//! did-you-mean ("unknown field `tick_objectiv` on buff `poison` — did
+//! you mean `tick_objective`?") — a typo never silently means "field
+//! absent" — while keys starting with `_` are the documented annotation
+//! namespace (`_source`, `_scope`, …), accepted at every nesting level.
+//!
 //! # Compile once, evaluate fast
 //!
 //! [`plan::compile`] is the only step that parses expressions, validates
