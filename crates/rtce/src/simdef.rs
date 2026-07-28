@@ -98,14 +98,17 @@ impl SimDefaults {
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["measure"];
 
     /// `true` when serializing this block would write nothing a reader
-    /// needs: every knob at its default AND no `_` annotations to carry.
-    /// Used by [`SimDef`]'s `skip_serializing_if`, so a config that never
+    /// needs: every knob at its default AND no `_` annotations to carry
+    /// (`default()` has an empty `extra`, so equality covers both). Used
+    /// by [`SimDef`]'s `skip_serializing_if`, so a config that never
     /// wrote a `defaults` block round-trips without one — while a block
     /// holding only annotations still survives (annotations are the one
-    /// content `extra` is FOR).
+    /// content `extra` is FOR). Spelled as whole-struct equality, not a
+    /// per-field predicate, so a knob added by a later task (P8d/P8e)
+    /// cannot be silently DROPPED on serialize by an un-extended list.
     #[must_use]
     pub fn is_vacuous(&self) -> bool {
-        self.measure == Measure::default() && self.extra.is_empty()
+        *self == Self::default()
     }
 }
 
@@ -143,11 +146,15 @@ impl SimDefaults {
 ///   it is never frozen to the triggering cast's snapshot, whatever
 ///   either action's `measure` says (a free cast begins and completes at
 ///   the firing proc's instant, so the two measures coincide there).
-/// - **Instant casts** (`cast_time` `0`): cast start and cast complete
-///   are the same instant, so the two measures are identical by
-///   construction — the capture always runs in the completion
-///   transaction, at its documented intra-instant position (post-`gain`,
-///   post-`casts` increment).
+/// - **Instant casts** (`cast_time` `0`): an instant cast is ALWAYS
+///   measured at the completion position, whatever `measure` says. Cast
+///   start and cast complete share the wall-clock instant, but the
+///   intra-instant positions differ — the completion capture runs
+///   post-`gain`, post-`casts` increment — so under `cast_start` a
+///   zero-time cast's `casts.<self>` counts from 1 while an
+///   epsilon-time cast's counts from 0. That discontinuity is the
+///   documented behavior, not an accident, and it is pinned
+///   (`an_instant_cast_is_measured_at_the_completion_position_even_under_cast_start`).
 ///
 /// `#[non_exhaustive]` for [`EffectDef`]'s reason: a third measurement
 /// instant (a projectile-impact delay, say) is plausible and would have

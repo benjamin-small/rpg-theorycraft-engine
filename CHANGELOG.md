@@ -71,11 +71,14 @@ byte-identical, `diablo4_rotation`'s EV and MC blocks included.
   `cast_complete` (default — today's instant, byte-identical) or
   `cast_start` (the world the cast leaves behind as it begins: cost
   paid, cooldown armed, `casts.<self>` NOT yet counted, `gain` not yet
-  credited). `ActionDef.measure` overrides per action. Instant casts:
-  the two coincide by construction. The snapshot rides the in-flight
-  cast; the completion transaction reads it instead of measuring
-  afresh, and everything else about the transaction's order is
-  unchanged.
+  credited). `ActionDef.measure` overrides per action. An INSTANT cast
+  is always measured at the completion position, whatever `measure`
+  says — the two share the wall-clock instant, and the intra-instant
+  discontinuity this implies for `casts.<self>` (a zero-time cast
+  counts from 1, an epsilon-time one from 0) is documented on `Measure`
+  and pinned. The snapshot rides the in-flight cast; the completion
+  transaction reads it instead of measuring afresh, and everything else
+  about the transaction's order is unchanged.
 - Teaching contrast in `examples/poe2_triggers.rs`: the cast-grid
   footgun (`shock` at an on-cadence 2.0s, bolt damage 2175 → 1837.5 at
   identical 0.95 uptime) is now FIXABLE by config —

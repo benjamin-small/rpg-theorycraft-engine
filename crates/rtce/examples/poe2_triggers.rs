@@ -27,7 +27,7 @@ use rtce::gamedef::GameDef;
 use rtce::plan::compile as plan_compile;
 use rtce::scenario::Scenario;
 use rtce::sim::{compile as sim_compile, run, Mode};
-use rtce::simdef::{NumOrExpr, Rotation, SimDef};
+use rtce::simdef::{Measure, NumOrExpr, Rotation, SimDef};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -485,6 +485,12 @@ fn main() {
     assert!(
         matches!(fixed.buffs["shock"].duration, NumOrExpr::Num(d) if d == 2.0),
         "the fix run must keep shock ON the cast grid"
+    );
+    assert_eq!(
+        fixed.defaults.measure,
+        Measure::CastStart,
+        "the injection must actually set the knob — a silent no-op replace \
+         would re-pin the footgun numbers and call them fixed"
     );
     let fixed_plan = sim_compile(&plan, &fixed, &rotation).expect("simdef compiles");
     let unfooted = run(&plan, &fixed_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");

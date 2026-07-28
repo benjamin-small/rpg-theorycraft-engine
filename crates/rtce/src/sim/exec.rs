@@ -798,14 +798,23 @@ struct WorldSnapshot {
     /// effects-list entry drives cannot leak into a later entry's
     /// capture (the 0.3.0 400-vs-800 list-reorder incoherence).
     phase: Phase,
-    /// Evaluated `hits_per_use` (`1.0` when the map omits it); `None` for
-    /// a utility action — there is no damage query to run.
-    hits: Option<f64>,
+    /// The damage half of the measurement — `Some` exactly when the
+    /// action deals damage, so this field IS the "is this cast damaging"
+    /// discriminant everywhere a snapshot is in hand (one spelling, not
+    /// two; `None` for a utility action).
+    damage: Option<DamageMeasure>,
+}
+
+/// The damage-specific half of a [`WorldSnapshot`]: what a damaging
+/// cast's queries need beyond the world itself, measured at the same
+/// instant.
+struct DamageMeasure {
+    /// Evaluated `hits_per_use` (`1.0` when the map omits it).
+    hits: f64,
     /// `Mode::Expected` only, and only when the caller rolls procs: the
     /// probability THIS hit crits, used to weight `on_crit` accumulation.
-    /// `None` in `Mode::MonteCarlo` (the branch is sampled outright), for
-    /// a proc-triggered free cast (which rolls no procs), and for a
-    /// utility action.
+    /// `None` in `Mode::MonteCarlo` (the branch is sampled outright) and
+    /// for a proc-triggered free cast (which rolls no procs).
     crit_chance: Option<f64>,
 }
 
@@ -1616,7 +1625,7 @@ impl<'a> Sim<'a> {
     /// this cast's proc rolls. Both halves are deliberate:
     ///
     /// - The applying cast does not benefit from the buff it applies —
-    ///   the same rule [`Sim::measure_cast`] already states for procs.
+    ///   the same rule [`Sim::capture_world`] already states for procs.
     /// - A proc rolled by this cast SEES the buff (`buff.<applied>` reads
     ///   `1` in its `chance`). Intrinsic effects of the action resolve
     ///   before effects TRIGGERED by it, which also means the whole list
@@ -2223,11 +2232,12 @@ impl<'a> Sim<'a> {
             });
         }
         if ct == 0.0 {
-            // An instant cast: begin and complete coincide, so the
-            // completion transaction measures it whatever the resolved
-            // `measure` says — the two instants are identical by
-            // construction (see [`Measure`]), and the capture keeps its
-            // documented intra-instant position there.
+            // An instant cast is ALWAYS measured at the completion
+            // position, whatever the resolved `measure` says: the two
+            // share the wall-clock instant, and the capture keeps the
+            // completion transaction's documented intra-instant position
+            // (post-`gain`, post-`casts` increment) — see [`Measure`]
+            // for the `casts.<self>` discontinuity this implies.
             self.complete_cast(action)
         } else {
             if self.sim_plan.actions[action].measure == Measure::CastStart {
@@ -2251,6 +2261,13 @@ impl<'a> Sim<'a> {
         // taken FIRST, so nothing later in this transaction (a proc's
         // free cast, notably) could ever see a stale one.
         let pending = self.pending_snapshot.take();
+        // The consumer half of `begin_cast`'s producer assert: a pending
+        // snapshot can only belong to THIS cast (one in flight), and
+        // this cast only produced one if its resolved measure says so.
+        debug_assert!(
+            pending.is_none() || self.sim_plan.actions[action].measure == Measure::CastStart,
+            "a pending snapshot must belong to a cast_start-measured cast"
+        );
         self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
 
@@ -2263,13 +2280,14 @@ impl<'a> Sim<'a> {
             None => self.capture_world(action, true)?,
         };
         if let Some(s) = &snap {
-            if let Some(hits) = s.hits {
+            if let Some(d) = &s.damage {
                 let dmg = if self.rng.is_some() {
-                    let (dmg, crit) = self.eval_action_damage_sampled(&s.build, &s.phase, hits)?;
+                    let (dmg, crit) =
+                        self.eval_action_damage_sampled(&s.build, &s.phase, d.hits)?;
                     is_crit = crit;
                     dmg
                 } else {
-                    self.eval_action_damage(&s.build, &s.phase, hits)?
+                    self.eval_action_damage(&s.build, &s.phase, d.hits)?
                 };
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
@@ -2282,17 +2300,20 @@ impl<'a> Sim<'a> {
         // triggers — see `Sim::apply_action_buffs` for the ordering and
         // for the one measured world its captures read.
         self.apply_action_buffs(action, snap.as_ref())?;
-        let damaging = self.sim_plan.actions[action].damage.is_some();
+        // ONE spelling of "was this cast damaging": the measurement's own
+        // damage half (a damaging action always has a snapshot, so `snap`
+        // being `None` — a utility action without effects — answers no).
+        let damage_measure = snap.as_ref().and_then(|s| s.damage.as_ref());
         if self.rng.is_some() {
             self.roll_procs_mc(Trigger::OnCast, true, action)?;
-            if damaging {
+            if damage_measure.is_some() {
                 self.roll_procs_mc(Trigger::OnHit, true, action)?;
                 self.roll_procs_mc(Trigger::OnCrit, is_crit, action)?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0, action)?;
-            if damaging {
-                let crit_chance = snap.as_ref().and_then(|s| s.crit_chance).expect(
+            if let Some(d) = damage_measure {
+                let crit_chance = d.crit_chance.expect(
                     "capture_world(.., true) fills crit_chance for a \
                      damaging action in EV mode",
                 );
@@ -2313,8 +2334,8 @@ impl<'a> Sim<'a> {
     /// [`Sim::complete_cast`] calls it in the completion transaction
     /// (`cast_complete`, the default), and [`Sim::begin_cast`] calls it
     /// at cast start for a SCHEDULED `cast_start` cast. An instant cast
-    /// always measures in the completion transaction — the two instants
-    /// coincide there (see [`Measure`]).
+    /// is always measured at the completion position, whatever `measure`
+    /// says (see [`Measure`] for the discontinuity this implies).
     ///
     /// Everything is taken TOGETHER, here: `damage.stats` (and
     /// `hits_per_use`) are evaluated once into one overlay, the effective
@@ -2360,27 +2381,27 @@ impl<'a> Sim<'a> {
             return Ok(None);
         }
         self.refresh_time_varying_slots();
-        let (build, hits, crit_chance) = if damaging {
+        let phase = self.effective_phase.clone();
+        let (build, damage) = if damaging {
             let build = self.overlay_build_for_action(action, now)?;
             let hits = self.eval_hits_per_use(action, now)?;
             let crit_chance = if needs_crit_chance && self.rng.is_none() {
-                Some(self.eval_action_crit_chance(&build)?)
+                Some(self.eval_action_crit_chance(&build, &phase)?)
             } else {
                 None
             };
-            (build, Some(hits), crit_chance)
+            (build, Some(DamageMeasure { hits, crit_chance }))
         } else {
             // A utility action with effects: its captures read the plain
             // effective build — the frozen-build rule P7d set, captured
             // HERE so both action paths share one code path (and, P8c,
             // one phase).
-            (self.effective_damage_build.clone(), None, None)
+            (self.effective_damage_build.clone(), None)
         };
         Ok(Some(WorldSnapshot {
             build,
-            phase: self.effective_phase.clone(),
-            hits,
-            crit_chance,
+            phase,
+            damage,
         }))
     }
 
@@ -2459,14 +2480,17 @@ impl<'a> Sim<'a> {
     /// of this cast — see [`Plan::crit_chance`]'s docs for the naming
     /// convention and the fail-soft `0.0` when this game has no `"crit"`
     /// event. Used to weight `on_crit` proc accumulation (see
-    /// [`Sim::roll_procs_ev`]'s doc comment).
-    ///
-    /// Reads the LIVE `effective_phase`, which is correct by
-    /// construction: the only caller is [`Sim::capture_world`], at the
-    /// measured instant — where the live phase IS the snapshot's.
-    fn eval_action_crit_chance(&mut self, build: &BuildState) -> Result<f64, PlanError> {
-        self.plan
-            .crit_chance(build, &self.effective_phase, &mut self.scratch.eval)
+    /// [`Sim::roll_procs_ev`]'s doc comment). Like its two damage-query
+    /// siblings, it takes the measured world's phase explicitly — the
+    /// caller ([`Sim::capture_world`]) has the snapshot's clone in hand,
+    /// so the one-world invariant is mechanized rather than resting on a
+    /// single-caller prose claim.
+    fn eval_action_crit_chance(
+        &mut self,
+        build: &BuildState,
+        phase: &Phase,
+    ) -> Result<f64, PlanError> {
+        self.plan.crit_chance(build, phase, &mut self.scratch.eval)
     }
 
     /// MC mode only: `damage_objective × hits` for one completed cast,
@@ -2718,8 +2742,8 @@ impl<'a> Sim<'a> {
         // comment).
         let snap = self.capture_world(action, false)?;
         if let Some(s) = &snap {
-            if let Some(hits) = s.hits {
-                let dmg = self.eval_action_damage(&s.build, &s.phase, hits)?;
+            if let Some(d) = &s.damage {
+                let dmg = self.eval_action_damage(&s.build, &s.phase, d.hits)?;
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
                 self.actions[action].damage += dmg;
@@ -7731,8 +7755,7 @@ mod tests {
             let same_phase = WorldSnapshot {
                 build: overlaid.clone(),
                 phase: sim.effective_phase.clone(),
-                hits: None,
-                crit_chance: None,
+                damage: None,
             };
             assert!(
                 close(sim.eval_objective(obj, Some(&same_phase)).unwrap(), 150.0),
@@ -7747,8 +7770,7 @@ mod tests {
             let other_phase = WorldSnapshot {
                 build: overlaid,
                 phase: boosted_phase,
-                hits: None,
-                crit_chance: None,
+                damage: None,
             };
             assert!(
                 close(sim.eval_objective(obj, Some(&other_phase)).unwrap(), 300.0),
@@ -9909,6 +9931,282 @@ mod tests {
                  at its own instant (100 would mean it was frozen to the \
                  outer cast's snapshot)",
                 report.actions["comet"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // `hits_per_use` is part of the measurement, at the SAME instant
+        // as the rest of it (fix-round pin: re-evaluating it at
+        // completion survived every other test, because no fixture gave
+        // it a time-dependent expression). `volley` is a 1s cast with a
+        // LITERAL `dmg: 10` and `hits_per_use: "time"` over 5s — the
+        // hits channel is the only thing that can move:
+        //   cast_complete (default): 10 × (1+2+3+4+5) = 150
+        //   cast_start:              10 × (0+1+2+3+4) = 100
+        // Mutation: read `hits_per_use` at completion under cast_start →
+        // the 100 becomes 150.
+        // --------------------------------------------------------------
+        #[test]
+        fn hits_per_use_is_measured_at_the_same_instant_as_the_overlay() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{ "volley": {{ "cast_time": "1",
+                             "damage": {{ "stats": {{ "dmg": 10.0,
+                                                      "hits_per_use": "time" }} }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "volley" } ] }"#;
+            let complete = ev_json(&plan, &build, &with_defaults(""), rot, 5);
+            assert!(
+                close(complete.total.total_damage, 150.0),
+                "default: got {} — want 10×(1+2+3+4+5), hits read at the \
+                 completion instants",
+                complete.total.total_damage
+            );
+            let start = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "measure": "cast_start" },"#),
+                rot,
+                5,
+            );
+            assert!(
+                close(start.total.total_damage, 100.0),
+                "cast_start: got {} — want 10×(0+1+2+3+4); the hit count is \
+                 part of the ONE measurement, taken at the measured instant \
+                 (150 would mean hits_per_use was re-read at completion)",
+                start.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The cast-start capture's INTRA-instant position: AFTER the cost
+        // is paid (and the cooldown armed) — the world the cast leaves
+        // behind as it starts, exactly as `Measure::CastStart`'s rustdoc
+        // states. `caster` costs 40 mana of a 100-cap pool regenerating
+        // 5/s, casts once (1000s cooldown), and its overlay reads the
+        // paying resource: `dmg = mana`.
+        //   cast_start:  measured at t=0, post-cost → 100 − 40 = 60
+        //   pre-cost mutant:                          100
+        //   cast_complete (the default contrast): t=1, post-cost plus 1s
+        //     of regen → 60 + 5 = 65
+        // The three values are pairwise distinct, so this pins the
+        // position within the instant AND (again) the instant itself.
+        // --------------------------------------------------------------
+        #[test]
+        fn the_cast_start_capture_is_taken_after_the_cost_is_paid() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let simdef = |measure: &str| {
+                format!(
+                    r#"{{ "resources": {{ "mana": {{ "max": "100",
+                                                     "regen_per_sec": "5" }} }},
+                         "actions": {{ "caster": {{ "cast_time": "1",
+                             "cooldown": 1000.0, {measure}
+                             "cost": {{ "mana": 40.0 }},
+                             "damage": {{ "stats": {{ "dmg": "mana" }} }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "caster" } ] }"#;
+            let start = ev_json(
+                &plan,
+                &build,
+                &simdef(r#""measure": "cast_start","#),
+                rot,
+                10,
+            );
+            assert_eq!(start.actions["caster"].casts, 1);
+            assert!(
+                close(start.actions["caster"].damage, 60.0),
+                "cast_start: got {} — want 100 − 40, the POST-cost pool \
+                 (100 would mean the capture ran before pay_cost; 65 that \
+                 it ran at completion)",
+                start.actions["caster"].damage
+            );
+            let complete = ev_json(&plan, &build, &simdef(""), rot, 10);
+            assert!(
+                close(complete.actions["caster"].damage, 65.0),
+                "default: got {} — want 60 + 5×1s regen at completion",
+                complete.actions["caster"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The DAMAGE query's phase half under cast_start, in-suite (the
+        // example-level 1837.5 → 2175 contrast in `poe2_triggers` was
+        // the only witness before this pin — every other measurement
+        // fixture here is condition-free). `tag` (instant, utility)
+        // applies `mark` (drives `marked`, 0.5s) and the decision chain
+        // then begins `beam` (1s, cast_start) at the SAME t=0 — so mark
+        // is live at beam's cast start and EXPIRED by its completion.
+        //   hit = dmg × (1 + marked), dmg 100:
+        //   cast_start:              measured at t=0, marked 1 → 200
+        //   cast_complete (default): measured at t=1, marked 0 → 100
+        // Mutation: evaluating beam's damage against the LIVE phase at
+        // completion (instead of the snapshot's) sends the 200 to 100.
+        // --------------------------------------------------------------
+        #[test]
+        fn the_damage_querys_phase_half_reads_the_snapshot_under_cast_start() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "conditions": ["marked"],
+                     "pipeline": [ { "name": "hit", "expr": "dmg * (1 + marked)" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let simdef = |measure: &str| {
+                format!(
+                    r#"{{ "actions": {{
+                           "tag":  {{ "cast_time": "0", "cooldown": 1000.0,
+                                      "effects": [ {{ "apply_buff": "mark" }} ] }},
+                           "beam": {{ "cast_time": "1", "cooldown": 1000.0, {measure}
+                                      "damage": {{ "stats": {{}} }} }} }},
+                         "buffs": {{ "mark": {{ "duration": 0.5,
+                                                "conditions": {{ "marked": 1.0 }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "tag" }, { "action": "beam" } ] }"#;
+            let start = ev_json(
+                &plan,
+                &build,
+                &simdef(r#""measure": "cast_start","#),
+                rot,
+                10,
+            );
+            assert!(
+                close(start.actions["beam"].damage, 200.0),
+                "cast_start: got {} — want 100 × (1 + 1), the snapshot's \
+                 phase carrying `marked` from t=0 (100 would mean the \
+                 damage query read the LIVE phase at completion, where \
+                 mark is long expired)",
+                start.actions["beam"].damage
+            );
+            let complete = ev_json(&plan, &build, &simdef(""), rot, 10);
+            assert!(
+                close(complete.actions["beam"].damage, 100.0),
+                "default: got {} — mark expired at t=0.5, before the \
+                 completion measurement",
+                complete.actions["beam"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // An INSTANT cast is measured at the completion position even
+        // under cast_start — the two share the wall-clock instant, and
+        // the completion transaction's intra-instant position wins
+        // (post-`gain`, post-`casts` increment). The discriminating
+        // observable is `casts.<self>` counting from 1: `pulse` is a
+        // ZERO-time cast on a 1s cooldown over 3s (casts at t=0,1,2 —
+        // the t=3 wake is at the horizon, where nothing begins), with
+        // `dmg = 100 * casts.pulse`:
+        //   either measure: 100 × (1+2+3) = 600
+        // and the equality with the default run is asserted alongside
+        // the literal. Mutation: capturing at the begin position for an
+        // instant cast (pre-increment) → 100 × (0+1+2) = 300. NB the
+        // epsilon-cast_time discontinuity is deliberate and documented
+        // on `Measure`: at cast_time 1 this same expression pins 300
+        // (`casts_self_excludes_the_in_flight_cast_under_cast_start`).
+        // --------------------------------------------------------------
+        #[test]
+        fn an_instant_cast_is_measured_at_the_completion_position_even_under_cast_start() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{ "pulse": {{ "cast_time": "0", "cooldown": 1.0,
+                             "damage": {{ "stats": {{ "dmg": "100 * casts.pulse" }} }} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "pulse" } ] }"#;
+            let start = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "measure": "cast_start" },"#),
+                rot,
+                3,
+            );
+            assert_eq!(start.actions["pulse"].casts, 3);
+            assert!(
+                close(start.total.total_damage, 600.0),
+                "instant + cast_start: got {} — want 100×(1+2+3), the \
+                 completion position (300 would mean the capture ran at \
+                 the begin position, pre-increment)",
+                start.total.total_damage
+            );
+            let complete = ev_json(&plan, &build, &with_defaults(""), rot, 3);
+            assert!(
+                close(start.total.total_damage, complete.total.total_damage),
+                "for an instant cast the two measures must be the same \
+                 number: {} vs {}",
+                start.total.total_damage,
+                complete.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The EV `on_crit` weight under cast_start: part of the ONE
+        // measurement, read off the snapshot's build and phase at the
+        // measured instant. `zapper`'s overlay sets
+        // `crit_chance = 100 − 100 * time`, so at its cast start (t=0)
+        // the hit is a CERTAIN crit and at its completion (t=1) it
+        // cannot crit at all; the base build's crit_chance is 0.
+        //   damage: 100 × (1 + P(crit)×(factor−1)) = 100 × 2 = 200
+        //   `surge` (on_crit, chance 1): acc += 1 × weight 1 → fires → 1
+        // Mutation: evaluating the crit weight at completion against the
+        // live world → weight 0 → surge never fires (and 100 damage
+        // would mean the damage query moved too).
+        // --------------------------------------------------------------
+        #[test]
+        fn the_ev_on_crit_weight_is_part_of_the_cast_start_measurement() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "crit_chance"],
+                     "events": { "crit": { "chance": "crit_chance / 100",
+                                            "factor": "2" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * event_factors",
+                                     "branched": true } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "crit_chance": 0.0 } }"#)
+                    .unwrap();
+            let simdef = r#"{
+              "actions": {
+                "zapper": { "cast_time": "1", "cooldown": 1000.0,
+                            "measure": "cast_start",
+                            "damage": { "stats": { "crit_chance": "100 - 100 * time" } } }
+              },
+              "buffs": { "spark": { "duration": 1.0 } },
+              "procs": {
+                "surge": { "trigger": "on_crit", "chance": "1",
+                           "effects": [ { "apply_buff": "spark" } ] }
+              },
+              "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "zapper" } ] }"#;
+            let report = ev_json(&plan, &build, simdef, rot, 10);
+            assert!(
+                close(report.actions["zapper"].damage, 200.0),
+                "zapper: got {} — want 100 × 2, a certain crit in the \
+                 cast-start world",
+                report.actions["zapper"].damage
+            );
+            assert_eq!(
+                report.proc_counts["surge"], 1,
+                "surge must fire once: the on_crit weight is the \
+                 snapshot's (0 fires would mean the weight was read at \
+                 completion, where the overlay's crit_chance is 0)"
             );
         }
     }

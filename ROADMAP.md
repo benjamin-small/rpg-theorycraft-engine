@@ -114,8 +114,13 @@
       overlay to build — `overlay_build_for_action` still clones the full
       effective build today). The second half of this item is DONE as a
       side effect of P7b: the EV `on_crit` crit-chance query no longer
-      builds a second overlay — `Sim::measure_cast` builds ONE per cast
-      and both queries read it. It is still a second `Plan` call (folding
+      builds a second overlay — `Sim::capture_world` (né `measure_cast`)
+      builds ONE per cast and both queries read it. P8c added one `Phase`
+      clone per measured cast (the `WorldSnapshot`'s phase half) —
+      accepted: the utility action's build clone MOVED into the same
+      capture rather than multiplying, and the phase clone is what buys
+      the one-world invariant; fold it into a future cache pass with the
+      overlay-build one if a bench ever surfaces it. It is still a second `Plan` call (folding
       it into `eval_action_damage`'s call remains open), but it is no
       longer a second overlay, and it now happens at the cast's own
       instant rather than after the cast's procs — a correctness fix, not
