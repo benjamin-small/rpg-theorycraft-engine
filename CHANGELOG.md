@@ -7,6 +7,54 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added — `event_order` (P8d)
+
+```jsonc
+{ "defaults": { "event_order": "scheduled" } }   // | "completions_first"
+```
+
+Which of two COINCIDENT queue events resolves first is now config.
+SimDef-global ONLY, by design — ordering is a property of the queue, and
+a collision involves two entities, so a per-spell tie-break would be
+incoherent (the rationale lives on the `EventOrder` type).
+
+- **`scheduled`** (default) — the honest name for the long-standing
+  behavior: coincident events resolve in scheduling (`seq`) order.
+  "Expiry before completion" was never a rule, only incidental — an
+  expiry usually holds the lower `seq` because it was scheduled at the
+  buff's application, earlier than the completion. Bit-identical to
+  0.3.0: the rank the queue now carries is a CONSTANT under this
+  setting (`QueueItem` orders by `(time, class_rank, seq)`, the rank
+  computed at push), proven by the untouched suite and the
+  byte-identical `diablo4_rotation` MC block.
+- **`completions_first`** — every `CastComplete` outranks every
+  coincident `BuffExpire`/`PhaseBoundary`/`Wake`; within a class, `seq`
+  still decides, so seeded Monte Carlo stays deterministic under every
+  setting.
+- **The cast-grid footgun gains its second config fix** (`sim` module
+  docs, "A buff expiring on the cast grid"): P8c's
+  `measure: "cast_start"` moves the MEASUREMENT off the collision;
+  `event_order: "completions_first"` moves the COLLISION itself — the
+  completing cast measures WITH its still-live buff and its
+  reapplication makes the pending expiry stale. `poe2_triggers` runs
+  both against the same on-grid 2.0s shock: each alone restores bolt
+  damage 1837.5 → 2175 at the same 0.95 uptime.
+- **Pinned consequence, stated as designed:** the horizon cast of a
+  zero-weight final phase — whose `scheduled` attribution (boundary first:
+  900 / 250 / 1150) the 0.3.0 pin recorded as an incidental consequence
+  of `seq` order — flips under `completions_first` to 1000 / 0: the
+  completion resolves before the boundary and is measured under, and
+  attributed to, the OLD phase. Horizon-drain semantics (P7e-T2) are
+  unchanged: the knob decides which event at `t == duration` resolves
+  first, never whether it resolves.
+- Rust API: `SimDefaults` gains the public `event_order: EventOrder`
+  field (source-breaking for exhaustive struct literals; neither
+  consumer constructs one). `EventOrder` is `#[non_exhaustive]` from
+  birth, for `Measure`'s reason — a third policy (an explicit
+  expiries-first, a per-class rank table) is plausible and would land on
+  this enum. `sim::SimPlan` (already `#[non_exhaustive]`) carries the
+  resolved order.
+
 ### Fixed — one world per measured cast (P8c: the phase's ONE deliberate behavior change)
 
 Through 0.3.0, a snapshot `tick_objective` captured by an ACTION's
@@ -62,7 +110,8 @@ byte-identical, `diablo4_rotation`'s EV and MC blocks included.
 ```
 
 - **`defaults`** — package-wide semantic defaults, the new home for
-  P8's knobs (`proc_rolls` and `event_order` join it in later slices).
+  P8's knobs (`event_order` joined in P8d, above; `proc_rolls` joins in
+  a later slice).
   Omitted (every 0.2.0/0.3.0 config) = every knob at its 0.3.0-behavior
   value; the block round-trips away unless it carries content, and it
   gets the full P8a unknown-key treatment ("unknown field `measur` on

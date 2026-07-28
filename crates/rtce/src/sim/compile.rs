@@ -7,7 +7,9 @@
 use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
-use crate::simdef::{EffectDef, Measure, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger};
+use crate::simdef::{
+    EffectDef, EventOrder, Measure, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger,
+};
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
 /// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
@@ -296,6 +298,13 @@ pub struct SimPlan {
     pub rules: Vec<CompiledRule>,
     /// Index into the `Plan`'s objective slice for `damage_objective`.
     pub damage_objective: usize,
+    /// The coincident-event ordering for the whole run (P8d) —
+    /// [`crate::simdef::SimDefaults::event_order`], carried whole rather
+    /// than resolved per entity (it is SimDef-global by design; see
+    /// [`EventOrder`] for why a per-entity override would be
+    /// incoherent). The executor reads THIS field at every event push,
+    /// never the `defaults` block.
+    pub event_order: EventOrder,
 }
 
 /// Compile-time symbol table over the extended sim space: the `Plan`'s own
@@ -935,6 +944,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         procs,
         rules,
         damage_objective,
+        event_order: simdef.defaults.event_order,
     })
 }
 

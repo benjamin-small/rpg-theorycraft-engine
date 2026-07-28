@@ -27,7 +27,7 @@ use rtce::gamedef::GameDef;
 use rtce::plan::compile as plan_compile;
 use rtce::scenario::Scenario;
 use rtce::sim::{compile as sim_compile, run, Mode};
-use rtce::simdef::{Measure, NumOrExpr, Rotation, SimDef};
+use rtce::simdef::{EventOrder, Measure, NumOrExpr, Rotation, SimDef};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -359,8 +359,9 @@ fn main() {
     // ══════ Contrast: shock on the cast grid — the invisible loss ══════
     //
     // This is the measurement behind `sim`'s "a buff expiring on the cast
-    // grid" section and the 0.4.0 ordering question in ROADMAP, pinned
-    // here so the number those docs quote cannot rot.
+    // grid" section, pinned here so the number those docs quote cannot
+    // rot. (It also settled ROADMAP's ordering question: the answer
+    // became P8d's `event_order` knob, run as the LAST contrast below.)
     //
     // Move `shock` from 2.5s to a flat 2.0s and it expires exactly on the
     // bolt cadence (bolts complete at t = 1,3,…,19; a shock applied at t
@@ -525,6 +526,108 @@ fn main() {
         unfooted.buffs["shock"].uptime
     );
     println!("  measurement pins hold: 1837.5 → 2175 bolt damage, by `defaults.measure` ✓");
+
+    // ══════ Contrast: the OTHER config that fixes it (P8d) ════════════
+    //
+    // Same on-grid 2.0s `shock`, and the measure stays at its default —
+    // this time move the COLLISION instead of the measurement:
+    //
+    //     "defaults": { "event_order": "completions_first" }
+    //
+    // Every `CastComplete` now outranks a coincident `BuffExpire`
+    // (package-wide by design — ordering is a property of the QUEUE, and
+    // a collision involves two entities, so there is deliberately no
+    // per-spell form). The bolt at t=3,5,…,19 resolves BEFORE the shock
+    // expiry sharing its instant, measures WITH the still-live shock,
+    // and its reapplication bumps the buff generation — the pending
+    // expiry is stale, a no-op. Same casts, same 0.95 uptimes, and bolt
+    // is restored to 150 + 9 × 225 = 2175 (total 9870), the 2.5s run's
+    // numbers again. comet is a proc-fired FREE cast at the firing
+    // proc's instant — no queue entry of its own, nothing coincident —
+    // so it is untouched by this knob too (4320).
+    //
+    // The two fixes, side by side (`shock` at the on-grid 2.0
+    // throughout; the no-knob row is the footgun):
+    //
+    //   defaults                          bolt      total   what moved
+    //   (none)                          1837.5     9532.5   —
+    //   measure: "cast_start"           2175.0     9870.0   the measurement
+    //   event_order:
+    //     "completions_first"           2175.0     9870.0   the ordering
+    //
+    // One knob moves the MEASUREMENT off the collision (nothing is
+    // measured at completions anymore); the other moves the COLLISION
+    // itself (the completion wins it). Same number by two mechanisms —
+    // see `Measure` and `EventOrder` for what else each knob moves
+    // before adopting either wholesale (`casts.<self>` and resource
+    // readings for the former; zero-weight-phase attribution for the
+    // latter).
+    let reordered_json = simdef_json.replace(r#""duration": 2.5"#, r#""duration": 2.0"#);
+    let reordered_json = reordered_json.replacen(
+        r#"{
+      "actions""#,
+        r#"{
+      "defaults": { "event_order": "completions_first" },
+      "actions""#,
+        1,
+    );
+    let reordered: SimDef = serde_json::from_str(&reordered_json).expect("valid simdef");
+    assert!(
+        matches!(reordered.buffs["shock"].duration, NumOrExpr::Num(d) if d == 2.0),
+        "the fix run must keep shock ON the cast grid"
+    );
+    assert_eq!(
+        reordered.defaults.event_order,
+        EventOrder::CompletionsFirst,
+        "the injection must actually set the knob — a silent no-op replace \
+         would re-pin the footgun numbers and call them fixed"
+    );
+    assert_eq!(
+        reordered.defaults.measure,
+        Measure::CastComplete,
+        "the measure must stay at its default — this run is the ORDERING \
+         fix, not the measurement fix again"
+    );
+    let reordered_plan = sim_compile(&plan, &reordered, &rotation).expect("simdef compiles");
+    let requeued =
+        run(&plan, &reordered_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
+
+    println!(
+        "\n  with `shock` at 2.0 AND `defaults.event_order: \"completions_first\"`: \
+         bolt {:.4}, total {:.4} — the same restoration, by the ORDERING knob",
+        requeued.actions["bolt"].damage, requeued.total.total_damage
+    );
+    assert_eq!(requeued.actions["bolt"].casts, 10);
+    assert!(
+        close(requeued.actions["bolt"].damage, 2175.0),
+        "bolt under completions_first on the grid: got {} — want 150 + \
+         9×225, every completion resolving before the coincident expiry",
+        requeued.actions["bolt"].damage
+    );
+    assert!(
+        close(requeued.actions["comet"].damage, 4320.0),
+        "comet must be untouched — a free cast has no queue entry to \
+         reorder: got {}",
+        requeued.actions["comet"].damage
+    );
+    assert!(
+        close(requeued.total.total_damage, 9870.0),
+        "got {}",
+        requeued.total.total_damage
+    );
+    assert!(
+        close(requeued.buffs["shock"].uptime, 0.95),
+        "uptime stays 0.95 in every one of these runs: got {}",
+        requeued.buffs["shock"].uptime
+    );
+    assert!(
+        close(requeued.total.total_damage, unfooted.total.total_damage),
+        "the two knobs must land on the SAME number: ordering {} vs \
+         measurement {}",
+        requeued.total.total_damage,
+        unfooted.total.total_damage
+    );
+    println!("  ordering pins hold: 1837.5 → 2175 bolt damage, by `defaults.event_order` ✓");
 
     // ── Monte Carlo ───────────────────────────────────────────────────
     //

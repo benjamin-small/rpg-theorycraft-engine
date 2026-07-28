@@ -137,8 +137,11 @@
 //!   cooldown is armed.
 //! - **Every event already scheduled AT `duration` is processed.** The
 //!   executor drains the whole instant; it does not stop after the first
-//!   event there. Within the instant they resolve in scheduling order
-//!   (the `seq` tiebreaker), exactly as at any other instant.
+//!   event there. Within the instant they resolve in the configured
+//!   coincident-event order ([`crate::simdef::EventOrder`] — scheduling
+//!   order, the `seq` tiebreaker, under the default), exactly as at any
+//!   other instant: the knob decides which event at the horizon resolves
+//!   FIRST, never whether one resolves.
 //! - **Therefore a cast completing exactly at `duration` counts** — its
 //!   `casts`, its damage and its `apply_buff` all land. A cast started at
 //!   `duration − cast_time` is a full cast, not a truncated one.
@@ -154,7 +157,8 @@
 //!
 //! # A buff expiring on the cast grid
 //!
-//! Events sharing an instant resolve in SCHEDULING order (the `seq`
+//! Under the default `event_order` ([`crate::simdef::EventOrder`]),
+//! events sharing an instant resolve in SCHEDULING order (the `seq`
 //! tiebreaker), at the horizon and everywhere else alike. One consequence
 //! of that is the single most likely way to get a wrong number out of
 //! this executor while every diagnostic looks healthy, so it is worth
@@ -201,8 +205,11 @@
 //! looks low while the uptimes look perfect, this is the first thing to
 //! check.
 //!
-//! **And here is the config that fixes it** (P8c): measure the cast at
-//! the instant it BEGINS instead of the instant it completes —
+//! **And here are the TWO configs that fix it** — one moves the
+//! measurement, one moves the ordering; either alone restores the number.
+//!
+//! The measurement-level fix (P8c): measure the cast at the instant it
+//! BEGINS instead of the instant it completes —
 //!
 //! ```json
 //! { "defaults": { "measure": "cast_start" } }
@@ -213,18 +220,27 @@
 //! happens, but nothing is measured at completions anymore: every cast
 //! after the first STARTS strictly inside the previous completion's
 //! window, so the refreshing cast benefits from its own buff again.
-//! `poe2_triggers` runs this as a contrast — `shock` at the on-grid 2.0
-//! with `cast_start` restores bolt damage 1837.5 → 2175, the off-grid
-//! number, at the same 0.95 uptime. See [`crate::simdef::Measure`] for
-//! what else the knob moves (`casts.<self>`, resource readings) before
-//! adopting it wholesale.
 //!
-//! Whether the event ORDERING itself is the right semantics is a separate
-//! question, still recorded in `ROADMAP.md`: a `CastComplete` arguably
-//! ought to resolve before a coincident `BuffExpire`, since a cast that
-//! refreshes a buff at the instant it lapses should plausibly keep it up.
-//! P8c fixes the footgun at the MEASUREMENT level without touching the
-//! queue; the ordering-level knob is P8d's.
+//! The ordering-level fix (P8d): keep the measurement where it is and
+//! reorder the COLLISION instead —
+//!
+//! ```json
+//! { "defaults": { "event_order": "completions_first" } }
+//! ```
+//!
+//! (package-wide ONLY, by design — ordering is a property of the queue,
+//! and a collision involves two entities, so there is deliberately no
+//! per-spell form). Every `CastComplete` now outranks a coincident
+//! `BuffExpire`: the completing cast measures WITH its still-live buff,
+//! and its reapplication makes the pending expiry stale.
+//!
+//! `poe2_triggers` runs BOTH as contrasts against the same on-grid 2.0s
+//! `shock`: each knob alone restores bolt damage 1837.5 → 2175, the
+//! off-grid number, at the same 0.95 uptime. Before adopting either
+//! wholesale, see [`crate::simdef::Measure`] for what else the
+//! measurement knob moves (`casts.<self>`, resource readings) and
+//! [`crate::simdef::EventOrder`] for what else the ordering knob moves
+//! (the zero-weight-final-phase attribution flip).
 //!
 //! # Sim slot layout
 //!

@@ -177,7 +177,12 @@
 //!   have to out-rank same-instant real events via a second ordering key
 //!   ON TOP OF `seq`, which the spec's own "seq tiebreaker" wording does
 //!   not ask for — the duration check gets the identical result with one
-//!   fewer moving part.
+//!   fewer moving part. (P8d later DID build that second key —
+//!   [`QueueItem`]'s `rank`, driving
+//!   [`crate::simdef::SimDefaults::event_order`] — but it exists to let
+//!   CONFIG reorder real coincident events, and is a constant under the
+//!   default; `End` stays folded into the duration check, which needs no
+//!   queue entry at all.)
 //!
 //! # Procs and Monte Carlo (P6d, re-pinned P6 review/I1)
 //!
@@ -242,7 +247,7 @@ use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
 use crate::rng::{mix_seed, Pcg32};
 use crate::scenario::{Phase, Scenario};
-use crate::simdef::{Measure, ReapplyPolicy, Trigger};
+use crate::simdef::{EventOrder, Measure, ReapplyPolicy, Trigger};
 
 /// Execution fidelity for [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,18 +648,49 @@ enum Event {
     Wake,
 }
 
-/// A heap entry: `(time, seq, event)`, ordered so the EARLIEST time pops
-/// first and same-time ties break by ascending `seq` (first scheduled,
-/// first processed) — `BinaryHeap` is a max-heap, so both comparisons are
-/// reversed.
+/// The ordering CLASS of `event` under `order` — the middle key of
+/// [`QueueItem`]'s `(time, class_rank, seq)` order, computed ONCE when
+/// the item is pushed (rank-at-push: `Ord` has no access to config, and
+/// the rank is a pure function of the event kind and the run's
+/// [`EventOrder`], which cannot change mid-run — so baking it onto the
+/// item keeps the comparator self-contained for one byte per entry).
+///
+/// Under [`EventOrder::Scheduled`] this is a CONSTANT — deliberately not
+/// a per-kind table — so the order degenerates to the 0.3.0 `(time,
+/// seq)` order bit-identically (the untouched suite plus the
+/// byte-identical `diablo4_rotation` MC block are the proof). Under
+/// [`EventOrder::CompletionsFirst`], `CastComplete` outranks everything
+/// else coincident; `seq` still breaks all residual ties, so seeded MC
+/// stays deterministic under every setting.
+fn class_rank(event: &Event, order: EventOrder) -> u8 {
+    match order {
+        EventOrder::Scheduled => 0,
+        EventOrder::CompletionsFirst => match event {
+            Event::CastComplete { .. } => 0,
+            Event::BuffExpire { .. } | Event::PhaseBoundary { .. } | Event::Wake => 1,
+        },
+    }
+}
+
+/// A heap entry: `(time, class_rank, seq, event)`, ordered so the
+/// EARLIEST time pops first, same-time ties break by ascending
+/// `class_rank` (the configured [`EventOrder`], baked in at push — see
+/// [`class_rank`]), and residual ties by ascending `seq` (first
+/// scheduled, first processed) — `BinaryHeap` is a max-heap, so all
+/// three comparisons are reversed.
 struct QueueItem {
     time: FTime,
+    /// [`class_rank`] of `event`, computed at push. Constant under the
+    /// default order, which makes this field a no-op tiebreak there.
+    rank: u8,
     seq: u64,
     event: Event,
 }
 impl PartialEq for QueueItem {
     fn eq(&self, other: &Self) -> bool {
-        self.time == other.time && self.seq == other.seq
+        // `rank` included for `Eq`/`Ord` consistency, though `seq` is
+        // unique per run and decides alone in practice.
+        self.time == other.time && self.rank == other.rank && self.seq == other.seq
     }
 }
 impl Eq for QueueItem {}
@@ -665,9 +701,12 @@ impl PartialOrd for QueueItem {
 }
 impl Ord for QueueItem {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Every key is compared other-to-self: the max-heap then pops
+        // the MINIMUM `(time, rank, seq)` first.
         other
             .time
             .cmp(&self.time)
+            .then_with(|| other.rank.cmp(&self.rank))
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }
@@ -1072,6 +1111,7 @@ impl<'a> Sim<'a> {
         self.seq += 1;
         self.heap.push(QueueItem {
             time: FTime(time),
+            rank: class_rank(&event, self.sim_plan.event_order),
             seq: self.seq,
             event,
         });
@@ -4528,7 +4568,13 @@ mod tests {
         // CONSEQUENCE of draining the horizon in scheduling order, not a
         // designed choice about what a zero-width phase should own. Pinned
         // so that a future phase wanting different attribution has to change
-        // this number deliberately instead of drifting into it.
+        // this number deliberately instead of drifting into it. (P8d made
+        // the other attribution AVAILABLE rather than changing this one:
+        // under `defaults.event_order: "completions_first"` the completion
+        // outranks the boundary and the cell flips to 1000 / 0 by design —
+        // `mod event_order`'s
+        // `a_zero_weight_final_phase_cast_flips_to_the_old_phase_under_completions_first`.
+        // THIS pin is the `scheduled` cell, and stays.)
         //
         // Also discriminating for the drain itself: before it, the boundary
         // popped first and the loop broke, dropping the 10th cast entirely
@@ -10207,6 +10253,372 @@ mod tests {
                 "surge must fire once: the on_crit weight is the \
                  snapshot's (0 fires would mean the weight was read at \
                  completion, where the overlay's crit_chance is 0)"
+            );
+        }
+    }
+
+    // ==================================================================
+    // P8d — `defaults.event_order`: which of two COINCIDENT queue
+    // entries resolves first. `scheduled` (default) is the 0.3.0
+    // `(time, seq)` order, bit-identical — proven by the untouched
+    // suite plus the byte-identical `diablo4_rotation` MC block;
+    // `completions_first` ranks every `CastComplete` ahead of every
+    // coincident `BuffExpire`/`PhaseBoundary`/`Wake`, `seq` breaking
+    // ties within a class. Implementation is rank-at-push: `QueueItem`
+    // carries a `class_rank` computed from (event kind, the SimPlan's
+    // order) when the item is pushed, and `Ord` is `(time, class_rank,
+    // seq)` — see `class_rank`'s doc comment.
+    // ==================================================================
+    mod event_order {
+        use super::*;
+        use crate::scenario::Scenario;
+
+        fn dummy(seconds: u32) -> Scenario {
+            serde_json::from_str(&format!(
+                r#"{{ "phases": [ {{ "name": "p", "weight": {seconds} }} ] }}"#
+            ))
+            .unwrap()
+        }
+
+        /// Parse-and-run helper (EV mode) — as in `mod measurement`,
+        /// every fixture is the JSON a config author would write, since
+        /// the knob under test IS config surface.
+        fn ev_json(
+            plan: &Plan,
+            build: &BuildState,
+            simdef_json: &str,
+            rotation_json: &str,
+            scenario: &Scenario,
+        ) -> SimReport {
+            let simdef: SimDef = serde_json::from_str(simdef_json).unwrap();
+            let rotation: Rotation = serde_json::from_str(rotation_json).unwrap();
+            let sim_plan = sim_compile(plan, &simdef, &rotation).unwrap();
+            run(plan, &sim_plan, build, scenario, Mode::Expected).unwrap()
+        }
+
+        /// `hit = dmg * boost` — a product bucket a buff can double, so
+        /// "did the cast measure WITH its buff?" is a factor of 2 in the
+        /// damage number.
+        fn boost_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "buckets": { "boost": { "fold": "product" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * boost" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        // --------------------------------------------------------------
+        // THE CAST-GRID COLLISION, ordering flavor — the exec-level twin
+        // of `examples/poe2_triggers.rs`' shock-at-2.0 contrast (P7e
+        // footgun; `sim` module docs, "A buff expiring on the cast
+        // grid").
+        //
+        // `bolt` (1s cast, 2s cooldown) applies `charge` (duration 2.0 —
+        // EXACTLY the cast cadence; ×2 via the product bucket) at each
+        // completion, under the default `cast_complete` measure. Bolts
+        // begin t=0,2,4,6,8 and complete t=1,3,5,7,9 (10s fight, 5
+        // casts); the `charge` applied at completion t expires at t+2 —
+        // the NEXT completion's instant. Both queue entries share that
+        // instant, and the `BuffExpire` was scheduled at the PREVIOUS
+        // application:
+        //
+        //   scheduled (default): the expiry holds the lower `seq` and
+        //     resolves first — every bolt measures BARE, then re-applies
+        //     the buff it just lost:            5 × 100        =  500
+        //   completions_first: the completion outranks the expiry — the
+        //     bolt measures WITH its still-live charge, and its
+        //     reapplication bumps the buff generation, so the coincident
+        //     expiry is STALE (a no-op):        100 + 4 × 200  =  900
+        //
+        // The uptime is 0.9 in BOTH runs (live [1, 10] — the window
+        // never visibly lapses either way: zero-width gap under
+        // `scheduled`, stale expiry under `completions_first`). That
+        // restates the footgun's signature — the integrated columns
+        // cannot see the collision; only damage moves.
+        //
+        // The explicit `"scheduled"` run is asserted equal to the
+        // omitted-block run — the default × override identity cell.
+        // Mutations this kills: flip the rank table (completions rank 1,
+        // the rest 0) and the 900 collapses to 500; drop the rank from
+        // `QueueItem::cmp` and likewise.
+        // --------------------------------------------------------------
+        #[test]
+        fn completions_first_lets_a_cast_measure_the_buff_it_refreshes_on_the_grid() {
+            let plan = boost_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{ "bolt": {{ "cast_time": "1", "cooldown": 2.0,
+                             "damage": {{ "stats": {{}} }},
+                             "apply_buff": ["charge"] }} }},
+                         "buffs": {{ "charge": {{ "duration": 2.0,
+                             "contributions": [ {{ "bucket": "boost", "value": 100.0 }} ] }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "bolt" } ] }"#;
+            let ten = dummy(10);
+
+            let omitted = ev_json(&plan, &build, &with_defaults(""), rot, &ten);
+            assert_eq!(omitted.actions["bolt"].casts, 5);
+            assert!(
+                close(omitted.total.total_damage, 500.0),
+                "default (scheduled): got {} — want 5×100, every bolt \
+                 measured bare (the expiry resolved first)",
+                omitted.total.total_damage
+            );
+
+            let explicit = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "event_order": "scheduled" },"#),
+                rot,
+                &ten,
+            );
+            assert!(
+                close(explicit.total.total_damage, omitted.total.total_damage),
+                "an explicit `scheduled` must be the omitted default: {} vs {}",
+                explicit.total.total_damage,
+                omitted.total.total_damage
+            );
+
+            let cf = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "event_order": "completions_first" },"#),
+                rot,
+                &ten,
+            );
+            assert_eq!(cf.actions["bolt"].casts, 5, "the cadence is untouched");
+            assert!(
+                close(cf.total.total_damage, 900.0),
+                "completions_first: got {} — want 100 + 4×200, every bolt \
+                 after the first measured WITH its still-live charge",
+                cf.total.total_damage
+            );
+            for (label, r) in [("scheduled", &omitted), ("completions_first", &cf)] {
+                assert!(
+                    close(r.buffs["charge"].uptime, 0.9),
+                    "{label}: uptime must be 0.9 — the integrated column \
+                     cannot see the collision in EITHER order: got {}",
+                    r.buffs["charge"].uptime
+                );
+            }
+        }
+
+        // --------------------------------------------------------------
+        // THE ZERO-WEIGHT-FINAL-PHASE FLIP — the `completions_first`
+        // cell of `mod horizon`'s
+        // `a_zero_weight_final_phase_takes_the_horizon_cast_by_the_seq_rule`
+        // (whose 900 / 250 / 1150 pin stays green untouched: that IS the
+        // `scheduled` cell).
+        //
+        // Same fixture: phases `[main: 10, epilogue: 0]`, epilogue
+        // overriding `dmg` to 250, a 1s `filler` spammed, so a
+        // `PhaseBoundary` (scheduled at construction — the far lower
+        // `seq`) and the 10th `CastComplete` (scheduled at t=9) share
+        // t=10. Under `completions_first` the completion outranks the
+        // boundary regardless of `seq`, so the 10th cast is measured
+        // under — and attributed to — `main`:
+        //
+        //   main     = casts at t=1..10 = 10 × 100 = 1000, dps 100
+        //   epilogue = nothing          =        0, dps 0
+        //   total    = 1000 over 10s    = 100 dps, 10 casts
+        //
+        // The 0.3.0 pin called the old attribution "a CONSEQUENCE of
+        // draining the horizon in scheduling order, not a designed
+        // choice". THIS attribution is the designed one: the knob's
+        // whole meaning is that a completion beats a coincident
+        // boundary, and the flipped cell is pinned as such (spec P8d).
+        // Horizon-drain semantics are unchanged — the cast still
+        // RESOLVES either way; only its measuring phase moves.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_zero_weight_final_phase_cast_flips_to_the_old_phase_under_completions_first() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let scenario: Scenario = serde_json::from_str(
+                r#"{ "phases": [ { "name": "main", "weight": 10 },
+                                 { "name": "epilogue", "weight": 0,
+                                   "stats": { "dmg": 250.0 } } ] }"#,
+            )
+            .unwrap();
+            let simdef = r#"{
+              "defaults": { "event_order": "completions_first" },
+              "actions": { "filler": { "cast_time": "1",
+                                       "damage": { "stats": {} } } },
+              "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "filler" } ] }"#;
+            let report = ev_json(&plan, &build, simdef, rot, &scenario);
+
+            assert_eq!(report.actions["filler"].casts, 10);
+            assert!(
+                close(report.phases[0].total_damage, 1000.0),
+                "main: got {} — want 10×100, the horizon cast measured \
+                 under the OLD phase (900 would mean the boundary still \
+                 resolved first)",
+                report.phases[0].total_damage
+            );
+            assert!(
+                close(report.phases[0].dps, 100.0),
+                "got {}",
+                report.phases[0].dps
+            );
+            assert!(
+                close(report.phases[1].total_damage, 0.0),
+                "epilogue: got {} — want 0, nothing lands in the \
+                 zero-width phase under this ordering",
+                report.phases[1].total_damage
+            );
+            assert!(
+                close(report.phases[1].dps, 0.0),
+                "got {}",
+                report.phases[1].dps
+            );
+            assert!(
+                close(report.total.total_damage, 1000.0),
+                "got {}",
+                report.total.total_damage
+            );
+            assert!(close(report.total.dps, 100.0), "got {}", report.total.dps);
+        }
+
+        // --------------------------------------------------------------
+        // SEEDED MC DETERMINISM under `completions_first`: `seq` still
+        // breaks every residual tie (within a class), so the event
+        // order — and therefore the RNG draw order — stays a pure
+        // function of (config, seed). The fixture is the cast-grid
+        // collision above PLUS a fractional-chance proc, so the run has
+        // real Bernoulli draws AND exercises the reordered instants.
+        // Same seed twice → byte-identical serialized report.
+        // --------------------------------------------------------------
+        #[test]
+        fn mc_same_seed_twice_is_byte_identical_under_completions_first() {
+            let plan = boost_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let simdef_json = r#"{
+              "defaults": { "event_order": "completions_first" },
+              "actions": { "bolt": { "cast_time": "1", "cooldown": 2.0,
+                  "damage": { "stats": {} },
+                  "apply_buff": ["charge"] } },
+              "buffs": { "charge": { "duration": 2.0,
+                  "contributions": [ { "bucket": "boost", "value": 100.0 } ] },
+                         "glow": { "duration": 0.5 } },
+              "procs": { "spark": { "trigger": "on_cast", "chance": "0.5",
+                                    "apply_buff": "glow" } },
+              "damage_objective": "hit" }"#;
+            let simdef: SimDef = serde_json::from_str(simdef_json).unwrap();
+            let rotation: Rotation =
+                serde_json::from_str(r#"{ "rules": [ { "action": "bolt" } ] }"#).unwrap();
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            let mc = || {
+                run(
+                    &plan,
+                    &sim_plan,
+                    &build,
+                    &dummy(10),
+                    Mode::MonteCarlo {
+                        iterations: 16,
+                        seed: 7,
+                    },
+                )
+                .unwrap()
+            };
+            let a = serde_json::to_string(&mc()).unwrap();
+            let b = serde_json::to_string(&mc()).unwrap();
+            assert_eq!(a, b, "same seed twice must be byte-identical");
+        }
+
+        // --------------------------------------------------------------
+        // THE `Wake` CLASS ASSIGNMENT — stated honestly: it has NO
+        // observable consequence, and this test pins WHY-shaped
+        // evidence, not a behavioral difference, because none can be
+        // constructed. A `Wake` coincident with a `CastComplete` means a
+        // cast is in flight at that instant (it completes there), so
+        // `mid_cast` is true until the completion is processed:
+        //
+        //   - Wake first (scheduled): its decision retry hits the
+        //     `mid_cast` early-return in `attempt_decision` — a no-op.
+        //   - Completion first (completions_first): the completion's own
+        //     post-event retry already ran; the Wake's retry re-runs the
+        //     identical decision against unchanged state (a `Wake`
+        //     mutates nothing) — idempotent.
+        //
+        // So the assignment `Wake → rank 1` is pinned as HARMLESS rather
+        // than observable: a fixture that engineers the coincidence
+        // produces byte-identical reports under both orders. The
+        // completions-first-beats-Wake claim is real but invisible;
+        // what IS behaviorally visible for the knob is the
+        // BuffExpire/PhaseBoundary evidence in the two tests above.
+        //
+        // The coincidence, hand-worked (10s fight, `hit = dmg` = 100):
+        //   `nova`   1s cast, 6s cooldown, applies `gate` (duration 1)
+        //   `filler` 4s cast, `when: buff.gate == 0`
+        //   t=0  decision: nova ready → begin (cd ready at 6)
+        //   t=1  nova completes (100), applies gate (expires t=2) →
+        //        retry: nova on cd (candidate 6), filler `when` false →
+        //        Wake SCHEDULED AT t=6            (the lower seq)
+        //   t=2  gate expires → retry: filler eligible → begin, 4s cast
+        //        → CastComplete SCHEDULED AT t=6  (the higher seq)
+        //   t=6  the coincidence: Wake vs filler's completion (100).
+        //        Either order: the completion's retry begins nova
+        //        (cd_ready 6 <= 6), the Wake's retry no-ops.
+        //   t=7  nova completes (100), applies gate → wake at cd 12
+        //   t=8  gate expires → filler begins, would complete t=12 —
+        //        past the horizon, never counted.
+        //   → nova 2 casts, filler 1, total 300, both orders.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_wake_coinciding_with_a_completion_is_ordering_invisible_by_construction() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{
+                           "nova":   {{ "cast_time": "1", "cooldown": 6.0,
+                                        "damage": {{ "stats": {{}} }},
+                                        "apply_buff": ["gate"] }},
+                           "filler": {{ "cast_time": "4",
+                                        "damage": {{ "stats": {{}} }} }}
+                         }},
+                         "buffs": {{ "gate": {{ "duration": 1.0 }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "nova" },
+                                      { "action": "filler",
+                                        "when": "buff.gate == 0" } ] }"#;
+            let ten = dummy(10);
+            let scheduled = ev_json(&plan, &build, &with_defaults(""), rot, &ten);
+            let cf = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "event_order": "completions_first" },"#),
+                rot,
+                &ten,
+            );
+            // The derived timeline actually ran (nova's second cast can
+            // only begin at exactly t=6 — the engineered instant).
+            assert_eq!(scheduled.actions["nova"].casts, 2);
+            assert_eq!(scheduled.actions["filler"].casts, 1);
+            assert!(
+                close(scheduled.total.total_damage, 300.0),
+                "got {}",
+                scheduled.total.total_damage
+            );
+            assert_eq!(
+                serde_json::to_string(&scheduled).unwrap(),
+                serde_json::to_string(&cf).unwrap(),
+                "a Wake/CastComplete coincidence must be invisible to the \
+                 ordering knob — the wake's retry is mid_cast-gated before \
+                 the completion and idempotent after it"
             );
         }
     }

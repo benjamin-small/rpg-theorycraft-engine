@@ -75,8 +75,8 @@ impl SimDef {
 /// `SimDef`, and per-entity overrides (e.g. [`ActionDef::measure`]) win
 /// over it.
 ///
-/// Later P8 slices add `proc_rolls` and `event_order` here; the block is
-/// the intended home for every future knob of this kind.
+/// P8e adds `proc_rolls` here later; the block is the intended home for
+/// every future knob of this kind.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SimDefaults {
     /// The instant a cast's world is measured at, for every action that
@@ -84,6 +84,13 @@ pub struct SimDefaults {
     /// Defaults to [`Measure::CastComplete`], the 0.3.0 behavior.
     #[serde(default)]
     pub measure: Measure,
+    /// The order coincident queue events resolve in, for the WHOLE run —
+    /// see [`EventOrder`] for the full semantics. Defaults to
+    /// [`EventOrder::Scheduled`], the 0.3.0 behavior. SimDef-global by
+    /// design: there is deliberately no per-entity override (the type's
+    /// docs say why a per-spell tie-break would be incoherent).
+    #[serde(default)]
+    pub event_order: EventOrder,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this block.
@@ -95,7 +102,7 @@ impl SimDefaults {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
     /// Staleness here only degrades the did-you-mean, never
     /// correctness — see `config_keys`' module docs ("Staleness").
-    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["measure"];
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["measure", "event_order"];
 
     /// `true` when serializing this block would write nothing a reader
     /// needs: every knob at its default AND no `_` annotations to carry
@@ -177,6 +184,82 @@ pub enum Measure {
     /// it starts. The snapshot then rides the in-flight cast to its
     /// completion transaction, where every `Plan` evaluation reads it.
     CastStart,
+}
+
+/// The order COINCIDENT events resolve in — when two entries of the
+/// executor's event queue share one instant, which one is processed
+/// first (P8d).
+///
+/// Configured package-wide via [`SimDefaults::event_order`]. **Default:
+/// [`EventOrder::Scheduled`]** — the long-standing behavior,
+/// bit-identical for every config that does not name the field.
+///
+/// **SimDef-global ONLY — deliberately no per-entity override.**
+/// Ordering is a property of the QUEUE, not of any one spell: a
+/// collision involves TWO entities (this bolt's completion against that
+/// buff's expiry), so a per-spell tie-break field is incoherent — when
+/// the two entities disagree, neither one's field can claim the
+/// collision.
+///
+/// # The two orders
+///
+/// - [`Scheduled`](EventOrder::Scheduled) is the honest name for the
+///   0.3.0 behavior: coincident events resolve in SCHEDULING order —
+///   first scheduled, first processed (the queue's `seq` tiebreaker).
+///   "Expiry before completion" was never a designed rule, only
+///   incidental: an expiry usually holds the lower `seq` because it was
+///   scheduled back at the buff's APPLICATION, earlier than the
+///   completion (scheduled at cast start).
+/// - [`CompletionsFirst`](EventOrder::CompletionsFirst): every cast
+///   completion outranks every coincident buff expiry, phase boundary,
+///   and rotation wake. Within a class, scheduling order still decides.
+///
+/// # Interactions worth knowing before switching
+///
+/// - **The cast-grid footgun** (`sim` module docs, "A buff expiring on
+///   the cast grid") becomes fixable at the ORDERING level: a cast
+///   completing exactly as its own buff lapses now resolves first,
+///   measures WITH the still-live buff, and its reapplication makes the
+///   pending expiry stale. This complements P8c's measurement-level fix
+///   ([`Measure::CastStart`]): one knob moves the measurement off the
+///   collision, the other moves the collision itself.
+///   `examples/poe2_triggers.rs` runs both against the same on-grid
+///   config and both restore the same number (1837.5 → 2175).
+/// - **The zero-weight-final-phase flip:** a cast completing exactly at
+///   a phase boundary resolves BEFORE the boundary under
+///   `completions_first`, so it is measured under — and attributed to —
+///   the OLD phase. The old attribution (boundary first, the cast lands
+///   in the zero-width phase) was documented as an incidental
+///   consequence of `seq` order; under this knob the flip is DESIGNED,
+///   and pinned as such
+///   (`a_zero_weight_final_phase_cast_flips_to_the_old_phase_under_completions_first`).
+/// - **Horizon-drain semantics are UNCHANGED** (P7e-T2): every event
+///   already scheduled at `t == duration` is still processed, whatever
+///   the order. This knob decides which event at the horizon resolves
+///   FIRST, never WHETHER one resolves.
+/// - **Seeded Monte Carlo stays deterministic under every setting:**
+///   `seq` breaks all residual ties, so a run's event order — and
+///   therefore its RNG draw order — is a pure function of (config,
+///   seed).
+///
+/// `#[non_exhaustive]` for [`Measure`]'s reason: a third policy is
+/// plausible (an EXPLICIT expiries-first, say, or a full per-class rank
+/// table) and would have to land here, so an exhaustive `match`
+/// downstream would make that a breaking change for no gain. Variants
+/// stay freely constructible; only an exhaustive `match` needs a
+/// wildcard arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EventOrder {
+    /// Coincident events resolve in scheduling (`seq`) order — first
+    /// scheduled, first processed. The 0.3.0 behavior, and the default.
+    #[default]
+    Scheduled,
+    /// Every `CastComplete` outranks every coincident buff expiry,
+    /// phase boundary, and rotation wake; within a class, scheduling
+    /// order still decides.
+    CompletionsFirst,
 }
 
 /// A literal number or an expression string, evaluated at a documented
@@ -1855,6 +1938,7 @@ mod tests {
     fn an_omitted_defaults_block_means_cast_complete_and_never_reappears() {
         let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
         assert_eq!(def.defaults.measure, Measure::CastComplete);
+        assert_eq!(def.defaults.event_order, EventOrder::Scheduled);
         assert_eq!(def.defaults, SimDefaults::default());
         assert_eq!(def.actions["fireball"].measure, None);
         let json = serde_json::to_string(&def).unwrap();
@@ -1919,6 +2003,52 @@ mod tests {
         assert!(
             e.to_string()
                 .contains("expected `cast_complete` or `cast_start`"),
+            "got: {e}"
+        );
+    }
+
+    // ==================================================================
+    // P8d — `event_order` at the parse layer.
+    // ==================================================================
+
+    // The omitted-block contract extends to the new knob: every
+    // 0.2.0/0.3.0 config gets `scheduled` (the existing
+    // `an_omitted_defaults_block_means_cast_complete_and_never_reappears`
+    // already asserts whole-struct default equality, which covers it —
+    // this spells the knob out and pins the one-knob-named case).
+    #[test]
+    fn event_order_parses_and_naming_it_leaves_measure_at_its_default() {
+        let def: SimDef = serde_json::from_str(
+            r#"{ "defaults": { "event_order": "completions_first" },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap();
+        assert_eq!(def.defaults.event_order, EventOrder::CompletionsFirst);
+        assert_eq!(
+            def.defaults.measure,
+            Measure::CastComplete,
+            "naming one knob must not disturb the other"
+        );
+
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(round.defaults, def.defaults);
+    }
+
+    // A malformed `event_order` VALUE names the two variants — the same
+    // serde-derived voice as `measure`'s
+    // (`a_malformed_measure_value_names_the_two_variants`). The probe
+    // value is the plausible one: `expires_first` is what today's
+    // incidental "expiry usually wins" behavior LOOKS like it is called.
+    #[test]
+    fn a_malformed_event_order_value_names_the_two_variants() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{ "defaults": { "event_order": "expires_first" },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("expected `scheduled` or `completions_first`"),
             "got: {e}"
         );
     }

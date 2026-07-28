@@ -213,15 +213,35 @@ NOT decided in 0.3.0. Three groups:
       hand-written `Deserialize` (the `TickObjectiveObj` +
       `deny_unknown_fields` machinery is gone). See the CHANGELOG's
       Unreleased migration note.
-- [ ] **Should `CastComplete` out-rank a coincident `BuffExpire`?**
-      (P7e-T2 review) — 0.4.0 question, OPEN, deliberately not decided in
-      0.3.0. Same-instant events resolve in scheduling (`seq`) order, so a
-      buff whose window closes exactly when the cast that would refresh it
-      completes expires FIRST (it was scheduled back at the last
-      application, so it holds the lower `seq`) — and that cast measures
-      itself without the buff it is about to re-apply. Arguably wrong: a
-      cast that refreshes a buff at the instant it lapses should plausibly
-      keep it up, and a player would never describe that frame as a gap.
+- [x] ~~**Should `CastComplete` out-rank a coincident `BuffExpire`?**~~
+      (P7e-T2 review) — **answered BY CONFIG in P8d** (Unreleased):
+      both orders are legitimate semantics, so neither was hardcoded —
+      `defaults.event_order` picks one. `"scheduled"` (the default) is
+      the honest name for the long-standing behavior: same-instant
+      events resolve in scheduling (`seq`) order, so a buff whose window
+      closes exactly when the cast that would refresh it completes
+      expires FIRST (it was scheduled back at the last application, so
+      it holds the lower `seq`) — and that cast measures itself without
+      the buff it is about to re-apply. `"completions_first"` is the
+      other reading: every `CastComplete` outranks every coincident
+      `BuffExpire`/`PhaseBoundary`/`Wake`, `seq` still breaking ties
+      within a class (seeded MC stays deterministic under both). The
+      "second ordering key on the queue" the 0.3.0 note below said this
+      would need is exactly what was built: `QueueItem` orders by
+      `(time, class_rank, seq)`, the rank computed at push and CONSTANT
+      under the default (bit-identical — the byte-identical
+      `diablo4_rotation` MC block is the proof). Pinned consequence,
+      stated as designed: the zero-weight-final-phase horizon cast,
+      whose `scheduled` attribution (boundary first — 900/250/1150) the
+      0.3.0 pin recorded as incidental, flips to 1000/0 under
+      `completions_first` (measured under, and attributed to, the OLD
+      phase). `poe2_triggers` runs the on-grid 2.0s shock under BOTH
+      fixes — `measure: "cast_start"` (P8c) and `event_order:
+      "completions_first"` (P8d) — each restoring 1837.5 → 2175 alone;
+      the PoE2 slices keep their half-integer `representative`
+      durations (the default order is still the default). The
+      original case for deciding, kept below because its table still
+      describes the DEFAULT:
 
       What makes it worth deciding, rather than leaving to config hygiene,
       is that the cost is INVISIBLE in the integrated column a reader would
@@ -253,7 +273,8 @@ NOT decided in 0.3.0. Three groups:
       wants its own slice, a mutation-proven pin, and a migration note —
       `CastComplete`-before-`BuffExpire` cannot be expressed by `seq`
       alone and needs a second ordering key on the queue, the same
-      machinery the P6 design notes declined for `End`.
+      machinery the P6 design notes declined for `End`. (That is the
+      slice P8d became; the default DID NOT change, so no number moved.)
 - [ ] **A per-stack `product` fold mode** (P7c-T1/P7e) — 0.4.0 candidate,
       and only if a real config asks. Today a stacked contribution scales
       its VALUE by the count, so 3 stacks of `+10` in a `product` bucket
