@@ -184,6 +184,11 @@
 #![warn(missing_docs)]
 
 pub mod build;
+/// Fail-closed unknown-config-key rejection (P8a): the shared
+/// did-you-mean walk plus the `_` annotation-namespace carve-out.
+/// Internal — its behavior surfaces through `plan::compile`,
+/// `sim::compile`, and the config structs' `Deserialize` impls.
+mod config_keys;
 pub mod expr;
 pub mod gamedef;
 pub mod plan;

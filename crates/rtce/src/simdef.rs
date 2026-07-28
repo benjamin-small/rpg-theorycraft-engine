@@ -11,6 +11,18 @@ use std::collections::BTreeMap;
 /// The game's SEQUENCING config, as data: resource/action/buff/proc
 /// registries plus the `Plan` objective the sim accumulates per hit.
 /// Compiled once (together with a [`Rotation`]) by `sim::compile`.
+///
+/// # Unknown keys (P8a)
+///
+/// Every struct on this config surface collects keys it does not declare
+/// into a public `extra` field (serde flatten), and `sim::compile` fails
+/// closed on any collected key that does not start with `_` — a
+/// positioned error naming the key, the entity it sits on, and the
+/// nearest real field ("unknown field `tick_objectiv` on buff `poison` —
+/// did you mean `tick_objective`?"). Keys starting with `_` are the
+/// documented ANNOTATION NAMESPACE (`_source`, `_scope`, …): accepted at
+/// every nesting level and carried through serde round-trips, so a
+/// config's provenance notes survive a load-and-save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SimDef {
     /// Resource registry (mana, spirit, …), by name.
@@ -29,6 +41,17 @@ pub struct SimDef {
     /// Name of the `Plan` objective the sim accumulates as
     /// `damage_objective × hits` on every completed damaging cast.
     pub damage_objective: String,
+    /// Unknown keys collected at parse — see the type-level "Unknown
+    /// keys" section: `_`-prefixed annotations survive round-trips here;
+    /// anything else fails closed at `sim::compile`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl SimDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] =
+        &["resources", "actions", "buffs", "procs", "damage_objective"];
 }
 
 /// A literal number or an expression string, evaluated at a documented
@@ -89,13 +112,48 @@ pub struct SimDef {
 /// [`crate::sim::CompiledValue`]: this is a CONFIG type, "number or
 /// expression" is the whole idea, and a caller building or inspecting a
 /// `SimDef` in Rust should be able to match it exhaustively.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum NumOrExpr {
     /// Literal value (backward compatible with 0.2.0 configs).
     Num(f64),
     /// Expression over the sim symbol space.
     Expr(String),
+}
+
+/// Hand-written (P8a) so a malformed value reports what was EXPECTED —
+/// "expected a number (literal) or a string (expression)" — instead of
+/// serde's "data did not match any variant of untagged enum". The
+/// accepted inputs are exactly the untagged derive's: any JSON number →
+/// [`NumOrExpr::Num`] (integers via the same lossless-`f64` widening
+/// serde itself applies), any JSON string → [`NumOrExpr::Expr`].
+/// Serialization is unchanged (still the untagged derive above).
+impl<'de> Deserialize<'de> for NumOrExpr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = NumOrExpr;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a number (literal) or a string (expression)")
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<NumOrExpr, E> {
+                Ok(NumOrExpr::Num(v))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<NumOrExpr, E> {
+                Ok(NumOrExpr::Num(v as f64))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<NumOrExpr, E> {
+                Ok(NumOrExpr::Num(v as f64))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<NumOrExpr, E> {
+                Ok(NumOrExpr::Expr(v.to_owned()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<NumOrExpr, E> {
+                Ok(NumOrExpr::Expr(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// `0.0` — the same default the `f64` fields carried before these became
@@ -144,6 +202,16 @@ pub struct ResourceDef {
     pub max: String,
     /// Expression (over stats/conditions) for the per-second regen rate.
     pub regen_per_sec: String,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this resource.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ResourceDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["max", "regen_per_sec"];
 }
 
 /// One action the rotation can cast: timing, resource cost/gain, and an
@@ -266,6 +334,23 @@ pub struct ActionDef {
     /// Fail-closed at `sim::compile`: a name that is not a defined buff.
     #[serde(default)]
     pub apply_buff: Vec<String>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this action.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ActionDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
+        "cast_time",
+        "cooldown",
+        "cost",
+        "gain",
+        "damage",
+        "apply_buff",
+    ];
 }
 
 /// Per-cast stat overrides folded onto the `Plan`'s `BuildState` before the
@@ -304,6 +389,16 @@ pub struct ActionDamage {
     /// is therefore not a guarantee for the phases that also name it.
     #[serde(default)]
     pub stats: BTreeMap<String, NumOrExpr>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming the owning action.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ActionDamage {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["stats"];
 }
 
 /// What happens when a buff is applied while it is ALREADY active — the
@@ -378,9 +473,11 @@ pub enum ReapplyPolicy {
 /// `snapshot` is `true`. An unrecognized key inside the object form is
 /// rejected rather than ignored (a typo'd `"snapshots": true` silently
 /// meaning "live" is precisely the silent wrong answer this crate refuses
-/// to give).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "TickObjectiveRepr", into = "TickObjectiveRepr")]
+/// to give) — with the P8a carve-out that `_`-prefixed keys are the
+/// annotation namespace and pass here as at every other nesting level
+/// (accepted and dropped; this struct stores no `extra`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "TickObjectiveRepr")]
 pub struct TickObjective {
     /// The `Plan` objective whose value is this buff's DoT rate. Must name
     /// an objective of the plan the sim compiles against.
@@ -437,47 +534,20 @@ impl TickObjective {
     }
 }
 
-/// The two JSON shapes [`TickObjective`] accepts, as an untagged enum —
-/// the serde-only representation `TickObjective` converts through, so the
-/// struct itself stays a plain two-field record everywhere else.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The two JSON shapes [`TickObjective`] SERIALIZES to, as an untagged
+/// enum — the serialize-only representation `TickObjective` converts
+/// through, so the struct itself stays a plain two-field record
+/// everywhere else. (Deserialization is the hand-written visitor below,
+/// which replaced 0.3.0's `TickObjectiveObj` + `deny_unknown_fields`
+/// machinery in P8a — the crate-wide unknown-key policy that machinery's
+/// docs wished for now exists, and this type follows it.)
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum TickObjectiveRepr {
     /// `"dot_dps"` — the 0.2.0 shape, always live.
     Name(String),
     /// `{ "objective": "dot_dps", "snapshot": true }`.
-    Object(TickObjectiveObj),
-}
-
-/// The object arm of [`TickObjectiveRepr`], as its own struct because
-/// `deny_unknown_fields` is a struct-level serde attribute — it does not
-/// exist on an enum VARIANT, and silently accepting a typo'd key is not an
-/// option here.
-///
-/// Note the guard is LOCAL to this object, not a crate-wide policy: a
-/// misspelled `tick_objectiv` on [`BuffDef`] itself is still silently
-/// ignored (and silently means "no DoT"), which is the bigger hole. Making
-/// every config struct `deny_unknown_fields` is a crate-wide hygiene
-/// change with its own compatibility question, tracked in ROADMAP for
-/// 0.4.0 rather than smuggled in here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TickObjectiveObj {
-    objective: String,
-    #[serde(default)]
-    snapshot: bool,
-}
-
-impl From<TickObjectiveRepr> for TickObjective {
-    fn from(r: TickObjectiveRepr) -> Self {
-        match r {
-            TickObjectiveRepr::Name(objective) => TickObjective::live(objective),
-            TickObjectiveRepr::Object(o) => TickObjective {
-                objective: o.objective,
-                snapshot: o.snapshot,
-            },
-        }
-    }
+    Object { objective: String, snapshot: bool },
 }
 
 impl From<TickObjective> for TickObjectiveRepr {
@@ -486,13 +556,75 @@ impl From<TickObjective> for TickObjectiveRepr {
     /// `tick_objective` into the object form.
     fn from(t: TickObjective) -> Self {
         if t.snapshot {
-            TickObjectiveRepr::Object(TickObjectiveObj {
+            TickObjectiveRepr::Object {
                 objective: t.objective,
                 snapshot: true,
-            })
+            }
         } else {
             TickObjectiveRepr::Name(t.objective)
         }
+    }
+}
+
+/// Hand-written (P8a): a bare string is the live 0.2.0 form; a map takes
+/// exactly `objective` (required) and `snapshot` (default `false`), plus
+/// `_`-prefixed annotation keys, which are skipped. Any other key is the
+/// fail-closed error "unknown field `…`, expected `objective` or
+/// `snapshot`" — positioned, instead of serde's untagged "did not match
+/// any variant".
+impl<'de> Deserialize<'de> for TickObjective {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TickObjective;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an objective name or `{ \"objective\": …, \"snapshot\": … }` object")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<TickObjective, E> {
+                Ok(TickObjective::live(v))
+            }
+            fn visit_string<E>(self, v: String) -> Result<TickObjective, E> {
+                Ok(TickObjective::live(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<TickObjective, A::Error> {
+                use serde::de::Error as _;
+                let mut objective: Option<String> = None;
+                let mut snapshot: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "objective" => {
+                            if objective.is_some() {
+                                return Err(A::Error::duplicate_field("objective"));
+                            }
+                            objective = Some(map.next_value()?);
+                        }
+                        "snapshot" => {
+                            if snapshot.is_some() {
+                                return Err(A::Error::duplicate_field("snapshot"));
+                            }
+                            snapshot = Some(map.next_value()?);
+                        }
+                        _ if key.starts_with('_') => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                        _ => {
+                            return Err(A::Error::custom(format!(
+                                "unknown field `{key}`, expected `objective` or `snapshot`"
+                            )));
+                        }
+                    }
+                }
+                let objective = objective.ok_or_else(|| A::Error::missing_field("objective"))?;
+                Ok(TickObjective {
+                    objective,
+                    snapshot: snapshot.unwrap_or(false),
+                })
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 
@@ -616,6 +748,25 @@ pub struct BuffDef {
     /// [`ReapplyPolicy`]. Defaults to [`ReapplyPolicy::Refresh`].
     #[serde(default)]
     pub on_reapply: ReapplyPolicy,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this buff (the
+    /// misspelled `tick_objectiv` that 0.3.0 silently read as "no DoT"
+    /// is exactly what this catches).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl BuffDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
+        "duration",
+        "contributions",
+        "conditions",
+        "tick_objective",
+        "max_stacks",
+        "on_reapply",
+    ];
 }
 
 /// `1` — one live instance, the 0.2.0 binary buff (see
@@ -639,6 +790,7 @@ impl Default for BuffDef {
             tick_objective: None,
             max_stacks: default_max_stacks(),
             on_reapply: ReapplyPolicy::default(),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -742,6 +894,23 @@ pub struct ProcDef {
     /// (omit the key) for "every action".
     #[serde(default)]
     pub actions: Option<Vec<String>>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this proc.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl ProcDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
+        "trigger",
+        "chance",
+        "icd",
+        "apply_buff",
+        "cast_action",
+        "actions",
+    ];
 }
 
 /// A priority-list rotation (SimC-style): pure config, drivers may search
@@ -754,6 +923,16 @@ pub struct Rotation {
     /// point. No rule eligible → time advances to the next event (waiting
     /// is modeled, never an infinite loop).
     pub rules: Vec<Rule>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Rotation {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["rules"];
 }
 
 /// One rotation rule: cast `action` when its hard gates pass and (if
@@ -767,6 +946,17 @@ pub struct Rule {
     /// always willing (subject to hard gates).
     #[serde(default)]
     pub when: Option<String>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this rule's position
+    /// and action.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Rule {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["action", "when"];
 }
 
 /// Verbatim from docs/superpowers/specs/2026-07-22-p6-sequencing-design.md
@@ -1029,7 +1219,8 @@ mod tests {
     // Fail-closed: `"snapshots": true` is a typo, not a config that means
     // "live". Silently ignoring the key would silently give the WRONG DoT
     // semantics — the exact class of quiet wrong answer this crate exists
-    // to refuse.
+    // to refuse. P8a: the hand-written map visitor names the key and both
+    // valid fields, instead of serde's "did not match any variant".
     #[test]
     fn an_unknown_key_inside_the_tick_objective_object_is_rejected() {
         let e = serde_json::from_str::<SimDef>(
@@ -1041,12 +1232,46 @@ mod tests {
             }"#,
         )
         .unwrap_err();
-        // An untagged enum reports "no variant matched" rather than the
-        // inner `deny_unknown_fields` message — but it is POSITIONED at
-        // the offending value, which is what makes it actionable.
         assert!(
-            e.to_string().contains("TickObjectiveRepr") && e.to_string().contains("line 4"),
-            "expected a positioned no-variant-matched error, got: {e}"
+            e.to_string()
+                .contains("unknown field `snapshots`, expected `objective` or `snapshot`"),
+            "got: {e}"
+        );
+    }
+
+    // …but the `_` annotation namespace is open INSIDE the object form
+    // too, like at every other nesting level (P8a).
+    #[test]
+    fn an_underscore_key_inside_the_tick_objective_object_is_accepted() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "buffs": { "poison": { "duration": 8.0,
+                                     "tick_objective": { "objective": "dot_dps",
+                                                         "snapshot": true,
+                                                         "_why": "PoE2 ailment" } } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            def.buffs["poison"].tick_objective,
+            Some(TickObjective::snapshot("dot_dps"))
+        );
+    }
+
+    // P8a: a malformed `NumOrExpr` names what was expected instead of
+    // serde's "data did not match any variant of untagged enum NumOrExpr".
+    #[test]
+    fn a_malformed_num_or_expr_names_what_was_expected() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{ "actions": { "a": { "cast_time": "1", "cooldown": true } },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("expected a number (literal) or a string (expression)"),
+            "got: {e}"
         );
     }
 
@@ -1128,6 +1353,11 @@ mod tests {
             bare.apply_buff, derived.apply_buff,
             "serde's per-field defaults must agree with the derived \
              `Default` — a new ActionDef field belongs in BOTH"
+        );
+        assert_eq!(
+            bare.extra, derived.extra,
+            "a config that says nothing collects nothing (P8a) — both \
+             spellings of the default must be the empty map"
         );
     }
 

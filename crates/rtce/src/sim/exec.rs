@@ -2911,11 +2911,13 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -2925,6 +2927,7 @@ mod tests {
         buffs.insert(
             "proc_buff".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(0.5),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -2936,6 +2939,7 @@ mod tests {
         let mut procs = BTreeMap::new();
         procs.insert("spark".to_string(), proc);
         SimDef {
+            extra: Default::default(),
             resources: BTreeMap::new(),
             actions,
             buffs,
@@ -2946,7 +2950,9 @@ mod tests {
 
     fn filler_rotation() -> Rotation {
         Rotation {
+            extra: Default::default(),
             rules: vec![Rule {
+                extra: Default::default(),
                 action: "filler".into(),
                 when: None,
             }],
@@ -3003,11 +3009,13 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -3017,6 +3025,7 @@ mod tests {
         buffs.insert(
             "window".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration,
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -3029,6 +3038,7 @@ mod tests {
         procs.insert(
             "pulse".to_string(),
             ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnCast,
                 chance: "1".into(),
                 icd,
@@ -3039,6 +3049,7 @@ mod tests {
         );
         (
             SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3046,7 +3057,9 @@ mod tests {
                 damage_objective: "hit".into(),
             },
             Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 }],
@@ -3081,6 +3094,7 @@ mod tests {
         resources.insert(
             "mana".to_string(),
             ResourceDef {
+                extra: Default::default(),
                 max: "100".into(),
                 regen_per_sec: "10".into(),
             },
@@ -3091,11 +3105,13 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: cost_map,
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -3103,6 +3119,7 @@ mod tests {
         );
         (
             SimDef {
+                extra: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3110,7 +3127,9 @@ mod tests {
                 damage_objective: "hit".into(),
             },
             Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spender".into(),
                     when: None,
                 }],
@@ -3132,11 +3151,13 @@ mod tests {
         actions.insert(
             "nova".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "0".into(),
                 cooldown,
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -3144,6 +3165,7 @@ mod tests {
         );
         (
             SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3151,7 +3173,9 @@ mod tests {
                 damage_objective: "hit".into(),
             },
             Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "nova".into(),
                     when: None,
                 }],
@@ -3175,6 +3199,7 @@ mod tests {
         resources.insert(
             "mana".to_string(),
             ResourceDef {
+                extra: Default::default(),
                 max: "100".into(),
                 regen_per_sec: "0".into(),
             },
@@ -3187,11 +3212,13 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: cost_map,
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -3200,6 +3227,7 @@ mod tests {
         actions.insert(
             "generator".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -3210,6 +3238,7 @@ mod tests {
         );
         (
             SimDef {
+                extra: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3217,12 +3246,15 @@ mod tests {
                 damage_objective: "hit".into(),
             },
             Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "spender".into(),
                         when: None,
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "generator".into(),
                         when: None,
                     },
@@ -3250,16 +3282,21 @@ mod tests {
         actions.insert(
             "beam".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
-                damage: Some(ActionDamage { stats }),
+                damage: Some(ActionDamage {
+                    extra: Default::default(),
+                    stats,
+                }),
                 apply_buff: Vec::new(),
             },
         );
         (
             SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3267,7 +3304,9 @@ mod tests {
                 damage_objective: "hit".into(),
             },
             Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "beam".into(),
                     when: None,
                 }],
@@ -3349,6 +3388,7 @@ mod tests {
         actions.insert(
             "charge_gen".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(gen_cooldown),
                 cost: BTreeMap::new(),
@@ -3360,11 +3400,13 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
                 damage: Some(ActionDamage {
+                    extra: Default::default(),
                     stats: BTreeMap::new(),
                 }),
                 apply_buff: Vec::new(),
@@ -3374,6 +3416,7 @@ mod tests {
         buffs.insert(
             "charge".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(buff_duration),
                 max_stacks,
                 on_reapply,
@@ -3391,6 +3434,7 @@ mod tests {
         procs.insert(
             "charge_pulse".to_string(),
             ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnCast,
                 chance: pulse_chance.into(),
                 icd: pulse_icd,
@@ -3400,6 +3444,7 @@ mod tests {
             },
         );
         SimDef {
+            extra: Default::default(),
             resources: BTreeMap::new(),
             actions,
             buffs,
@@ -3410,12 +3455,15 @@ mod tests {
 
     fn stack_rotation() -> Rotation {
         Rotation {
+            extra: Default::default(),
             rules: vec![
                 Rule {
+                    extra: Default::default(),
                     action: "charge_gen".into(),
                     when: None,
                 },
                 Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 },
@@ -3461,17 +3509,20 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3479,7 +3530,9 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spam".into(),
                     when: None,
                 }],
@@ -3542,6 +3595,7 @@ mod tests {
             resources.insert(
                 "mana".to_string(),
                 ResourceDef {
+                    extra: Default::default(),
                     max: "100".into(),
                     regen_per_sec: "10".into(),
                 },
@@ -3552,17 +3606,20 @@ mod tests {
             actions.insert(
                 "spender".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost,
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources,
                 actions,
                 buffs: BTreeMap::new(),
@@ -3570,7 +3627,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spender".into(),
                     when: None,
                 }],
@@ -3631,6 +3690,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(10.0),
                     cost: BTreeMap::new(),
@@ -3642,11 +3702,13 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
@@ -3656,6 +3718,7 @@ mod tests {
             buffs.insert(
                 "power_up".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -3673,6 +3736,7 @@ mod tests {
             procs.insert(
                 "empower_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 10.0,
@@ -3682,6 +3746,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3689,12 +3754,15 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "empower".into(),
                         when: None,
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     },
@@ -3744,6 +3812,7 @@ mod tests {
             buffs.insert(
                 "x".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -3756,17 +3825,20 @@ mod tests {
             actions.insert(
                 "a".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3774,7 +3846,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "a".into(),
                     when: Some("buff.x == 1".into()),
                 }],
@@ -3821,6 +3895,7 @@ mod tests {
             actions.insert(
                 "instant_nop".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -3830,6 +3905,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -3837,7 +3913,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "instant_nop".into(),
                     when: None,
                 }],
@@ -3908,6 +3986,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(10.0),
                     cost: BTreeMap::new(),
@@ -3919,11 +3998,13 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
@@ -3935,6 +4016,7 @@ mod tests {
             buffs.insert(
                 "enrage_window".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -3947,6 +4029,7 @@ mod tests {
             procs.insert(
                 "empower_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 10.0,
@@ -3956,6 +4039,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -3963,12 +4047,15 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "empower".into(),
                         when: None,
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     },
@@ -4020,17 +4107,20 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4038,7 +4128,9 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spam".into(),
                     when: None,
                 }],
@@ -4081,11 +4173,13 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: vec!["window".into()],
@@ -4095,6 +4189,7 @@ mod tests {
             buffs.insert(
                 "window".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(buff_duration),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -4105,6 +4200,7 @@ mod tests {
             );
             (
                 SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -4112,7 +4208,9 @@ mod tests {
                     damage_objective: "hit".into(),
                 },
                 Rotation {
+                    extra: Default::default(),
                     rules: vec![Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     }],
@@ -4222,17 +4320,20 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4240,7 +4341,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 }],
@@ -4333,17 +4436,20 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4351,7 +4457,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 }],
@@ -4420,6 +4528,7 @@ mod tests {
             let scenario: Scenario =
                 serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
             let simdef = filler_simdef(ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnHit,
                 chance: "0.3".into(),
                 icd: 0.0,
@@ -4483,6 +4592,7 @@ mod tests {
             let scenario: Scenario =
                 serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
             let simdef = filler_simdef(ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnHit,
                 chance: "0.3".into(),
                 icd: 4.0,
@@ -4549,6 +4659,7 @@ mod tests {
                 serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 200 } ] }"#)
                     .unwrap();
             let simdef = filler_simdef(ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnHit,
                 chance: "0.3".into(),
                 icd: 5.0,
@@ -4608,11 +4719,13 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
@@ -4622,6 +4735,7 @@ mod tests {
             buffs.insert(
                 "proc_buff".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(0.5),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -4634,6 +4748,7 @@ mod tests {
             procs.insert(
                 "crit_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCrit,
                     chance: "1".into(),
                     icd: 0.0,
@@ -4643,6 +4758,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -4650,7 +4766,9 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spam".into(),
                     when: None,
                 }],
@@ -4687,6 +4805,7 @@ mod tests {
             actions.insert(
                 "trigger".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4698,11 +4817,13 @@ mod tests {
             actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
@@ -4712,6 +4833,7 @@ mod tests {
             procs.insert(
                 "free_nuke".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 0.0,
@@ -4721,6 +4843,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4728,7 +4851,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "trigger".into(),
                     when: None,
                 }],
@@ -4766,17 +4891,20 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4784,7 +4912,9 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spam".into(),
                     when: None,
                 }],
@@ -4823,17 +4953,20 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs: BTreeMap::new(),
@@ -4841,7 +4974,9 @@ mod tests {
                 damage_objective: "dps".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "spam".into(),
                     when: None,
                 }],
@@ -4887,6 +5022,7 @@ mod tests {
             let scenario: Scenario =
                 serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
             let simdef = filler_simdef(ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnHit,
                 chance: "0.3".into(),
                 icd: 0.0,
@@ -4959,6 +5095,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4973,6 +5110,7 @@ mod tests {
             actions.insert(
                 "ping".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -4985,6 +5123,7 @@ mod tests {
             buffs.insert(
                 "y".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(1.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -4997,6 +5136,7 @@ mod tests {
             procs.insert(
                 "a_cast".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 0.0,
@@ -5008,6 +5148,7 @@ mod tests {
             procs.insert(
                 "b_gated".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     // Reads sim state `a_cast` moves in this same batch.
                     chance: "casts.ping".into(),
@@ -5018,6 +5159,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -5025,7 +5167,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 }],
@@ -5087,11 +5231,13 @@ mod tests {
             actions.insert(
                 "strike".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: BTreeMap::new(),
                     }),
                     apply_buff: Vec::new(),
@@ -5103,6 +5249,7 @@ mod tests {
             buffs.insert(
                 "focus".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5114,6 +5261,7 @@ mod tests {
             buffs.insert(
                 "marker".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(1.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5126,6 +5274,7 @@ mod tests {
             procs.insert(
                 "focus_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnHit,
                     chance: "1".into(),
                     icd: 100.0, // fires on the first hit only
@@ -5137,6 +5286,7 @@ mod tests {
             procs.insert(
                 "crit_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCrit,
                     chance: "1".into(),
                     icd: 0.0,
@@ -5146,6 +5296,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -5153,7 +5304,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "strike".into(),
                     when: None,
                 }],
@@ -5718,6 +5871,7 @@ mod tests {
             resources.insert(
                 "mana".to_string(),
                 ResourceDef {
+                    extra: Default::default(),
                     max: "50 + buff.boost * 50".into(),
                     regen_per_sec: "10".into(),
                 },
@@ -5726,6 +5880,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
@@ -5738,6 +5893,7 @@ mod tests {
             buffs.insert(
                 "boost".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5750,6 +5906,7 @@ mod tests {
             procs.insert(
                 "boost_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 100.0,
@@ -5759,6 +5916,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources,
                 actions,
                 buffs,
@@ -5766,7 +5924,9 @@ mod tests {
                 damage_objective: "hit".into(),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: "filler".into(),
                     when: None,
                 }],
@@ -6087,25 +6247,33 @@ mod tests {
             simdef.actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(1000.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
-                    damage: Some(ActionDamage { stats: nuke_stats }),
+                    damage: Some(ActionDamage {
+                        extra: Default::default(),
+                        stats: nuke_stats,
+                    }),
                     apply_buff: Vec::new(),
                 },
             );
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "charge_gen".into(),
                         when: None,
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "nuke".into(),
                         when: Some("stacks.charge >= 3".into()),
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     },
@@ -6219,28 +6387,36 @@ mod tests {
                 simdef.actions.insert(
                     name.to_string(),
                     ActionDef {
+                        extra: Default::default(),
                         cast_time: "0".into(),
                         cooldown: NumOrExpr::Num(1000.0),
                         cost: BTreeMap::new(),
                         gain: BTreeMap::new(),
-                        damage: Some(ActionDamage { stats }),
+                        damage: Some(ActionDamage {
+                            extra: Default::default(),
+                            stats,
+                        }),
                         apply_buff: Vec::new(),
                     },
                 );
             }
             let probe = |action: &str| Rule {
+                extra: Default::default(),
                 action: action.into(),
                 when: Some("time >= 2".into()),
             };
             let rotation = Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "charge_gen".into(),
                         when: None,
                     },
                     probe("probe_remaining"),
                     probe("probe_flag"),
                     Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     },
@@ -6457,6 +6633,7 @@ mod tests {
             let scenario: Scenario =
                 serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#).unwrap();
             let simdef = filler_simdef(ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnHit,
                 chance: "0.3".into(),
                 icd: 4.0,
@@ -6556,6 +6733,7 @@ mod tests {
             actions.insert(
                 "opener".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "0".into(),
                     cooldown: NumOrExpr::Num(1000.0),
                     cost: BTreeMap::new(),
@@ -6569,11 +6747,13 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    extra: Default::default(),
                     cast_time: "1".into(),
                     cooldown: NumOrExpr::Num(0.0),
                     cost: BTreeMap::new(),
                     gain: BTreeMap::new(),
                     damage: Some(ActionDamage {
+                        extra: Default::default(),
                         stats: filler_stats,
                     }),
                     apply_buff: Vec::new(),
@@ -6583,6 +6763,7 @@ mod tests {
             buffs.insert(
                 "poison".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(duration),
                     max_stacks,
                     on_reapply,
@@ -6595,6 +6776,7 @@ mod tests {
             procs.insert(
                 "poison_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: chance.into(),
                     icd: 0.0,
@@ -6604,6 +6786,7 @@ mod tests {
                 },
             );
             SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -6614,12 +6797,15 @@ mod tests {
 
         fn dot_rotation() -> Rotation {
             Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "opener".into(),
                         when: None,
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "filler".into(),
                         when: None,
                     },
@@ -6640,6 +6826,7 @@ mod tests {
             simdef.buffs.insert(
                 "empower".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     contributions: vec![Contribution {
                         bucket: "boost".into(),
@@ -6653,6 +6840,7 @@ mod tests {
             simdef.procs.insert(
                 "empower_proc".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "time >= 10".into(),
                     icd: 0.0,
@@ -7463,6 +7651,7 @@ mod tests {
         /// are individually readable off the total.
         fn mark_buff(duration: f64) -> BuffDef {
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: vec![Contribution {
                     bucket: "boost".into(),
@@ -7511,7 +7700,9 @@ mod tests {
 
         fn only(action: &str) -> Rotation {
             Rotation {
+                extra: Default::default(),
                 rules: vec![Rule {
+                    extra: Default::default(),
                     action: action.into(),
                     when: None,
                 }],
@@ -7537,6 +7728,7 @@ mod tests {
         /// for, and the one the D4 example's `frost_nova` now uses.
         fn utility(cast_time: &str, cooldown: f64, apply_buff: Vec<String>) -> ActionDef {
             ActionDef {
+                extra: Default::default(),
                 cast_time: cast_time.into(),
                 cooldown: NumOrExpr::Num(cooldown),
                 cost: BTreeMap::new(),
@@ -7556,11 +7748,15 @@ mod tests {
             apply_buff: Vec<String>,
         ) -> ActionDef {
             ActionDef {
+                extra: Default::default(),
                 cast_time: cast_time.into(),
                 cooldown: NumOrExpr::Num(cooldown),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
-                damage: Some(ActionDamage { stats }),
+                damage: Some(ActionDamage {
+                    extra: Default::default(),
+                    stats,
+                }),
                 apply_buff,
             }
         }
@@ -7568,6 +7764,7 @@ mod tests {
         /// A plain timed buff: no contributions, no conditions, no tick.
         fn plain_buff(duration: f64) -> BuffDef {
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
@@ -7581,6 +7778,7 @@ mod tests {
         /// it, for as long as it is live.
         fn empower_buff(duration: f64) -> BuffDef {
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: vec![Contribution {
                     bucket: "boost".into(),
@@ -7599,6 +7797,7 @@ mod tests {
         /// at its own application.
         fn snapshot_buff(duration: f64) -> BuffDef {
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
@@ -7639,6 +7838,7 @@ mod tests {
             let mut buffs = BTreeMap::new();
             buffs.insert("window".to_string(), window);
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7697,6 +7897,7 @@ mod tests {
             let mut buffs = BTreeMap::new();
             buffs.insert("empower".to_string(), empower_buff(100.0));
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7748,6 +7949,7 @@ mod tests {
             procs.insert(
                 "gate".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "buff.window".into(),
                     icd: 0.0,
@@ -7757,6 +7959,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7819,6 +8022,7 @@ mod tests {
             buffs.insert(
                 "gate".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(3.0),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -7830,6 +8034,7 @@ mod tests {
             buffs.insert(
                 "timed".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Expr("2 * (1 + stacks.gate)".into()),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -7839,6 +8044,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -7922,6 +8128,7 @@ mod tests {
                     procs.insert(
                         "ail_proc".to_string(),
                         ProcDef {
+                            extra: Default::default(),
                             trigger: Trigger::OnCast,
                             chance: "1".into(),
                             icd: 0.0,
@@ -7932,6 +8139,7 @@ mod tests {
                     );
                 }
                 SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8018,6 +8226,7 @@ mod tests {
                 buffs.insert("empower".to_string(), empower_buff(100.0));
                 buffs.insert("ail".to_string(), snapshot_buff(100.0));
                 SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8128,6 +8337,7 @@ mod tests {
                 buffs.insert("mark".to_string(), mark_buff(100.0));
                 buffs.insert("poison".to_string(), snapshot_buff(100.0));
                 SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8227,6 +8437,7 @@ mod tests {
                 procs.insert(
                     "gated".to_string(),
                     ProcDef {
+                        extra: Default::default(),
                         trigger: Trigger::OnCast,
                         chance: "1".into(),
                         icd,
@@ -8236,6 +8447,7 @@ mod tests {
                     },
                 );
                 let simdef = SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8304,6 +8516,7 @@ mod tests {
                 procs.insert(
                     "per_hit".to_string(),
                     ProcDef {
+                        extra: Default::default(),
                         trigger: Trigger::OnHit,
                         chance: chance.into(),
                         icd: 0.0,
@@ -8313,6 +8526,7 @@ mod tests {
                     },
                 );
                 let simdef = SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8380,6 +8594,7 @@ mod tests {
             let plan = marked_dot_plan();
             let build = boosted_dot_build();
             let cond = |v: f64| BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(100.0),
                 contributions: Vec::new(),
                 conditions: [("marked".to_string(), v)].into_iter().collect(),
@@ -8399,6 +8614,7 @@ mod tests {
                 buffs.insert(weak.to_string(), cond(0.25));
                 buffs.insert(strong.to_string(), cond(1.0));
                 let simdef = SimDef {
+                    extra: Default::default(),
                     resources: BTreeMap::new(),
                     actions,
                     buffs,
@@ -8455,6 +8671,7 @@ mod tests {
             buffs.insert(
                 "over".to_string(),
                 BuffDef {
+                    extra: Default::default(),
                     duration: NumOrExpr::Num(5.0),
                     contributions: Vec::new(),
                     conditions: [("marked".to_string(), 5.0)].into_iter().collect(),
@@ -8464,6 +8681,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8527,6 +8745,7 @@ mod tests {
             procs.insert(
                 "echo".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger: Trigger::OnCast,
                     chance: "1".into(),
                     icd: 1000.0,
@@ -8536,6 +8755,7 @@ mod tests {
                 },
             );
             let simdef = SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8596,6 +8816,7 @@ mod tests {
             procs.insert(
                 "spark".to_string(),
                 ProcDef {
+                    extra: Default::default(),
                     trigger,
                     chance: chance.into(),
                     icd: 0.0,
@@ -8605,6 +8826,7 @@ mod tests {
                 },
             );
             SimDef {
+                extra: Default::default(),
                 resources: BTreeMap::new(),
                 actions,
                 buffs,
@@ -8615,12 +8837,15 @@ mod tests {
 
         fn alternating_rotation() -> Rotation {
             Rotation {
+                extra: Default::default(),
                 rules: vec![
                     Rule {
+                        extra: Default::default(),
                         action: "a".into(),
                         when: Some("casts.a == casts.b".into()),
                     },
                     Rule {
+                        extra: Default::default(),
                         action: "b".into(),
                         when: None,
                     },

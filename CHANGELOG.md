@@ -7,7 +7,75 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed — unknown config keys now fail closed (P8a)
+
+Every config struct now REJECTS a key it does not declare, instead of
+silently ignoring it. In 0.3.0 a typo'd key parsed and silently meant
+"field absent" — `"tick_objectiv"` silently meaning "no DoT" was the
+standing example — which for search-loop consumers is a silent wrong
+answer priced across thousands of configs. The error is positioned and
+carries its own remedy:
+
+```
+unknown field `tick_objectiv` on buff `poison` — did you mean `tick_objective`?
+```
+
+**Migration:** rename the key the error names (the did-you-mean is the
+fix in every observed case); when nothing is within edit distance 2 the
+error lists the valid fields instead. Configs with no typos — including
+both consumers' committed gamedefs — pass unmodified.
+
+- **The `_` namespace is the documented annotation escape hatch.** Keys
+  starting with `_` (`_source`, `_scope`, `_shape`, …) are accepted at
+  EVERY nesting level, exactly as the committed fixtures already use
+  them. On the `SimDef`-side structs they are collected into a new
+  public `extra` field (serde flatten) and survive serde round-trips; on
+  the structs below they are accepted and dropped at parse, which is the
+  same fate the 0.3.0 derived `Deserialize` gave them.
+- **Where rejection happens.** `SimDef`, `ResourceDef`, `ActionDef`,
+  `ActionDamage`, `BuffDef`, `ProcDef`, `Rotation`, `Rule` collect
+  unknowns and fail at `sim::compile`; `EventDef` likewise at
+  `plan::compile` — in all nine cases the error names the entity's
+  registry name. `GameDef`, `BucketDef`, `StageDef`, `BuildState`,
+  `Contribution`, `Scenario`, `Phase` reject at PARSE via hand-written
+  `Deserialize` impls instead (with the context the struct itself
+  carries, e.g. ``phase `boss` ``): these seven are constructed in Rust
+  with exhaustive struct literals by both consumers, so they
+  deliberately gain **no** new field.
+- **Rust source compatibility:** adding the public `extra` field to the
+  nine collect-side structs is source-breaking for exhaustive struct
+  literals of THOSE types (add `extra: Default::default()`); neither
+  consumer constructs any of them, and the seven structs consumers do
+  construct are unchanged.
+- **`NumOrExpr` reports what it expected.** A malformed value (e.g.
+  `"cooldown": true`) now errors with `expected a number (literal) or a
+  string (expression)` instead of serde's "data did not match any
+  variant of untagged enum".
+- **`tick_objective` object form.** The hand-written map visitor
+  replaces the `TickObjectiveObj` + `deny_unknown_fields` machinery; an
+  unknown key now reads ``unknown field `snapshots`, expected
+  `objective` or `snapshot` `` (0.3.0's error was serde's untagged "did
+  not match any variant"), `_` keys are accepted there too, and the
+  bare-string form plus the serialize-live-back-to-bare-string
+  canonicalization are unchanged.
+
+### Fixed — non-finite config numbers no longer come back `Ok(NaN)` (P8a)
+
+Validation debt from the 0.3.0 release review: a `NaN`/`inf` in the
+inputs below used to propagate through the folds and return as an
+`Ok(NaN)` / `Ok(inf)` objective, silently. Each is now a positioned
+error, mirroring the existing `Phase.uptimes` "must be finite" rule:
+
+- `Contribution::value`, on BOTH halves of the shared type — a
+  `BuildState` contribution at `Plan` build resolution ("contribution
+  value into bucket `boost` must be finite, got NaN") and a
+  `BuffDef::contributions` entry at `sim::compile` (named with its
+  buff).
+- `BuildState.stats` values, at `Plan` build resolution.
+- `Phase.stats` override values, alongside the existing uptime check.
+
+No numeric path changed: `diablo4_rotation`'s EV and Monte Carlo blocks
+are byte-identical, and both consumers' pinned numbers are untouched.
 
 ## [0.3.0] — 2026-07-26
 

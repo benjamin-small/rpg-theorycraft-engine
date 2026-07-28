@@ -2,11 +2,25 @@
 //! into buckets. This is the only artifact that changes per permutation.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// ONE candidate: a full set of stat values plus every tagged contribution
 /// it makes into the game's buckets. This is the only piece of config that
 /// changes per permutation a search driver evaluates.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// # Unknown keys (P8a)
+///
+/// A non-`_` key that names no field here (or on a [`Contribution`]) is
+/// rejected at PARSE with a did-you-mean error; `_`-prefixed keys are the
+/// annotation namespace, accepted and dropped exactly as the derived
+/// `Deserialize` always dropped them. Neither struct gains a field: both
+/// consumers construct them in Rust with exhaustive struct literals.
+///
+/// Every stat VALUE must be finite — `NaN`/`inf` would otherwise
+/// propagate through the folds and come back as an `Ok(NaN)` objective;
+/// `Plan` rejects them at build resolution, as it does a non-finite
+/// [`Contribution::value`].
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct BuildState {
     /// Values for the GameDef stat registry, by name (missing = 0.0).
     #[serde(default)]
@@ -26,12 +40,15 @@ pub struct BuildState {
 /// `NaN` values are never equal) — these are config literals, never
 /// computed results, so structural comparison is exactly what a
 /// "did this parse to what I wrote?" test wants.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Contribution {
     /// Name of the bucket this value folds into (must exist in the
     /// GameDef's bucket registry).
     pub bucket: String,
     /// The raw value contributed, before the bucket's fold is applied.
+    /// Must be FINITE: `NaN`/`inf` is rejected where the contribution is
+    /// resolved (`Plan`'s build resolution for a [`BuildState`]'s, and
+    /// `sim::compile` for a `BuffDef`'s), never folded into an `Ok(NaN)`.
     pub value: f64,
     /// Counts only in branches where this event fired.
     #[serde(default)]
@@ -39,6 +56,64 @@ pub struct Contribution {
     /// Value scales by the phase's uptime for this condition (default 0).
     #[serde(default)]
     pub condition: Option<String>,
+}
+
+// P8a: hand-written `Deserialize` — parse-side mirror + shared
+// unknown-key rejection (see `config_keys`'s module docs for why these
+// two structs cannot simply grow an `extra` field).
+
+impl<'de> Deserialize<'de> for BuildState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            stats: BTreeMap<String, f64>,
+            #[serde(default)]
+            contributions: Vec<Contribution>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            "the build state",
+            &["stats", "contributions"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(BuildState {
+            stats: r.stats,
+            contributions: r.contributions,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Contribution {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            bucket: String,
+            value: f64,
+            #[serde(default)]
+            event: Option<String>,
+            #[serde(default)]
+            condition: Option<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            &format!("a contribution into bucket `{}`", r.bucket),
+            &["bucket", "value", "event", "condition"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Contribution {
+            bucket: r.bucket,
+            value: r.value,
+            event: r.event,
+            condition: r.condition,
+        })
+    }
 }
 
 #[cfg(test)]

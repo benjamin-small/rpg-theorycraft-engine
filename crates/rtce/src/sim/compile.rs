@@ -408,6 +408,60 @@ impl Symbols for SimSymbols<'_> {
 /// every expression over the extended sim symbol space. This is the only
 /// place sim expressions get parsed — do it once and reuse the result.
 pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimPlan, PlanError> {
+    // P8a: unknown config keys fail closed FIRST — a typo'd key silently
+    // meaning "field absent" is the root cause every later check would
+    // only see the symptom of (`tick_objectiv` silently meaning "no DoT"
+    // was the standing example). Each entity's registry name is the error
+    // context; `_`-prefixed keys are the annotation namespace and pass.
+    crate::config_keys::reject_unknown("the simdef", SimDef::KNOWN_KEYS, &simdef.extra)?;
+    for (name, r) in &simdef.resources {
+        crate::config_keys::reject_unknown(
+            &format!("resource `{name}`"),
+            crate::simdef::ResourceDef::KNOWN_KEYS,
+            &r.extra,
+        )?;
+    }
+    for (name, a) in &simdef.actions {
+        crate::config_keys::reject_unknown(
+            &format!("action `{name}`"),
+            crate::simdef::ActionDef::KNOWN_KEYS,
+            &a.extra,
+        )?;
+        if let Some(dmg) = &a.damage {
+            crate::config_keys::reject_unknown(
+                &format!("action `{name}` damage"),
+                crate::simdef::ActionDamage::KNOWN_KEYS,
+                &dmg.extra,
+            )?;
+        }
+    }
+    for (name, b) in &simdef.buffs {
+        crate::config_keys::reject_unknown(
+            &format!("buff `{name}`"),
+            crate::simdef::BuffDef::KNOWN_KEYS,
+            &b.extra,
+        )?;
+    }
+    for (name, p) in &simdef.procs {
+        crate::config_keys::reject_unknown(
+            &format!("proc `{name}`"),
+            crate::simdef::ProcDef::KNOWN_KEYS,
+            &p.extra,
+        )?;
+    }
+    crate::config_keys::reject_unknown(
+        "the rotation",
+        crate::simdef::Rotation::KNOWN_KEYS,
+        &rotation.extra,
+    )?;
+    for (i, rule) in rotation.rules.iter().enumerate() {
+        crate::config_keys::reject_unknown(
+            &format!("rotation rule {i} (action `{}`)", rule.action),
+            crate::simdef::Rule::KNOWN_KEYS,
+            &rule.extra,
+        )?;
+    }
+
     // Reserved words + flat-namespace collisions: every resource/action/
     // buff name must be neither a reserved sim word nor already a stat/
     // condition name in the underlying plan. This codebase treats stats,
@@ -471,9 +525,24 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
-    // Buffs: tick_objective must name a plan objective, and the stack
-    // policy must be one this engine actually honors.
+    // Buffs: tick_objective must name a plan objective, the stack policy
+    // must be one this engine actually honors, and every contribution
+    // value must be finite. The finiteness check is the sim half of the
+    // shared `Contribution` type (`Plan` guards its own half at build
+    // resolution): a NaN here would fold into every capture and come back
+    // `Ok(NaN)` — the 0.3.0 release review's standing repro.
     for (name, buff) in &simdef.buffs {
+        for c in &buff.contributions {
+            if !c.value.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "buff `{name}`: contribution value into bucket `{}` must be \
+                         finite, got {}",
+                        c.bucket, c.value
+                    ),
+                });
+            }
+        }
         if let Some(t) = &buff.tick_objective {
             if !objective_names.iter().any(|o| *o == t.objective) {
                 return Err(PlanError {
@@ -787,6 +856,7 @@ mod tests {
         resources.insert(
             "mana".to_string(),
             ResourceDef {
+                extra: Default::default(),
                 max: "max_mana".into(),
                 regen_per_sec: "mana_regen".into(),
             },
@@ -801,17 +871,22 @@ mod tests {
         actions.insert(
             "fireball".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1.0 / base_aps".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost,
                 gain: BTreeMap::new(),
-                damage: Some(ActionDamage { stats: dmg_stats }),
+                damage: Some(ActionDamage {
+                    extra: Default::default(),
+                    stats: dmg_stats,
+                }),
                 apply_buff: Vec::new(),
             },
         );
         actions.insert(
             "frost_nova".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "0".into(),
                 cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
@@ -827,6 +902,7 @@ mod tests {
         buffs.insert(
             "vuln_window".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(4.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -838,6 +914,7 @@ mod tests {
         buffs.insert(
             "combustion".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(8.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -854,6 +931,7 @@ mod tests {
         buffs.insert(
             "burning".to_string(),
             BuffDef {
+                extra: Default::default(),
                 duration: NumOrExpr::Num(6.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -867,6 +945,7 @@ mod tests {
         procs.insert(
             "conflagrate".to_string(),
             ProcDef {
+                extra: Default::default(),
                 trigger: Trigger::OnCrit,
                 chance: "lucky_hit_chance / 100 * 0.3".into(),
                 icd: 2.0,
@@ -877,6 +956,7 @@ mod tests {
         );
 
         SimDef {
+            extra: Default::default(),
             resources,
             actions,
             buffs,
@@ -894,12 +974,15 @@ mod tests {
         // never compiles it), but a `when` string actually compiled here
         // must use the real grammar, so this fixture uses `and(...)`.
         Rotation {
+            extra: Default::default(),
             rules: vec![
                 Rule {
+                    extra: Default::default(),
                     action: "frost_nova".into(),
                     when: Some("and(cooldown.frost_nova == 0, buff.vuln_window == 0)".into()),
                 },
                 Rule {
+                    extra: Default::default(),
                     action: "fireball".into(),
                     when: Some("mana >= 40".into()),
                 },
@@ -961,6 +1044,7 @@ mod tests {
         let plan = toy_plan();
         let mut rotation = valid_rotation();
         rotation.rules.push(Rule {
+            extra: Default::default(),
             action: "mystery_action".into(),
             when: None,
         });
@@ -1305,6 +1389,165 @@ mod tests {
         assert!(e.what.contains("hidden_stage"), "got: {}", e.what);
     }
 
+    // ==================================================================
+    // P8a — unknown config keys fail closed at `sim::compile`, with the
+    // entity's registry name as context and a did-you-mean suggestion.
+    // The `_` prefix is the documented annotation namespace and stays
+    // open at every nesting level.
+    // ==================================================================
+
+    // The headline case: `tick_objectiv` (missing final `e`) used to
+    // parse and silently mean "no DoT" — exactly the quiet wrong answer
+    // the 0.3.0 `TickObjectiveObj` docs called "the bigger hole".
+    #[test]
+    fn a_typoed_key_on_a_buff_is_rejected_with_a_did_you_mean() {
+        let plan = toy_plan();
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "buffs": { "poison": { "duration": 8.0, "tick_objectiv": "dot_dps" } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let e = compile(&plan, &def, &Rotation::default()).unwrap_err();
+        assert!(
+            e.what.contains("unknown field `tick_objectiv`"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("buff `poison`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("did you mean `tick_objective`"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn a_typoed_key_on_action_damage_is_rejected_with_its_action_named() {
+        let plan = toy_plan();
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "actions": { "fireball": { "cast_time": "1",
+                                         "damage": { "stat": { "coeff_pct": 200.0 } } } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let e = compile(&plan, &def, &Rotation::default()).unwrap_err();
+        assert!(e.what.contains("unknown field `stat`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("action `fireball` damage"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("did you mean `stats`"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn a_typoed_key_on_a_proc_is_rejected_with_a_did_you_mean() {
+        let plan = toy_plan();
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "buffs": { "combustion": { "duration": 8.0 } },
+              "procs": { "conflagrate": { "trigger": "on_cast", "chance": "1",
+                                          "idc": 2.0, "apply_buff": "combustion" } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let e = compile(&plan, &def, &Rotation::default()).unwrap_err();
+        assert!(e.what.contains("unknown field `idc`"), "got: {}", e.what);
+        assert!(e.what.contains("proc `conflagrate`"), "got: {}", e.what);
+        assert!(e.what.contains("did you mean `icd`"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn a_typoed_key_on_a_rotation_rule_is_rejected_with_a_did_you_mean() {
+        let plan = toy_plan();
+        let rotation: Rotation = serde_json::from_str(
+            r#"{ "rules": [ { "action": "fireball", "whn": "mana >= 40" } ] }"#,
+        )
+        .unwrap();
+        let e = compile(&plan, &valid_simdef(), &rotation).unwrap_err();
+        assert!(e.what.contains("unknown field `whn`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("rotation rule 0 (action `fireball`)"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("did you mean `when`"), "got: {}", e.what);
+    }
+
+    // The `_` namespace on the SimDef side: annotations at the top level
+    // and on every nested entity parse, compile, AND survive a serde
+    // round-trip (they re-serialize; only non-`_` unknowns are rejected).
+    #[test]
+    fn underscore_annotations_on_simdef_structs_compile_and_survive_round_trips() {
+        let plan = toy_plan();
+        let raw = r#"{
+          "_source": "hand-written for the P8a namespace pin",
+          "resources": { "mana": { "max": "max_mana", "regen_per_sec": "mana_regen",
+                                   "_unit": "points" } },
+          "actions": { "fireball": { "cast_time": "1", "_rank": "5/5",
+                                     "damage": { "stats": { "coeff_pct": 200.0 },
+                                                 "_coeff_src": "tooltip" } } },
+          "buffs": { "combustion": { "duration": 8.0, "_icon": "flame" } },
+          "procs": { "conflagrate": { "trigger": "on_cast", "chance": "1",
+                                      "apply_buff": "combustion", "_src": "aspect" } },
+          "damage_objective": "hit_after_dr"
+        }"#;
+        let def: SimDef = serde_json::from_str(raw).unwrap();
+        let rotation: Rotation = serde_json::from_str(
+            r#"{ "_style": "single button", "rules": [
+                  { "action": "fireball", "_prio": "why not", "when": "mana >= 40" } ] }"#,
+        )
+        .unwrap();
+        compile(&plan, &def, &rotation).unwrap();
+
+        let json = serde_json::to_string(&def).unwrap();
+        for key in ["_source", "_unit", "_rank", "_coeff_src", "_icon", "_src"] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "`{key}` must survive the round-trip: {json}"
+            );
+        }
+        let json = serde_json::to_string(&rotation).unwrap();
+        for key in ["_style", "_prio"] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "`{key}` must survive the round-trip: {json}"
+            );
+        }
+    }
+
+    // ==================================================================
+    // P8a validation debt: `BuffDef::contributions` is the sim half of
+    // the shared `Contribution` type — a non-finite value used to fold
+    // into every capture and come back as `Ok(NaN)`. The `Plan` half is
+    // pinned in `plan.rs`; this is the `sim::compile` half.
+    // ==================================================================
+    #[test]
+    fn a_non_finite_buff_contribution_value_is_a_compile_error() {
+        let plan = toy_plan();
+        let mut simdef = valid_simdef();
+        simdef.buffs.get_mut("combustion").unwrap().contributions[0].value = f64::NAN;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("buff `combustion`"), "got: {}", e.what);
+        assert!(
+            e.what
+                .contains("contribution value into bucket `indep` must be finite"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("NaN"), "got: {}", e.what);
+
+        let mut simdef = valid_simdef();
+        simdef.buffs.get_mut("combustion").unwrap().contributions[0].value = f64::NEG_INFINITY;
+        let e = compile(&plan, &simdef, &valid_rotation()).unwrap_err();
+        assert!(e.what.contains("must be finite"), "got: {}", e.what);
+    }
+
     #[test]
     fn rule_with_no_when_is_always_eligible_and_compiles() {
         let plan = toy_plan();
@@ -1312,6 +1555,7 @@ mod tests {
         simdef.actions.insert(
             "basic_bolt".to_string(),
             ActionDef {
+                extra: Default::default(),
                 cast_time: "1".into(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
@@ -1322,6 +1566,7 @@ mod tests {
         );
         let mut rotation = valid_rotation();
         rotation.rules.push(Rule {
+            extra: Default::default(),
             action: "basic_bolt".into(),
             when: None,
         });

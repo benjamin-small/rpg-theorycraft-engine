@@ -173,18 +173,18 @@ NOT decided in 0.3.0. Three groups:
       than this one". Deliberately not guessed at in 0.3.0 — the right
       shape should be chosen by a config that needs it, most likely one
       of the PoE2 trigger slices.
-- [ ] Crate-wide `deny_unknown_fields` on the config structs (P7c-T2
-      review, fail-closed hygiene). P7c-T2 put the guard on
-      `TickObjectiveObj` only. The larger hole is one level up: a
-      misspelled `tick_objectiv` on `BuffDef` is silently ignored and
-      silently means "this buff has no DoT" — a quieter wrong answer than
-      the typo the local guard catches. Applying it to `GameDef`/
-      `SimDef`/`BuildState`/`Scenario` and friends is a compatibility
-      decision (it rejects configs that parse today), so it wants its own
-      slice and a 0.4.0 note. Alongside it: untagged enums (`NumOrExpr`,
-      `TickObjectiveRepr`) report "data did not match any variant" rather
-      than the inner field error, which is positioned but unhelpful —
-      worth a hand-written `Deserialize` if the sweep happens.
+- [x] ~~Crate-wide `deny_unknown_fields` on the config structs~~ —
+      **landed in P8a** (Unreleased), though NOT at the serde layer:
+      unknown keys are collected and rejected at `plan::compile`/
+      `sim::compile` with a did-you-mean (or at parse via hand-written
+      `Deserialize` for the seven structs both consumers construct in
+      Rust with exhaustive literals), and `_`-prefixed keys are the
+      documented annotation namespace at every nesting level. The
+      untagged-enum half landed too: `NumOrExpr` and the
+      `tick_objective` object form now report what was expected via
+      hand-written `Deserialize` (the `TickObjectiveObj` +
+      `deny_unknown_fields` machinery is gone). See the CHANGELOG's
+      Unreleased migration note.
 - [ ] **Should `CastComplete` out-rank a coincident `BuffExpire`?**
       (P7e-T2 review) — 0.4.0 question, OPEN, deliberately not decided in
       0.3.0. Same-instant events resolve in scheduling (`seq`) order, so a
@@ -266,7 +266,12 @@ NOT decided in 0.3.0. Three groups:
       fix differ (weight the EV accumulator by `hits` vs loop the roll),
       and they are NOT equivalent under an ICD — so this wants a config
       that needs it, not a guess.
-- [ ] **`Contribution::value` is never checked for finiteness** (0.3.0
+- [x] ~~**`Contribution::value` is never checked for finiteness**~~ —
+      **landed in P8a** (Unreleased): rejected on BOTH halves of the
+      shared type (`Plan` build resolution for `BuildState.contributions`,
+      `sim::compile` for `BuffDef.contributions`), alongside the same
+      guard for `BuildState.stats` and `Phase.stats` values. The original
+      note, kept for the repro: (0.3.0
       release review) — the one number in the sim config that P7b's
       evaluation-instant sweep and P7's `ProcDef::icd` fix both missed,
       and it SHIPS in 0.3.0. It is a bare `f64` on

@@ -135,6 +135,18 @@ impl Symbols for WithEventFactors<'_> {
 /// out the unified slot array. This is the only place expressions get
 /// parsed — do it once per `GameDef` and reuse the result.
 pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
+    // P8a: the unknown-key walk for the one GameDef-side struct that
+    // stores its unknowns — an `EventDef`'s name is the key of the map it
+    // sits in, only known here. (`GameDef`/`BucketDef`/`StageDef` reject
+    // unknown keys at PARSE instead — see `config_keys`'s module docs.)
+    for (name, ev) in &def.events {
+        crate::config_keys::reject_unknown(
+            &format!("event `{name}`"),
+            crate::gamedef::EventDef::KNOWN_KEYS,
+            &ev.extra,
+        )?;
+    }
+
     // `event_factors` is the engine's injected identifier (the per-branch
     // slot); a user name that collides would be silently shadowed.
     let bucket_names: Vec<String> = def.buckets.keys().cloned().collect();
@@ -504,6 +516,18 @@ impl Plan {
                     });
                 }
             }
+            // A NaN stat override would poison every stage it reaches and
+            // still come back `Ok` — same silent-NaN class as uptimes.
+            for (name, v) in &phase.stats {
+                if !v.is_finite() {
+                    return Err(PlanError {
+                        what: format!(
+                            "phase `{}` stat `{name}` must be finite, got {v}",
+                            phase.name
+                        ),
+                    });
+                }
+            }
         }
         let weight_sum: f64 = scenario.phases.iter().map(|p| p.weight).sum();
         // Fail-closed on NaN too: `weight_sum > 0.0` is false for NaN, so
@@ -523,6 +547,11 @@ impl Plan {
             let i = self.stat_id(name).ok_or_else(|| PlanError {
                 what: format!("unknown stat `{name}`"),
             })?;
+            if !v.is_finite() {
+                return Err(PlanError {
+                    what: format!("build stat `{name}` must be finite, got {v}"),
+                });
+            }
             scratch.stat_base[i] = *v;
         }
         // Contribution tags validate per call (cheap linear scans over
@@ -531,6 +560,17 @@ impl Plan {
             if !self.bucket_names.iter().any(|b| b == &c.bucket) {
                 return Err(PlanError {
                     what: format!("unknown bucket `{}`", c.bucket),
+                });
+            }
+            // A NaN/inf value would FOLD (Σ or Π) into every branch and
+            // come back as `Ok(NaN)` total damage — the 0.3.0 release
+            // review's standing repro. Fail closed instead.
+            if !c.value.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "contribution value into bucket `{}` must be finite, got {}",
+                        c.bucket, c.value
+                    ),
                 });
             }
             if let Some(e) = &c.event {
@@ -804,6 +844,17 @@ impl Plan {
                 });
             }
         }
+        // Same silent-NaN class as uptimes (see `run`).
+        for (name, v) in &phase.stats {
+            if !v.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "phase `{}` stat `{name}` must be finite, got {v}",
+                        phase.name
+                    ),
+                });
+            }
+        }
 
         for slot in scratch.stat_base.iter_mut() {
             *slot = 0.0;
@@ -812,12 +863,26 @@ impl Plan {
             let i = self.stat_id(name).ok_or_else(|| PlanError {
                 what: format!("unknown stat `{name}`"),
             })?;
+            if !v.is_finite() {
+                return Err(PlanError {
+                    what: format!("build stat `{name}` must be finite, got {v}"),
+                });
+            }
             scratch.stat_base[i] = *v;
         }
         for c in &build.contributions {
             if !self.bucket_names.iter().any(|b| b == &c.bucket) {
                 return Err(PlanError {
                     what: format!("unknown bucket `{}`", c.bucket),
+                });
+            }
+            // See `run`: a NaN/inf contribution folds to `Ok(NaN)`.
+            if !c.value.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "contribution value into bucket `{}` must be finite, got {}",
+                        c.bucket, c.value
+                    ),
                 });
             }
             if let Some(e) = &c.event {
@@ -1120,6 +1185,7 @@ mod tests {
             def.events.insert(
                 format!("e{i}"),
                 crate::gamedef::EventDef {
+                    extra: Default::default(),
                     chance: "0".into(),
                     factor: "1".into(),
                 },
@@ -1289,6 +1355,93 @@ mod tests {
             .evaluate(&toy_build(), &scenario, &mut scratch)
             .unwrap_err();
         assert!(err.what.contains("weight"), "got: {}", err.what);
+    }
+
+    // ------------------------------------------------------------------
+    // P8a validation debt (from the 0.3.0 release review): a non-finite
+    // number in a build or phase used to sail straight through the folds
+    // and come back as `Ok(NaN)` / `Ok(inf)` total damage — the silent
+    // wrong answer this crate exists to refuse. Each of the three inputs
+    // is rejected with a positioned error, mirroring the existing
+    // `Phase.uptimes` "must be finite" style.
+    // ------------------------------------------------------------------
+    #[test]
+    fn non_finite_contribution_value_is_rejected_not_folded() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+
+        let mut b = toy_build();
+        b.contributions[0].value = f64::NAN; // bucket "additive"
+        let e = plan.evaluate(&b, &arena(), &mut scratch).unwrap_err();
+        assert!(
+            e.what
+                .contains("contribution value into bucket `additive` must be finite"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("NaN"), "got: {}", e.what);
+
+        let mut b = toy_build();
+        b.contributions[0].value = f64::INFINITY;
+        let e = plan.evaluate(&b, &arena(), &mut scratch).unwrap_err();
+        assert!(e.what.contains("must be finite"), "got: {}", e.what);
+        assert!(e.what.contains("inf"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn non_finite_build_stat_is_rejected() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let mut b = toy_build();
+        b.stats.insert("weapon".into(), f64::NAN);
+        let e = plan.evaluate(&b, &arena(), &mut scratch).unwrap_err();
+        assert!(
+            e.what.contains("build stat `weapon` must be finite"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn non_finite_phase_stat_override_is_rejected() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let mut s = arena();
+        s.phases[0].stats.insert("enemy_dr".into(), f64::NAN);
+        let e = plan.evaluate(&toy_build(), &s, &mut scratch).unwrap_err();
+        assert!(
+            e.what
+                .contains("phase `arena` stat `enemy_dr` must be finite"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // The single-phase entry point (the sim's per-cast path) applies the
+    // same three rejections — it resolves the build fresh per call, so a
+    // gap here would be a gap in every `sim::run` evaluation.
+    #[test]
+    fn non_finite_inputs_are_rejected_on_the_single_phase_path_too() {
+        let plan = compile(&toy_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let phase = arena().phases[0].clone();
+
+        let mut b = toy_build();
+        b.contributions[0].value = f64::NAN;
+        let e = plan.evaluate_phase(&b, &phase, &mut scratch).unwrap_err();
+        assert!(e.what.contains("must be finite"), "got: {}", e.what);
+
+        let mut b = toy_build();
+        b.stats.insert("weapon".into(), f64::NAN);
+        let e = plan.evaluate_phase(&b, &phase, &mut scratch).unwrap_err();
+        assert!(e.what.contains("must be finite"), "got: {}", e.what);
+
+        let mut phase = phase;
+        phase.stats.insert("enemy_dr".into(), f64::NAN);
+        let e = plan
+            .evaluate_phase(&toy_build(), &phase, &mut scratch)
+            .unwrap_err();
+        assert!(e.what.contains("must be finite"), "got: {}", e.what);
     }
 
     #[test]

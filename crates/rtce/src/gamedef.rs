@@ -9,7 +9,19 @@ use std::collections::BTreeMap;
 /// registries, the probabilistic events, and the ordered pipeline of
 /// derived stages. `plan::compile` turns one of these into a `Plan` once;
 /// nothing here is touched again on the hot evaluation path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// # Unknown keys (P8a)
+///
+/// A non-`_` key that names no field here is rejected at PARSE with a
+/// did-you-mean error; keys starting with `_` are the documented
+/// annotation namespace (the committed gamedefs carry a top-level
+/// `_source`) and are accepted — and dropped — exactly as the derived
+/// `Deserialize` always dropped them. The same applies to
+/// [`BucketDef`]/[`StageDef`]; an [`EventDef`] instead collects unknowns
+/// into [`EventDef::extra`] so `plan::compile` can name the event in the
+/// error. These structs deliberately gain NO new field: both consumers
+/// construct them in Rust with exhaustive struct literals.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GameDef {
     /// Stat registry: names become slot offsets, in this order.
     pub stats: Vec<String>,
@@ -30,8 +42,9 @@ pub struct GameDef {
 }
 
 /// A named bucket's fold rule — how the contributions tagged with this
-/// bucket combine into a single slot value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// bucket combine into a single slot value. Unknown non-`_` keys are
+/// rejected at parse (see [`GameDef`]'s "Unknown keys" section).
+#[derive(Debug, Clone, Serialize)]
 pub struct BucketDef {
     /// How this bucket's contributions combine.
     pub fold: FoldKind,
@@ -59,11 +72,25 @@ pub struct EventDef {
     /// Expression over stats/buckets (branch-recomputed); multiplied into
     /// `event_factors` when this event fires.
     pub factor: String,
+    /// Unknown keys collected at parse (P8a). `_`-prefixed keys are the
+    /// annotation namespace: accepted at every nesting level and carried
+    /// through serde round-trips. Anything else fails closed at
+    /// `plan::compile`, which names this event and suggests the nearest
+    /// real field.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl EventDef {
+    /// The declared field names, for `plan::compile`'s unknown-key walk.
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["chance", "factor"];
 }
 
 /// One named stage of the pipeline: an expression evaluated over every
 /// slot defined so far (stats, conditions, buckets, earlier stages).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Unknown non-`_` keys are rejected at parse (see [`GameDef`]'s
+/// "Unknown keys" section).
+#[derive(Debug, Clone, Serialize)]
 pub struct StageDef {
     /// This stage's name; later stages and `objectives` refer to it by
     /// this name.
@@ -74,6 +101,94 @@ pub struct StageDef {
     /// probability-weighted EV. `event_factors` is only legal here.
     #[serde(default)]
     pub branched: bool,
+}
+
+// ── P8a: hand-written `Deserialize` for the consumer-constructed structs
+// (see `config_keys`'s module docs for why these three cannot simply grow
+// an `extra` field): a parse-side mirror with `#[serde(flatten)]` collects
+// leftover keys, and `config_keys::reject_unknown` fails closed on any
+// non-`_` one right there, with the context the struct itself carries.
+
+impl<'de> Deserialize<'de> for GameDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            stats: Vec<String>,
+            #[serde(default)]
+            conditions: Vec<String>,
+            #[serde(default)]
+            buckets: BTreeMap<String, BucketDef>,
+            #[serde(default)]
+            events: BTreeMap<String, EventDef>,
+            pipeline: Vec<StageDef>,
+            objectives: Vec<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            "the gamedef",
+            &[
+                "stats",
+                "conditions",
+                "buckets",
+                "events",
+                "pipeline",
+                "objectives",
+            ],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(GameDef {
+            stats: r.stats,
+            conditions: r.conditions,
+            buckets: r.buckets,
+            events: r.events,
+            pipeline: r.pipeline,
+            objectives: r.objectives,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            fold: FoldKind,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown("a bucket definition", &["fold"], &r.extra)
+            .map_err(serde::de::Error::custom)?;
+        Ok(BucketDef { fold: r.fold })
+    }
+}
+
+impl<'de> Deserialize<'de> for StageDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            name: String,
+            expr: String,
+            #[serde(default)]
+            branched: bool,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            &format!("stage `{}`", r.name),
+            &["name", "expr", "branched"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(StageDef {
+            name: r.name,
+            expr: r.expr,
+            branched: r.branched,
+        })
+    }
 }
 
 #[cfg(test)]
