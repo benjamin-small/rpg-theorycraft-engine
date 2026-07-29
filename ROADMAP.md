@@ -302,14 +302,25 @@ NOT decided in 0.3.0. Three groups:
       al.) keep their live sequential reads, and the proc path keeps its
       live ambient capture. See the CHANGELOG migration note for exactly
       which configs move.
-- [ ] **Should `Trigger::OnHit` scale with `hits_per_use`?** (0.3.0
-      release review) — OPEN. Today it rolls once per damaging CAST, so a
-      5-hit skill offers one roll, and a lucky-hit-style ARPG proc has to
-      fold the per-hit rate into `chance` by hand. Pinned in both modes by
-      `on_hit_rolls_once_per_cast_not_once_per_hit`. Two spellings of the
-      fix differ (weight the EV accumulator by `hits` vs loop the roll),
-      and they are NOT equivalent under an ICD — so this wants a config
-      that needs it, not a guess.
+- [x] ~~**Should `Trigger::OnHit` scale with `hits_per_use`?**~~ (0.3.0
+      release review) — **answered BY CONFIG in P8e** (Unreleased): both
+      readings are legitimate semantics, so neither was hardcoded —
+      `defaults.proc_rolls` / `ProcDef.rolls` picks one. `"per_cast"`
+      (the default) keeps the long-standing hits-blind roll,
+      bit-identical (RNG stream included) and still pinned by
+      `on_hit_rolls_once_per_cast_not_once_per_hit`; `"per_hit"` LOOPS
+      the roll over the measured hit count — the loop spelling, chosen
+      over "weight the accumulator by hits" precisely because the two
+      are NOT equivalent under an ICD (the 0.3.0 note below was right):
+      all hits of one cast share one instant, so any `icd > 0` caps
+      fires at one per cast (per_hit == per_cast, pinned as an
+      equality), while `icd: 0` permits multiple crossings per cast.
+      Chance is evaluated once per proc per cast (one measured world);
+      a fractional measured `hits_per_use` fails closed under
+      `per_hit`. `ProcRolls`'s rustdoc is the canonical statement;
+      `mod proc_rolls` in `sim::exec` carries the pins (4-vs-20
+      fractional EV contrast, the 7==7 ICD equality, the per-hit
+      ICD-bound EV/MC agreement regression).
 - [x] ~~**`Contribution::value` is never checked for finiteness**~~ —
       **landed in P8a** (Unreleased): rejected on BOTH halves of the
       shared type (`Plan` build resolution for `BuildState.contributions`,

@@ -305,6 +305,40 @@ pub enum Mode {
 /// `chance` scale this engine actually models (percent-ish proc rates).
 const PROC_FIRE_EPSILON: f64 = 1e-9;
 
+/// Floating-point tolerance for [`Sim::proc_roll_count`]'s whole-number
+/// test on a `per_hit` proc's measured `hits_per_use` (P8e): an
+/// expression like `2 + 0.1 * 10` lands within a hair of its intended
+/// whole number, a genuine `2.5` never does. Deliberately a SEPARATE
+/// constant from [`PROC_FIRE_EPSILON`] (the [`HORIZON_DRAIN_LIMIT`]
+/// precedent: two judgments that happen to share a value today must stay
+/// independently tunable) — this one asks "is this float a whole
+/// number?", that one asks "did the accumulator cross 1.0?", and
+/// tightening or loosening either should never silently move the other.
+/// The values coincide because both police the same phenomenon at the
+/// same scale: a short chain of `f64` arithmetic drifting a few ulps
+/// (~1e-16) off an exact decimal answer, with real config mistakes
+/// (0.5-fractional hits, sub-percent chances) orders of magnitude away.
+const HITS_WHOLE_EPSILON: f64 = 1e-9;
+
+/// Hard cap on a `per_hit` proc's roll count for ONE cast (P8e) —
+/// [`Sim::proc_roll_count`] fails closed above it rather than let one
+/// config line (`hits_per_use: 1e12`) hang the run loop, an engine
+/// consumers run inside a browser tab as WASM. `10_000`: real ARPG
+/// multi-hit skills measure under a hundred hits per use, so two orders
+/// of magnitude of headroom already describes nothing a game models —
+/// while staying small enough that even the cap-sized loop is
+/// instantaneous. The [`INSTANT_CHAIN_LIMIT`]/[`HORIZON_DRAIN_LIMIT`]
+/// precedent: a separate constant per bounded loop, each documenting its
+/// own rationale.
+///
+/// Checking the cap immediately after the whole-number test also closes
+/// that test's two large-float edges for free: above 2^53 every `f64` is
+/// trivially integral (the whole-number test passes VACUOUSLY — there
+/// are no fractions left to detect), and `as u64` would SATURATE beyond
+/// ~1.8e19; both regimes are unreachable because any such value already
+/// failed this cap by twelve-plus orders of magnitude.
+const PER_HIT_ROLL_LIMIT: f64 = 10_000.0;
+
 /// Hard bound on consecutive zero-time (`cast_time == 0.0`, `cooldown ==
 /// 0.0`, cost payable) casts chained within ONE decision instant before
 /// [`Sim::attempt_decision`] fails closed rather than hang (P6 review/C1)
@@ -2706,14 +2740,17 @@ impl<'a> Sim<'a> {
     /// count (`hits: None` — the `OnCast` roll, whose event is the cast
     /// itself); the measured hit count under [`ProcRolls::PerHit`].
     ///
-    /// Fail-closed: `per_hit` rolls a LITERAL count, so a measured
-    /// `hits_per_use` that is not a whole number `>= 0` (a fractional
-    /// value is an EV averaging device with no per-hit reading) is a
-    /// positioned error naming the proc, the action, and the value. The
-    /// integer test tolerates float noise the same absolute hair
-    /// `PROC_FIRE_EPSILON` does — an expression like `2 + 0.1 * 10`
-    /// lands within 1e-9 of its intended whole number, a genuine 2.5
-    /// never does.
+    /// Fail-closed, twice: `per_hit` rolls a LITERAL count, so a
+    /// measured `hits_per_use` that is not a whole number `>= 0` (a
+    /// fractional value is an EV averaging device with no per-hit
+    /// reading) is a positioned error naming the proc, the action, and
+    /// the value — the whole-number test tolerating float noise by
+    /// [`HITS_WHOLE_EPSILON`] (an expression like `2 + 0.1 * 10` lands
+    /// within a hair of its intended whole number, a genuine 2.5 never
+    /// does). And a count above [`PER_HIT_ROLL_LIMIT`] is the same
+    /// positioned error naming the limit — one config line must not
+    /// hang the run loop (that constant's doc carries the rationale and
+    /// the two large-float edges the cap closes for free).
     ///
     /// The match is deliberately EXHAUSTIVE over [`ProcRolls`] (in-crate,
     /// where `#[non_exhaustive]` does not force a wildcard): a third
@@ -2729,12 +2766,24 @@ impl<'a> Sim<'a> {
             (ProcRolls::PerCast, _) | (ProcRolls::PerHit, None) => Ok(1),
             (ProcRolls::PerHit, Some(h)) => {
                 let n = h.round();
-                if !h.is_finite() || n < 0.0 || (h - n).abs() > PROC_FIRE_EPSILON {
+                if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
                     return Err(PlanError {
                         what: format!(
                             "proc `{}` rolls per_hit, but action `{}` measured \
                              hits_per_use {h} at t={} — per-hit rolling needs a \
                              whole number >= 0",
+                            self.sim_plan.procs[pi].name,
+                            self.sim_plan.actions[action].name,
+                            self.time
+                        ),
+                    });
+                }
+                if n > PER_HIT_ROLL_LIMIT {
+                    return Err(PlanError {
+                        what: format!(
+                            "proc `{}` rolls per_hit, but action `{}` measured \
+                             hits_per_use {h} at t={} — per-hit rolling is \
+                             capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
                             self.sim_plan.procs[pi].name,
                             self.sim_plan.actions[action].name,
                             self.time
@@ -2771,16 +2820,24 @@ impl<'a> Sim<'a> {
     /// one Bernoulli draw PER MEASURED HIT ([`Sim::proc_roll_count`]),
     /// with the same two loop rules as EV's: `chance` evaluated once
     /// per cast (before the loop — the hits share one world), and the
-    /// ICD hard-gating the remaining hits after a mid-loop fire (a
+    /// ICD hard-gating the remaining hits after a mid-loop fire. A
     /// gated hit consumes NO draw, exactly as a gated cast consumes
-    /// none — so at `icd > 0` the per-cast and per-hit RNG streams
-    /// coincide, and the RNG draw count changes ONLY under `icd: 0`
-    /// `per_hit` configs). Under the default `per_cast` the loop runs
-    /// once and the draw stream is byte-identical to 0.3.0's — proven
-    /// by the untouched suite and the byte-identical `diablo4_rotation`
-    /// MC block. For `on_crit` procs the hits also share the cast's ONE
-    /// sampled crit mask (`qualifies` gates the whole loop): the hits
-    /// are simultaneous, so they cannot disagree about whether the cast
+    /// none — the gate precedes the draw, and that ORDER is observable
+    /// through every later consumer of the stream: in the chance-1 /
+    /// `icd > 0` degenerate case each open cast's first draw fires and
+    /// gates the rest, so the per-hit stream collapses to the per-cast
+    /// stream EXACTLY (pinned by full-report byte-equality against
+    /// downstream consumers in
+    /// `mc_gated_hits_consume_no_draw_the_streams_collapse_at_chance_one`;
+    /// a draw-then-discard spelling shifts every later sample). At
+    /// fractional chance `per_hit` genuinely consumes more draws — each
+    /// un-gated hit draws, fire or not; that is the point of the knob.
+    /// Under the default `per_cast` the loop runs once and the draw
+    /// stream is byte-identical to 0.3.0's — proven by the untouched
+    /// suite and the byte-identical `diablo4_rotation` MC block. For
+    /// `on_crit` procs the hits also share the cast's ONE sampled crit
+    /// mask (`qualifies` gates the whole loop): the hits are
+    /// simultaneous, so they cannot disagree about whether the cast
     /// crit — which is exactly what makes EV's per-hit `weight × hits`
     /// accumulation the expectation of this path (pinned by
     /// `ev_and_mc_agree_under_per_hit_on_crit_regression`).
@@ -8996,7 +9053,12 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // `Trigger::OnHit` rolls once per damaging CAST, not once per HIT.
+        // `Trigger::OnHit` rolls once per damaging CAST BY DEFAULT, not
+        // once per HIT — the DEFAULT-policy pin. Since P8e the per-hit
+        // reading is spelled in config instead of being inexpressible
+        // (`ProcRolls`: `rolls: "per_hit"` / `defaults.proc_rolls`,
+        // pinned by its own `mod proc_rolls`); THIS pin is what keeps the
+        // default meaning the 0.3.0 thing.
         //
         // The name says otherwise and nothing else in the crate said so
         // before 0.3.0, which makes it a silent modeling trap for lucky-hit
@@ -9025,9 +9087,9 @@ mod tests {
         //   count and is seed-independent.
         //     fires = 10.  A per-hit loop gives 50.
         //
-        // Whether it SHOULD scale with `hits_per_use` is an open 0.4.0
-        // question in ROADMAP.md; this pins today's answer so that changing
-        // it has to be deliberate.
+        // "Should it scale with `hits_per_use`?" was an open 0.4.0
+        // question in ROADMAP.md; P8e answered it BY CONFIG (`ProcRolls`,
+        // neither reading hardcoded). This pin keeps the DEFAULT deliberate.
         // ------------------------------------------------------------------
         #[test]
         fn on_hit_rolls_once_per_cast_not_once_per_hit() {
@@ -10933,6 +10995,28 @@ mod tests {
             run(plan, &sim_plan, build, scenario, Mode::Expected).unwrap()
         }
 
+        /// `ev_json`'s Monte Carlo twin — the shared run shape of every
+        /// MC fixture in this module.
+        fn mc_json(
+            plan: &Plan,
+            build: &BuildState,
+            simdef_json: &str,
+            rotation_json: &str,
+            scenario: &Scenario,
+            iterations: u32,
+            seed: u64,
+        ) -> SimReport {
+            let sim_plan = compile_json(plan, simdef_json, rotation_json);
+            run(
+                plan,
+                &sim_plan,
+                build,
+                scenario,
+                Mode::MonteCarlo { iterations, seed },
+            )
+            .unwrap()
+        }
+
         const NOVA_ROT: &str = r#"{ "rules": [ { "action": "nova" } ] }"#;
 
         /// The shared 5-hit spam fixture: `nova` under `minimal_plan`
@@ -11063,20 +11147,8 @@ mod tests {
                 )
             };
             let twenty = dummy(20);
-            let mc = |simdef_json: &str| {
-                let sim_plan = compile_json(&plan, simdef_json, NOVA_ROT);
-                run(
-                    &plan,
-                    &sim_plan,
-                    &build,
-                    &twenty,
-                    Mode::MonteCarlo {
-                        iterations: 1,
-                        seed: 7,
-                    },
-                )
-                .unwrap()
-            };
+            let mc =
+                |simdef_json: &str| mc_json(&plan, &build, simdef_json, NOVA_ROT, &twenty, 1, 7);
 
             let per_cast = mc(&spark(""));
             assert_eq!(per_cast.actions["nova"].casts, 20);
@@ -11154,20 +11226,8 @@ mod tests {
                  one fire per open cast"
             );
 
-            let mc = |simdef_json: &str| {
-                let sim_plan = compile_json(&plan, simdef_json, NOVA_ROT);
-                run(
-                    &plan,
-                    &sim_plan,
-                    &build,
-                    &twenty,
-                    Mode::MonteCarlo {
-                        iterations: 1,
-                        seed: 11,
-                    },
-                )
-                .unwrap()
-            };
+            let mc =
+                |simdef_json: &str| mc_json(&plan, &build, simdef_json, NOVA_ROT, &twenty, 1, 11);
             let mc_per_cast = mc(&spark(""));
             let mc_per_hit = mc(&spark(r#", "rolls": "per_hit""#));
             assert_eq!(mc_per_hit.proc_counts["spark"], 7);
@@ -11175,6 +11235,70 @@ mod tests {
                 mc_per_hit.proc_counts["spark"], mc_per_cast.proc_counts["spark"],
                 "MC: the gate skips the firing cast's remaining draws, so \
                  the equality holds exactly at chance 1"
+            );
+        }
+
+        // --------------------------------------------------------------
+        // THE DRAW SITS BEHIND THE GATE — the stream-POSITION pin the
+        // fire counts alone cannot give (a draw-then-discard spelling
+        // fires identically; only later consumers of the RNG stream see
+        // the difference). At chance 1 / icd 3.0 each open cast's FIRST
+        // hit fires and gates the rest, so a gated hit consuming no
+        // draw means the per-hit stream COLLAPSES to the per-cast
+        // stream exactly — every subsequent sample coincides. The
+        // fixture plants two downstream consumers and pins FULL-REPORT
+        // byte-equality between the per_cast and per_hit runs:
+        //
+        //   - across instants: `crit_plan` samples every nova cast's
+        //     crit mask (branched damage), so a shifted stream moves
+        //     the sampled damage totals;
+        //   - within the instant: `echo` (on_crit, chance 0.5, default
+        //     per_cast) draws right after spark's on_hit batch on every
+        //     crit cast, so a shifted stream moves its fire pattern.
+        //
+        // Under draw-then-discard the per_hit run burns 4 extra draws
+        // per open cast on gated hits and every later sample shifts —
+        // the reports diverge (the killed mutation). 4 iterations so
+        // the equality covers per-iteration reseeding too; spark's
+        // pooled count stays the hand-worked 7 (chance 1 fires
+        // wherever the gate is open, whatever the draws say).
+        // --------------------------------------------------------------
+        #[test]
+        fn mc_gated_hits_consume_no_draw_the_streams_collapse_at_chance_one() {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "cc": 0.5 } }"#).unwrap();
+            let spark = |rolls: &str| {
+                nova_simdef(
+                    "",
+                    &format!(
+                        r#"{{ "spark": {{ "trigger": "on_hit", "chance": "1",
+                                          "icd": 3.0,
+                                          "apply_buff": "glow"{rolls} }},
+                             "echo": {{ "trigger": "on_crit", "chance": "0.5",
+                                        "apply_buff": "glow" }} }}"#
+                    ),
+                )
+            };
+            let twenty = dummy(20);
+            let per_cast = mc_json(&plan, &build, &spark(""), NOVA_ROT, &twenty, 4, 13);
+            let per_hit = mc_json(
+                &plan,
+                &build,
+                &spark(r#", "rolls": "per_hit""#),
+                NOVA_ROT,
+                &twenty,
+                4,
+                13,
+            );
+            assert_eq!(per_hit.proc_counts["spark"], 7);
+            assert_eq!(
+                serde_json::to_string(&per_hit).unwrap(),
+                serde_json::to_string(&per_cast).unwrap(),
+                "gated hits must consume NO draw: at chance 1 / icd 3 the \
+                 per-hit stream collapses to the per-cast stream, so echo's \
+                 fires and every sampled damage must coincide — divergence \
+                 means a draw landed before the mid-loop gate"
             );
         }
 
@@ -11316,18 +11440,7 @@ mod tests {
                 r#"{ "spark": { "trigger": "on_crit", "chance": "1",
                                 "apply_buff": "glow", "rolls": "per_hit" } }"#,
             );
-            let sim_plan = compile_json(&plan, &simdef_json, NOVA_ROT);
-            let report = run(
-                &plan,
-                &sim_plan,
-                &build,
-                &dummy(20),
-                Mode::MonteCarlo {
-                    iterations: 1,
-                    seed: 3,
-                },
-            )
-            .unwrap();
+            let report = mc_json(&plan, &build, &simdef_json, NOVA_ROT, &dummy(20), 1, 3);
             let fires = report.proc_counts["spark"];
             assert_eq!(
                 fires % 5,
@@ -11406,8 +11519,9 @@ mod tests {
         //   t=6  gated
         //   t=7  h1 .4   h2 .7
         //   t=8  h1 1.0 → FIRE (acc .0), ready=10; h2 GATED
-        //        (f64: .7 + .3 = 0.9999999999999999 — THIS crossing is
-        //        the one `PROC_FIRE_EPSILON` exists for)
+        //        (f64: the accumulated value actually lands at
+        //        0.9999999999999998, two ulps shy of 1.0 — THIS
+        //        crossing is the one `PROC_FIRE_EPSILON` exists for)
         //   t=9  gated
         //   t=10 h1 .3   h2 .6   — the t=1 state, 9s later
         //   → a 3-fire / 9s cycle: fires at t = 2, 5, 8, 11, …, 59
@@ -11514,8 +11628,11 @@ mod tests {
         //   h1 .4  h2 .8  h3 1.2 → FIRE (.2)  h4 .6  h5 1.0 → FIRE (.0)
         //   → 2 fires/cast × 3 casts = 6.
         // Re-evaluating per hit instead would read glow=1 from h4 on
-        // (chance 1.0): h4 → 1.6 FIRE (.6), h5 → 1.6 FIRE (.6) — four
-        // fires on cast 1 alone. The 6 is the once-per-cast signature.
+        // (chance 1.0): h4 → .2+1.0 = 1.2 FIRE (.2), h5 → 1.2 FIRE (.2)
+        // — THREE fires on cast 1 alone, and 10 across the three casts
+        // (3/4/3 — the carried .2 lets cast 2's h2 cross early; the M3
+        // mutation contrast measured exactly 10). The 6 is the
+        // once-per-cast signature.
         // --------------------------------------------------------------
         #[test]
         fn chance_is_evaluated_once_per_cast_not_once_per_hit() {
@@ -11626,6 +11743,110 @@ mod tests {
                     err.what
                 );
             }
+        }
+
+        // --------------------------------------------------------------
+        // THE ZERO-HITS ASYMMETRY, pinned: `hits_per_use: 0` is a whole
+        // number, so under per_hit a damaging cast presents ZERO rolls
+        // (no hits, no hit events) — while the hits-blind per_cast
+        // still presents its one roll per cast. chance 1 / icd 0 makes
+        // the asymmetry loud: 5 casts → per_cast 5 fires, per_hit 0.
+        // (The damage total is 0 either way — hits multiplies it — so
+        // only the roll count separates the two readings.)
+        // --------------------------------------------------------------
+        #[test]
+        fn zero_measured_hits_present_no_roll_under_per_hit_but_one_under_per_cast() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let simdef = |rolls: &str| {
+                format!(
+                    r#"{{ "actions": {{ "nova": {{ "cast_time": "1",
+                             "damage": {{ "stats": {{ "hits_per_use": 0 }} }} }} }},
+                         "buffs": {{ "glow": {{ "duration": 0.5 }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "1",
+                             "apply_buff": "glow"{rolls} }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let five = dummy(5);
+
+            let per_cast = ev_json(&plan, &build, &simdef(""), NOVA_ROT, &five);
+            assert_eq!(per_cast.actions["nova"].casts, 5);
+            assert!(close(per_cast.total.total_damage, 0.0));
+            assert_eq!(
+                per_cast.proc_counts["spark"], 5,
+                "got {:?} — per_cast is hits-blind: one certain roll per \
+                 cast, zero hits or not",
+                per_cast.proc_counts
+            );
+
+            let per_hit = ev_json(
+                &plan,
+                &build,
+                &simdef(r#", "rolls": "per_hit""#),
+                NOVA_ROT,
+                &five,
+            );
+            assert_eq!(
+                per_hit.proc_counts["spark"], 0,
+                "got {:?} — zero measured hits present zero per-hit rolls",
+                per_hit.proc_counts
+            );
+        }
+
+        // --------------------------------------------------------------
+        // THE ROLL-COUNT CAP, golden-tested: `PER_HIT_ROLL_LIMIT`
+        // (10,000) is the third fail-closed constant on this path — one
+        // config line (`hits_per_use: 1e12`) must not hang the run loop
+        // (an engine consumers run as WASM in a browser tab). At the
+        // limit exactly the run proceeds (10,000 is a legal, absurd,
+        // finite count — chance 0 keeps the fixture instantaneous); one
+        // above it is a positioned error naming the proc, the action,
+        // the value, and the limit. The cap also closes the two
+        // large-float edges documented on the constant (≥2^53 trivially
+        // integral; `as u64` saturation) — any such value fails HERE
+        // first.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_hits_count_above_the_per_hit_roll_limit_fails_closed() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let simdef = |hits: &str| {
+                format!(
+                    r#"{{ "actions": {{ "nova": {{ "cast_time": "1",
+                             "damage": {{ "stats": {{ "hits_per_use": {hits} }} }} }} }},
+                         "buffs": {{ "glow": {{ "duration": 0.5 }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "0",
+                             "apply_buff": "glow", "rolls": "per_hit" }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let one = dummy(1);
+
+            let at_limit = ev_json(&plan, &build, &simdef("10000"), NOVA_ROT, &one);
+            assert_eq!(
+                at_limit.actions["nova"].casts, 1,
+                "hits == the limit exactly must still run (the error is > only)"
+            );
+            assert_eq!(at_limit.proc_counts["spark"], 0);
+
+            let sim_plan = compile_json(&plan, &simdef("10001"), NOVA_ROT);
+            let err = run(&plan, &sim_plan, &build, &one, Mode::Expected).unwrap_err();
+            for needle in ["spark", "nova", "10001", "capped at 10000"] {
+                assert!(
+                    err.what.contains(needle),
+                    "error must name `{needle}`: {}",
+                    err.what
+                );
+            }
+
+            // The documented large-float edges land on the SAME error:
+            // 1e300 is trivially integral (the whole-number test cannot
+            // object) and would saturate `as u64` — the cap fails it
+            // closed first.
+            let sim_plan = compile_json(&plan, &simdef("1e300"), NOVA_ROT);
+            let err = run(&plan, &sim_plan, &build, &one, Mode::Expected).unwrap_err();
+            assert!(err.what.contains("capped at 10000"), "got: {}", err.what);
         }
     }
 

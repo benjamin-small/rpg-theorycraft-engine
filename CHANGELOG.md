@@ -42,15 +42,25 @@ error).
   mid-cast fire hard-gates the cast's remaining hits (their mass is
   discarded, not banked — banking is exactly the EV-over-MC inflation
   the P6-review I1 fix removed; the per-hit ICD-bound EV/MC agreement
-  regression pins 20 EV fires against the pooled MC mean).
+  regression pins 20 EV fires against the pooled MC mean). In MC a
+  gated hit consumes NO RNG draw — the gate precedes the draw, pinned
+  by full-report byte-equality: at chance 1 / `icd > 0` the per-hit
+  stream collapses to the per-cast stream exactly, downstream samples
+  included.
 - **Chance is evaluated once per proc per cast** — the hits are
   simultaneous and share one measured world (P8c), so a fire mid-cast
   is never visible to its own sibling hits' `chance` (it IS visible to
   later procs in the batch and to later casts) — pinned by a
   self-feeding `chance` contrast.
-- **Fail-closed:** `per_hit` rolls a literal count, so a fractional
-  measured `hits_per_use` (legal under the hits-blind `per_cast`) is a
-  positioned run error naming the proc, the action, and the value.
+- **Fail-closed, twice:** `per_hit` rolls a literal count, so a
+  fractional measured `hits_per_use` (legal under the hits-blind
+  `per_cast`) is a positioned run error naming the proc, the action,
+  and the value — and the count is capped at 10,000 rolls per cast
+  (`PER_HIT_ROLL_LIMIT`, golden-tested at the boundary): one config
+  line must not hang the run loop, in an engine consumers run as WASM
+  in a browser tab. Above the cap the same positioned error names the
+  limit; the cap also closes the two large-float edges (values `≥2^53`
+  are trivially integral, `as u64` would saturate) before they matter.
 - Unchanged rules, restated where a reader will ask: a utility cast
   presents no hit roll under either setting, and a proc-triggered free
   cast rolls no procs at all (P7d).

@@ -339,7 +339,10 @@ pub enum EventOrder {
 /// an EV averaging device with no per-hit reading, and the contradiction
 /// is a positioned run error naming the proc, the action, and the value
 /// (under `per_cast` the roll is hits-blind and any finite value stays
-/// legal).
+/// legal). The count is also CAPPED (at 10,000 rolls per cast — the
+/// executor's `PER_HIT_ROLL_LIMIT`): real multi-hit skills measure
+/// under a hundred hits, and one config line must not hang the run
+/// loop; above the cap the same positioned error names the limit.
 ///
 /// `#[non_exhaustive]` for [`Measure`]'s reason (the
 /// [`Measure`]/[`EventOrder`]/[`EffectDef`] precedent chain): a third
@@ -1159,29 +1162,36 @@ impl Default for BuffDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
-    /// Rolls once per cast begun.
+    /// Rolls once per cast begun. Always cast-shaped: a cast is one
+    /// event whatever its hit count, so [`ProcRolls`] does not change
+    /// this trigger's roll count (see [`ProcRolls`]'s scope section).
     OnCast,
-    /// Rolls ONCE per completing cast of a DAMAGING action — not once per
-    /// hit.
+    /// Rolls once per completing cast of a DAMAGING action BY DEFAULT —
+    /// not once per hit — and once per MEASURED HIT under
+    /// [`ProcRolls::PerHit`] (P8e).
     ///
-    /// The distinction matters and is easy to misread from the name: an
-    /// action whose `damage.stats` sets `hits_per_use: 5` puts five hits'
-    /// worth of damage into the total but presents this trigger with
-    /// exactly ONE roll — weight `1.0` in [`crate::sim::Mode::Expected`],
-    /// one RNG draw in [`crate::sim::Mode::MonteCarlo`]. A lucky-hit-style
-    /// proc that should scale with a multi-hit skill is therefore NOT
-    /// expressible today; fold the per-hit rate into `chance` by hand if
-    /// you need it. Pinned by
-    /// `on_hit_rolls_once_per_cast_not_once_per_hit`; whether it SHOULD
-    /// scale with `hits_per_use` is an open 0.4.0 question in `ROADMAP.md`.
+    /// The default is easy to misread from the name: an action whose
+    /// `damage.stats` sets `hits_per_use: 5` puts five hits' worth of
+    /// damage into the total but presents this trigger with exactly ONE
+    /// roll — weight `1.0` in [`crate::sim::Mode::Expected`], one RNG
+    /// draw in [`crate::sim::Mode::MonteCarlo`]. Pinned by
+    /// `on_hit_rolls_once_per_cast_not_once_per_hit`. A lucky-hit-style
+    /// proc that should scale with a multi-hit skill says so in CONFIG:
+    /// `rolls: "per_hit"` on the proc, or `defaults.proc_rolls` for the
+    /// whole package — [`ProcRolls`] is the canonical statement of the
+    /// per-hit semantics (EV accumulation per hit, one Bernoulli draw
+    /// per hit, the ICD-at-one-instant rule).
     ///
-    /// An action with no `damage` presents no roll at all.
+    /// An action with no `damage` presents no roll at all, under either
+    /// policy.
     OnHit,
-    /// Rolls once per completing cast of a damaging action, weighted by
-    /// the probability that cast crit ([`crate::sim::Mode::Expected`]) or
-    /// gated on whether the sampled branch actually crit
-    /// ([`crate::sim::Mode::MonteCarlo`]). Per CAST, not per hit — see
-    /// [`Trigger::OnHit`].
+    /// Rolls once per completing cast of a damaging action by default —
+    /// per measured hit under [`ProcRolls::PerHit`], exactly as
+    /// [`Trigger::OnHit`] — weighted by the probability the cast crit
+    /// ([`crate::sim::Mode::Expected`]; under `per_hit` the weight
+    /// applies per hit) or gated on whether the sampled branch actually
+    /// crit ([`crate::sim::Mode::MonteCarlo`]; ONE mask per cast — the
+    /// cast's simultaneous hits share it).
     OnCrit,
 }
 
