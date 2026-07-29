@@ -47,13 +47,24 @@ incoherent (the rationale lives on the `EventOrder` type).
   attributed to, the OLD phase. Horizon-drain semantics (P7e-T2) are
   unchanged: the knob decides which event at `t == duration` resolves
   first, never whether it resolves.
-- Rust API: `SimDefaults` gains the public `event_order: EventOrder`
-  field (source-breaking for exhaustive struct literals; neither
-  consumer constructs one). `EventOrder` is `#[non_exhaustive]` from
-  birth, for `Measure`'s reason — a third policy (an explicit
-  expiries-first, a per-class rank table) is plausible and would land on
-  this enum. `sim::SimPlan` (already `#[non_exhaustive]`) carries the
-  resolved order.
+- **Within a class, `seq` still decides — pinned, not just documented:**
+  a buff expiry and a phase boundary sharing an instant under
+  `completions_first` resolve in scheduling order, observable through an
+  instant cast whose eligibility flips at the expiry and whose damage
+  names the phase it measured under
+  (`within_the_rest_class_seq_still_decides_under_completions_first` —
+  sub-ranking the rest class is NOT behavior-preserving).
+
+### Changed — Rust API (P8d)
+
+- `SimDefaults` gains the public `event_order: EventOrder` field
+  (source-breaking for exhaustive struct literals; neither consumer
+  constructs one). `EventOrder` is `#[non_exhaustive]` from birth, for
+  `Measure`'s reason — a third policy (an explicit expiries-first, a
+  per-class rank table) is plausible and would land on this enum.
+- `sim::SimPlan` (already `#[non_exhaustive]`) carries the resolved
+  order; the executor reads it at every event push, never the
+  `defaults` block.
 
 ### Fixed — one world per measured cast (P8c: the phase's ONE deliberate behavior change)
 

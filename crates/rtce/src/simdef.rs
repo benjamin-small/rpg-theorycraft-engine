@@ -111,8 +111,10 @@ impl SimDefaults {
     /// wrote a `defaults` block round-trips without one — while a block
     /// holding only annotations still survives (annotations are the one
     /// content `extra` is FOR). Spelled as whole-struct equality, not a
-    /// per-field predicate, so a knob added by a later task (P8d/P8e)
-    /// cannot be silently DROPPED on serialize by an un-extended list.
+    /// per-field predicate, so a knob added by a later task cannot be
+    /// silently DROPPED on serialize by an un-extended list (P8d's
+    /// `event_order` landed under exactly this cover; P8e's
+    /// `proc_rolls` is next).
     #[must_use]
     pub fn is_vacuous(&self) -> bool {
         *self == Self::default()

@@ -535,9 +535,8 @@ fn main() {
     //     "defaults": { "event_order": "completions_first" }
     //
     // Every `CastComplete` now outranks a coincident `BuffExpire`
-    // (package-wide by design — ordering is a property of the QUEUE, and
-    // a collision involves two entities, so there is deliberately no
-    // per-spell form). The bolt at t=3,5,…,19 resolves BEFORE the shock
+    // (package-wide by design — `EventOrder`'s docs say why a per-spell
+    // form would be incoherent). The bolt at t=3,5,…,19 resolves BEFORE the shock
     // expiry sharing its instant, measures WITH the still-live shock,
     // and its reapplication bumps the buff generation — the pending
     // expiry is stale, a no-op. Same casts, same 0.95 uptimes, and bolt

@@ -653,7 +653,8 @@ enum Event {
 /// the item is pushed (rank-at-push: `Ord` has no access to config, and
 /// the rank is a pure function of the event kind and the run's
 /// [`EventOrder`], which cannot change mid-run — so baking it onto the
-/// item keeps the comparator self-contained for one byte per entry).
+/// item keeps the comparator self-contained at the cost of one `u8` per
+/// entry, 8 bytes with alignment padding).
 ///
 /// Under [`EventOrder::Scheduled`] this is a CONSTANT — deliberately not
 /// a per-kind table — so the order degenerates to the 0.3.0 `(time,
@@ -665,6 +666,15 @@ enum Event {
 fn class_rank(event: &Event, order: EventOrder) -> u8 {
     match order {
         EventOrder::Scheduled => 0,
+        // No wildcard arm on purpose, in EITHER match: a new `Event`
+        // kind (or a new `EventOrder` policy) must choose its class HERE,
+        // as a semantic decision — [`EventOrder`]'s docs, the CHANGELOG,
+        // and ROADMAP enumerate the outranked kinds BY NAME, so a
+        // classification that falls through a `_` would silently
+        // contradict all three. The rest class is deliberately ONE rank:
+        // within it `seq` still decides (pinned by
+        // `within_the_rest_class_seq_still_decides_under_completions_first`
+        // — sub-ranking the rest class is NOT behavior-preserving).
         EventOrder::CompletionsFirst => match event {
             Event::CastComplete { .. } => 0,
             Event::BuffExpire { .. } | Event::PhaseBoundary { .. } | Event::Wake => 1,
@@ -689,7 +699,9 @@ struct QueueItem {
 impl PartialEq for QueueItem {
     fn eq(&self, other: &Self) -> bool {
         // `rank` included for `Eq`/`Ord` consistency, though `seq` is
-        // unique per run and decides alone in practice.
+        // unique per run and decides alone in practice. `event` excluded
+        // — it carries no `Ord` (so `cmp` never reads it), and `seq`
+        // uniqueness makes it redundant here too.
         self.time == other.time && self.rank == other.rank && self.seq == other.seq
     }
 }
@@ -10533,6 +10545,107 @@ mod tests {
             let a = serde_json::to_string(&mc()).unwrap();
             let b = serde_json::to_string(&mc()).unwrap();
             assert_eq!(a, b, "same seed twice must be byte-identical");
+        }
+
+        // --------------------------------------------------------------
+        // WITHIN THE REST CLASS, `seq` STILL DECIDES — the pin behind
+        // the "within a class, `seq` still decides" sentence the docs
+        // state in three places ([`EventOrder`], `class_rank`, the
+        // CHANGELOG). Without it, splitting the rest class into
+        // sub-ranks (`BuffExpire → 1, PhaseBoundary → 2, Wake → 3`)
+        // passed the ENTIRE suite: no fixture made two REST-class
+        // events at one instant observably order-dependent under
+        // `completions_first` (review probe — the 8th consecutive
+        // surviving mutation on documented-but-unpinned semantics).
+        //
+        // The fixture makes a `BuffExpire` and a `PhaseBoundary` share
+        // an instant, with an INSTANT cast whose eligibility flips at
+        // the expiry and whose damage names the phase it measured
+        // under:
+        //
+        //   phases [p1: 5, p2: 5], p2 overriding `dmg` 100 → 250
+        //   `opener` (instant, cd 1000): applies `x` (duration 5) at t=0
+        //   `spike`  (instant, cd 1000, `when: buff.x == 0`): damage
+        //
+        //   t=0  opener casts instantly, applies x → BuffExpire at t=5
+        //        (seq AFTER the construction-scheduled boundary's);
+        //        spike gated (buff.x is 1); idle otherwise.
+        //   t=5  the coincidence, both events rest-class (rank 1) under
+        //        `completions_first`, so `seq` decides:
+        //          boundary (lower seq) → phase p2 becomes current; the
+        //            retry still finds spike gated — `buff.x` reads the
+        //            INSTANCE LIST, which the expiry event has not yet
+        //            dropped (event-driven, not a time comparison);
+        //          expiry → x drops → retry: spike casts instantly,
+        //            measured under p2 → 250, attributed to p2.
+        //
+        //   → spike 250, phases [0, 250], total 250 over 10s = 25 dps.
+        //
+        // The `scheduled` run is asserted EQUAL: within the rest class
+        // the `completions_first` order IS the scheduled order — that
+        // equality is the claim under pin. Under the rank split above,
+        // the expiry (sub-rank 1) beats the boundary (sub-rank 2), the
+        // spike fires under p1 → 100, attributed to p1 — both the
+        // literal and the equality die. Mutation-proven with exactly
+        // that split.
+        // --------------------------------------------------------------
+        #[test]
+        fn within_the_rest_class_seq_still_decides_under_completions_first() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let scenario: Scenario = serde_json::from_str(
+                r#"{ "phases": [ { "name": "p1", "weight": 5 },
+                                 { "name": "p2", "weight": 5,
+                                   "stats": { "dmg": 250.0 } } ] }"#,
+            )
+            .unwrap();
+            let with_defaults = |block: &str| {
+                format!(
+                    r#"{{ {block}
+                         "actions": {{
+                           "opener": {{ "cast_time": "0", "cooldown": 1000.0,
+                                        "apply_buff": ["x"] }},
+                           "spike":  {{ "cast_time": "0", "cooldown": 1000.0,
+                                        "damage": {{ "stats": {{}} }} }}
+                         }},
+                         "buffs": {{ "x": {{ "duration": 5.0 }} }},
+                         "damage_objective": "hit" }}"#
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "opener" },
+                                      { "action": "spike",
+                                        "when": "buff.x == 0" } ] }"#;
+            let cf = ev_json(
+                &plan,
+                &build,
+                &with_defaults(r#""defaults": { "event_order": "completions_first" },"#),
+                rot,
+                &scenario,
+            );
+            assert_eq!(cf.actions["spike"].casts, 1);
+            assert!(
+                close(cf.actions["spike"].damage, 250.0),
+                "spike: got {} — want 250: the boundary (lower seq) must \
+                 resolve before the coincident expiry, so the expiry's \
+                 retry casts spike under p2 (100 would mean the rest \
+                 class was sub-ranked and the expiry jumped the queue)",
+                cf.actions["spike"].damage
+            );
+            assert!(
+                close(cf.phases[0].total_damage, 0.0) && close(cf.phases[1].total_damage, 250.0),
+                "attribution must follow: p1 {} / p2 {}",
+                cf.phases[0].total_damage,
+                cf.phases[1].total_damage
+            );
+            // Within the rest class, `completions_first` IS the
+            // scheduled order — the equality is the documented claim.
+            let sched = ev_json(&plan, &build, &with_defaults(""), rot, &scenario);
+            assert_eq!(
+                serde_json::to_string(&sched).unwrap(),
+                serde_json::to_string(&cf).unwrap(),
+                "two coincident rest-class events must resolve by seq \
+                 under BOTH settings"
+            );
         }
 
         // --------------------------------------------------------------

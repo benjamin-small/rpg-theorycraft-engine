@@ -228,11 +228,11 @@
 //! { "defaults": { "event_order": "completions_first" } }
 //! ```
 //!
-//! (package-wide ONLY, by design — ordering is a property of the queue,
-//! and a collision involves two entities, so there is deliberately no
-//! per-spell form). Every `CastComplete` now outranks a coincident
-//! `BuffExpire`: the completing cast measures WITH its still-live buff,
-//! and its reapplication makes the pending expiry stale.
+//! (package-wide ONLY, by design — [`crate::simdef::EventOrder`]'s docs
+//! say why a per-spell form would be incoherent). Every `CastComplete`
+//! now outranks a coincident `BuffExpire`: the completing cast measures
+//! WITH its still-live buff, and its reapplication makes the pending
+//! expiry stale.
 //!
 //! `poe2_triggers` runs BOTH as contrasts against the same on-grid 2.0s
 //! `shock`: each knob alone restores bolt damage 1837.5 → 2175, the
