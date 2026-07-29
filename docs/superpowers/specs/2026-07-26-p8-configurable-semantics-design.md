@@ -262,8 +262,10 @@ TDD red-first; every pinned number hand-worked in a comment; every
 behavior change mutation-proven (break it, watch the specific test fail,
 restore, report the contrast); fail-closed with positioned errors;
 clippy `-D warnings` + fmt + `missing_docs` + `publish --dry-run` clean
-per task; both consumers re-verified per task (diablo4-calc
-`8096.023984663315`; poe2-calcs 63 `rtce_parity`).
+per task; both consumers re-verified per task (diablo4-calc workspace
+green + its no-arg `eval` golden `17574.299999999996` — the standing
+consumer gate; `8096.02` is the HISTORICAL P4-era parity figure, not a
+current gate — poe2-calcs 63 `rtce_parity`).
 
 ## Out of scope (P8)
 

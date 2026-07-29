@@ -47,6 +47,8 @@ jobs:
         run: cargo run -p rtce --example poe2_poison
       - name: cargo run -p rtce --example poe2_triggers
         run: cargo run -p rtce --example poe2_triggers
+      - name: cargo run -p rtce --example poe2_ignite
+        run: cargo run -p rtce --example poe2_ignite
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings

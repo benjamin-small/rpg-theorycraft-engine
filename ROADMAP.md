@@ -101,14 +101,17 @@
   lessons in charges/poison/triggers.
 
 ## Next
-- [ ] **Publish 0.3.0** to crates.io. `rtce` 0.2.0 and `rtce-testkit`
-      0.1.0 are both live on the registry, and rtce's dev-dependency
-      already carries the `version = "0.1.0"` pin alongside its path, so
-      the PUBLISHED tarball's tests resolve testkit from the registry
-      rather than a path that isn't there (locally the path still wins).
-      `rtce-testkit` is UNTOUCHED this phase — no commit under
-      `crates/rtce-testkit/` since before P7 — and stays at 0.1.0; only
-      `rtce` bumps.
+- [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
+      the registry (`cargo search` confirms), alongside `rtce-testkit`
+      0.1.0. The mechanics recorded here carry forward to every release:
+      rtce's dev-dependency pins testkit by `version` alongside its
+      path, so a published tarball's tests resolve testkit from the
+      registry (locally the path wins); testkit bumps only when a commit
+      actually touches `crates/rtce-testkit/` (none since before P7 —
+      it stays 0.1.0 for 0.4.0 too).
+- [ ] **Publish 0.4.0** (staged by P8f: version bumped, CHANGELOG cut,
+      `cargo publish -p rtce --dry-run` clean). Publishes after the
+      whole-phase P8 review round — the coordinator's step, not a task's.
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full
@@ -355,13 +358,16 @@ NOT decided in 0.3.0. Three groups:
       would leave `Plan::evaluate` accepting the same NaN. Not fixed in
       0.3.0 purely because it is a behavior change caught at release-review
       time; it is not a design question and wants no config to justify it.
-- [ ] `sim::SimScratch` is public, constructible, and accepted by
-      nothing — `sim::run` builds its own internally (0.3.0 release
-      review). It is the clearest piece of dead public API in the crate.
-      Either give `run` a `_with_scratch` variant that takes it (the
-      `Plan::scratch` / `Plan::evaluate` shape, which is the point of
-      having the type at all) or remove it. Removing is breaking, so
-      0.4.0 either way.
+- [x] ~~`sim::SimScratch` is public, constructible, and accepted by
+      nothing~~ — **REMOVED from the public API in P8f** (Unreleased):
+      "remove" won over "give `run` a `_with_scratch` variant", because
+      no driver has asked for batch scratch reuse and dead surface
+      should not wait for one. The type itself survives crate-internally
+      (`pub(crate)`) — `run` still builds one per call — and its doc
+      names the re-publication condition: if batch reuse ever earns a
+      `run_with_scratch`, the type comes back AS a parameter something
+      accepts. Grep-verified unused in both consumers before removal;
+      CHANGELOG'd as the 0.4.0 breaking note.
 - [x] ~~A `ProcDef` can do exactly ONE of `apply_buff` / `cast_action`,
       and the limitation is enforced but not stated on the type (0.3.0
       release review)~~ — **landed in P8b** (Unreleased): "allow both"
@@ -370,16 +376,34 @@ NOT decided in 0.3.0. Three groups:
       explicit and pinned (the 0.2/0.1 order contrast). The exactly-one
       check generalized to "a proc must do something" (empty after
       desugar is the error; both SUGAR fields at once is still refused).
-- [ ] Coverage gaps recorded rather than closed in 0.3.0 (release
-      review): `refresh` with a LIVE `tick_objective` — the 0.2.0 default
-      DoT shape — has no behavioral test, no live tick objective runs
-      under `Mode::MonteCarlo` at all, and `ReapplyPolicy::Strongest` is
-      EV-only and example-free. None is a known bug; all three are places
-      a bug could hide.
-- [ ] `expr::MAX_STACK` is unreachable in practice (the depth guard trips
-      first) but is named in public docs as though a config could hit it
-      (0.3.0 release review). Either prove it reachable with a fixture or
-      stop advertising it as a failure mode.
+- [x] ~~Coverage gaps recorded rather than closed in 0.3.0~~ — **all
+      three closed in P8f** (Unreleased), and none was hiding a bug:
+      `refresh` + LIVE `tick_objective` is pinned behaviorally
+      (`sim::exec`'s `mod live_dot` — the 500/0.4 two-window pin, plus a
+      mid-window refold contrast that discriminates live from snapshot
+      INSIDE the policy, 875 vs 750); a live tick runs under
+      `Mode::MonteCarlo` with same-seed byte-determinism AND exact EV
+      equality pinned against a deliberately BRANCHED tick objective
+      (sampling it instead reads 487.5 — the mutation was run); and
+      `strongest` ships `examples/poe2_ignite.rs` (CI-run, hand-worked
+      1950/2400/1200 pins, the `refresh` re-capture contrast, and its
+      first Monte Carlo coverage). With the `refresh`×live cell filled,
+      every `(reapply policy × tick mode)` cell now has a discriminating
+      test — the CLAUDE.md docs-discipline rule 3 audit is what
+      confirmed the matrix.
+- [x] ~~`expr::MAX_STACK` is unreachable in practice~~ — **documented
+      honestly in P8f** (Unreleased). What was true: the constant is
+      `pub` only inside the PRIVATE `expr::compiler` module — never
+      re-exported, so unreachable as public API — while
+      `Program::max_depth`'s public doc named it as though a reader
+      could go look. What the entry got wrong: the failure mode itself
+      IS reachable, at compile time — ~64 right-nested levels trip the
+      positioned "expression too deep (stack > 64)" error (eval never
+      checks depth precisely BECAUSE compile rejects first).
+      `Program::max_depth` now states the actual relationship without
+      naming the private constant, and the exact boundary is pinned:
+      63 levels compile with `max_depth == 64`, 64 levels fail closed
+      (`depth_guard_boundary_is_exactly_max_stack`).
 - [ ] 0.5.0: `search::Candidate`/`search::Move` still silently IGNORE
       unknown keys (P8a spec review). Outside P8a's 16-struct config
       sweep — today every driver constructs them in-process, where Rust's

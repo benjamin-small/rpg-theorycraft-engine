@@ -153,7 +153,10 @@ in BOTH regimes: an internal cooldown is a hard gate in EV mode exactly as
 it is in MC mode, so the two modes' long-run fire rates converge whether a
 proc's ICD never binds or routinely gates hits — EV's accumulator fires
 deterministically at the expected interval, MC's rolls add sampling
-variance around that same mean.
+variance around that same mean. And the agreement is per HIT as well as
+per cast: under `proc_rolls: "per_hit"` (see "Configurable semantics"
+below) EV feeds its accumulator once per measured hit where MC draws one
+Bernoulli per hit, and the ICD hard-gates both identically.
 
 To be clear about scope, same as the D4 slice above: `examples/diablo4_rotation.rs`'s
 `SimDef` is a DEMONSTRATION slice, not Diablo 4's real cadence data —
@@ -219,7 +222,7 @@ The `vulnerable` uptime (0.4) was never asserted anywhere in the
 config — it FALLS OUT of Frost Nova's 4-second buff window recast every
 10 seconds. That's Level-2's whole point.
 
-## Counted and snapshotted state: three PoE2 slices
+## Counted and snapshotted state: four PoE2 slices
 
 A buff in rtce is internally an INSTANCE LIST. Config collapses it per
 mechanic — the binary buff above is the degenerate one-instance case, and
@@ -228,19 +231,20 @@ share one expiry clock (`add_refresh_all`), ailments that stack
 independently and each tick the magnitude they were born with
 (`add_independent`), and "strongest wins" replacement (`strongest`).
 
-TWO of those three are carried by worked examples, below, each with
-hand-worked pins in comments, asserted and run in CI. `strongest` is not
-among them: its coverage is the test suite (`sim::exec`'s `mod
-snapshot`), not a runnable slice. Worth knowing before reaching for it,
-because it is also the policy with the sharpest edge — a LOSING
-reapplication changes nothing at all, neither the magnitude nor the
-expiry, so a weak reapplication cannot extend a strong ailment.
+All three are carried by worked examples, below, each with hand-worked
+pins in comments, asserted and run in CI. `strongest` is the policy with
+the sharpest edge — a LOSING reapplication changes nothing at all,
+neither the magnitude nor the expiry, so a weak reapplication cannot
+keep a strong ailment alive and even a TIE loses ("strictly higher") —
+and that edge is exactly what `poe2_ignite` runs, with the `refresh`
+policy's unconditional re-capture as its contrast.
 
 | Example | Mechanic | Pins |
 |---|---|---|
 | `poe2_charges` | `add_refresh_all`, `max_stacks: 3`, expression `duration`, `stacks.X` in a rotation `when` | 11748 damage / 293.7 dps / 2.25 avg stacks |
 | `poe2_poison` | `add_independent`, unbounded, `snapshot: true`, applied by the skill's own `apply_buff` | 6000 hit + 11625 DoT / 881.25 dps / 3.875 avg stacks |
 | `poe2_triggers` | `ProcDef::actions` filter + `cast_action`, `apply_buff` on a primary and on the free-cast secondary | 9870 damage / 493.5 dps / 5 triggered casts |
+| `poe2_ignite` | `strongest` over rising/falling/tied phase power, vs the same timeline under `refresh` | 1950 / 2400 / 1200 DoT, uptime 0.9 / 0.8 / 0.8 |
 
 **Scope, honestly** — and this disclaimer is doing more work than the D4
 one. `crates/rtce/tests/fixtures/poe2/gamedef.json` is a PoE2-*shaped*
@@ -289,14 +293,67 @@ Monte Carlo (N=128, seed=5): mean 881.2500  std 0.0000
   contrast pins hold: 5812.5 DoT — exactly half the action-applied 11625 ✓
 ```
 
-Nothing in these three configs samples — the fixture's crit is closed
+Nothing in these four configs samples — the fixture's crit is closed
 form (`1 + c·(m−1)`, the same choice poe2-calcs' generated gamedef makes)
-and every proc they define is `chance: "1"` — so Monte Carlo mode is
-asserted to reproduce EV *exactly*, with zero spread, rather than within a
-tolerance band. That is the stronger claim: it fails if an RNG draw ever
-appears on a path that must stay deterministic. But it is a claim about
-exactness, not about MC's distribution machinery: `diablo4_rotation`
-remains the only example that actually samples.
+and no proc they define rolls below `chance: "1"` — so Monte Carlo mode
+is asserted to reproduce EV *exactly*, with zero spread, rather than
+within a tolerance band. That is the stronger claim: it fails if an RNG
+draw ever appears on a path that must stay deterministic. But it is a
+claim about exactness, not about MC's distribution machinery:
+`diablo4_rotation` remains the only example that actually samples.
+
+## Configurable semantics: the `defaults` block
+
+Real games disagree about semantics a generic engine is tempted to
+hard-code: WHEN a cast measures its world, HOW a proc rolls against a
+multi-hit cast, WHICH of two same-instant events resolves first. Each is
+configuration — a package-wide `defaults` block plus per-entity
+overrides, every knob a small named enum whose serde default reproduces
+the pre-0.4.0 behavior byte for byte (`diablo4_rotation`'s EV **and**
+Monte Carlo blocks are the standing proof that the default path is
+untouched, RNG stream included):
+
+```jsonc
+{
+  "defaults": {                        // all fields optional
+    "measure": "cast_complete",        // | "cast_start"
+    "event_order": "scheduled",        // | "completions_first"
+    "proc_rolls": "per_cast"           // | "per_hit"
+  },
+  "actions": { "bolt":  { "measure": "cast_start", ... } },  // per-action
+  "procs":   { "lucky": { "rolls": "per_hit", ... } }        // per-proc
+}
+```
+
+- **`measure`** — the instant a cast's WORLD is captured (effective
+  build and phase together, feeding its damage overlay, `hits_per_use`,
+  crit weight, and snapshot-DoT captures): the completion transaction
+  (default) or the instant the cast begins. Overridable per action.
+- **`event_order`** — whether coincident queue events resolve in
+  scheduling order (default) or with every cast completion outranking a
+  coincident expiry/boundary/wake. SimDef-global only, by design — a
+  collision involves two entities, so a per-spell tie-break would be
+  incoherent.
+- **`proc_rolls`** — one proc roll per damaging cast (default,
+  `hits_per_use`-blind) or one per measured hit, the ICD hard-gating
+  between fires. Overridable per proc.
+
+The teaching case is the CAST-GRID FOOTGUN: a buff duration that is an
+exact multiple of its refresher's cadence expires first on the shared
+instant, so the refreshing cast measures WITHOUT its own buff — and no
+integrated uptime column shows it. It now has TWO config fixes, both run
+as contrasts in `poe2_triggers` against the same on-grid 2.0s shock:
+`measure: "cast_start"` moves the measurement off the collision;
+`event_order: "completions_first"` moves the collision itself. Either
+alone restores bolt damage 1837.5 → 2175 at the same 0.95 uptime.
+
+The canonical semantics live on the types — `simdef::Measure`,
+`simdef::EventOrder`, `simdef::ProcRolls`, each documenting its default,
+its instant, and its interactions — and the `sim` module docs carry the
+footgun section. Unknown config keys FAIL CLOSED everywhere with a
+did-you-mean ("unknown field `measur` on the defaults block — did you
+mean `measure`?"); keys starting with `_` are the documented annotation
+namespace.
 
 ## Status
 

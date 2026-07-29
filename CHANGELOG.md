@@ -7,6 +7,170 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.0] — 2026-07-29
+
+**P8 — configurable semantics + one-world measurement.** A generic
+engine should not hard-code the semantic choices real games make
+differently: *when a cast measures its world*, *how a proc rolls against
+a multi-hit cast*, *which of two coincident events resolves first*. Each
+is now configuration — a `defaults` block (`measure` / `event_order` /
+`proc_rolls`) with per-entity overrides where coherent, every knob a
+named enum whose serde default reproduces 0.3.0 byte for byte (RNG
+stream included; `diablo4_rotation`'s EV and Monte Carlo blocks and both
+consumers are the standing proof). Around the knobs: what an action or a
+proc DOES generalizes into one ordered `effects` list, unknown config
+keys fail closed with a did-you-mean, non-finite config numbers stop
+coming back `Ok(NaN)`, and the ONE deliberate behavior change fixes the
+semantics the 0.3.0 release review flagged as arguably wrong — a cast
+now measures one world, build AND phase. The phase closes with the
+`refresh`+live-DoT coverage debt paid, a `strongest` worked example
+(`poe2_ignite`), and the docs discipline codified as standing rules.
+
+### Upgrading from 0.3.0 — read this first
+
+**One deliberate behavior change: one world per measured cast (P8c).**
+Numbers move ONLY for a config where one action's `apply_buff`/`effects`
+list contains BOTH a buff that drives a condition AND a later snapshot
+`tick_objective` whose objective reads that condition — the captured
+rate drops to the pre-list value (through 0.3.0 the capture read a
+frozen build against the LIVE phase, so a pure list reorder could double
+a DoT). Neither consumer qualifies; full detail under "Fixed" below.
+
+**A typo'd config that parsed in 0.3.0 now FAILS CLOSED (P8a).** A key
+no config struct declares was silently ignored — `"tick_objectiv"`
+silently meaning "no DoT" — and is now a positioned error carrying its
+own remedy: ``unknown field `tick_objectiv` on buff `poison` — did you
+mean `tick_objective`?``. Rename the key the error names (when nothing
+is within edit distance 2, the error lists the valid fields instead).
+Keys starting with `_` remain the documented annotation namespace, at
+every nesting level. Configs with no typos — including both consumers'
+committed gamedefs — pass unmodified.
+
+**The `icd: NaN` class of rejections widens (P8a).** 0.3.0 rejected a
+non-finite/negative `ProcDef::icd` because NaN silently DELETED the
+internal cooldown; 0.4.0 extends the same fail-closed treatment to the
+values that silently poisoned results instead: `Contribution::value` (on
+both halves of the shared type — `BuildState` and `BuffDef`
+contributions), `BuildState.stats` values, and `Phase.stats` overrides.
+A NaN/inf there used to return `Ok(NaN)`/`Ok(inf)` with no error
+anywhere (including `Ok(dps = 0)` on a utility-only rotation); each is
+now a positioned error. If this rejects your config, the numbers you had
+were wrong.
+
+**`sim::SimScratch` is REMOVED from the public API (P8f).** It spent
+0.2.0–0.3.0 constructible, re-exported, and accepted by NOTHING —
+`sim::run` builds its scratch internally, as it always did. If you
+constructed one, delete the call; nothing could have consumed it. (If
+batch scratch reuse ever earns a `run_with_scratch` variant, the type
+returns as that variant's parameter.)
+
+**Rust source breaks, consolidated** (permitted under 0.x; the JSON
+surface is unaffected except as above). Neither consumer constructs any
+affected type, and both were re-verified byte-identical per task:
+
+- Nine existing config structs gained a public `extra` field (serde
+  flatten, the P8a unknown-key collection): `SimDef`, `ResourceDef`,
+  `ActionDef`, `ActionDamage`, `BuffDef`, `ProcDef`, `Rotation`, `Rule`,
+  `EventDef`. Exhaustive struct literals need
+  `extra: Default::default()`. (The seven structs consumers DO construct
+  exhaustively — `GameDef`, `BucketDef`, `StageDef`, `BuildState`,
+  `Contribution`, `Scenario`, `Phase` — deliberately gained no field;
+  they reject unknown keys at parse instead.)
+- New public config fields: `SimDef::defaults` (`SimDefaults`, itself
+  new with `measure`/`event_order`/`proc_rolls`), `ActionDef::measure`
+  (`Option<Measure>`), `ProcDef::rolls` (`Option<ProcRolls>`), and
+  `ActionDef::effects`/`ProcDef::effects` (`Vec<EffectDef>`).
+- Compiled-side renames: `sim::ProcEffect` is now `sim::CompiledEffect`;
+  `CompiledProc.effect`/`CompiledAction.apply_buff` are replaced by
+  `effects: Vec<CompiledEffect>`; `CompiledAction` carries the resolved
+  `measure`, `CompiledProc` the resolved roll policy, `SimPlan` the
+  resolved event order (all `#[non_exhaustive]`, engine-constructed).
+- The new enums — `Measure`, `EventOrder`, `ProcRolls`, `EffectDef` —
+  are `#[non_exhaustive]` from birth: `match` them with a wildcard arm.
+  (`NumOrExpr` stays exhaustive by design.)
+
+### Added — the `strongest` worked example (P8f)
+
+`examples/poe2_ignite.rs` — the fourth PoE2 slice, retiring the 0.3.0
+release notes' "note what has NO example: `strongest`" caveat. One
+ignite over rising, falling and TIED phase power (two applications, one
+per 5s phase, on the committed PoE2-shaped fixture), every pin
+hand-derived and CI-run: the stronger application REPLACES (DoT 1950);
+a weaker one is DISCARDED WHOLE — rate and expiry, so the ailment
+lapses at its original t=9 and the uptime column itself shows the
+refusal (0.8 vs 0.9); a TIE loses too ("strictly higher", DoT 1200 not
+1350). The contrast run is the same falling timeline under `refresh`,
+whose unconditional re-capture trades 300 of DoT for a longer window
+(2100 at uptime 0.9 vs `strongest`'s 2400 at 0.8) — exactly the trade
+the policy exists to refuse. Also the policy's first Monte Carlo
+coverage: MC reproduces EV to the bit (a win/lose comparison runs
+against branch-blended captures, so WHICH instance wins can never
+depend on the seed).
+
+### Covered (behavior unchanged, but it was not pinned) — the 0.2.0 default DoT shape (P8f)
+
+Not a behavior change — the closing of a recorded hole. The 0.3.0
+release review counted the `(reapply policy × tick mode)` cells and
+found `refresh` + LIVE `tick_objective` — the 0.2.0 DEFAULT DoT shape —
+had ZERO behavioral coverage, and no live tick had ever run under
+`Mode::MonteCarlo`. Now pinned (`sim::exec`'s `mod live_dot`), with no
+bug found hiding:
+
+- A utility on a 10s cooldown applying a duration-4 live-tick buff over
+  20s accrues exactly its two windows at the branch-blended rate
+  (8s × 62.5 = 500, uptime 0.4) — the tick stops at expiry and resumes
+  on the cooldown recast.
+- Under Monte Carlo a live tick is same-seed byte-deterministic AND
+  equals EV EXACTLY — pinned against a deliberately BRANCHED tick
+  objective, so "the rate is branch-blended in both modes, never
+  sampled" is the assertion, not a tolerance band (mutating the tick to
+  sample reads 487.5 against the pinned 500.0).
+- A MID-WINDOW refold (another buff doubling the objective at t=2,
+  strictly inside a [0,4) window) moves a live rate at that instant and
+  a snapshot rate not at all — 875 vs 750 on the same layout under the
+  same `refresh` policy, the gap exactly the 2s × 62.5 doubling. With
+  this, every `(policy × tick)` cell has a discriminating test.
+- From the P8f docs audit: the `measure` knob's override was pinned in
+  only ONE direction (override against an omitted block); the other —
+  a per-action override winning over a NON-default block — is now
+  pinned too, mutation-proven both ways
+  (`a_per_action_override_wins_over_a_non_default_defaults_block`),
+  matching the two-direction coverage `proc_rolls` already had.
+
+### Changed — Rust API (P8f)
+
+- **`sim::SimScratch` is REMOVED from the public API** (see the
+  upgrade section). The type survives crate-internally; the re-export
+  and the public constructor are gone.
+- `expr`'s `Program::max_depth` docs now state the ACTUAL depth-bound
+  relationship instead of naming a constant the public API does not
+  expose (`MAX_STACK` is `pub` only inside the private
+  `expr::compiler` module): `max_depth <= 64` by construction, because
+  `compile` rejects a deeper program with a positioned "expression too
+  deep" error — reachable at ~64 right-nested levels, and now pinned at
+  the EXACT boundary (63 levels compile with `max_depth == 64`; 64
+  levels fail closed).
+
+### Docs (P8f)
+
+- **The front pages describe the 0.4.0 engine** (the P7e-T3 lesson,
+  applied before release this time): the root README, the crate README
+  (the crates.io page) and the crate-level rustdoc gain a "Configurable
+  semantics" section — the `defaults` block, one sentence per knob, the
+  cast-grid footgun's two config fixes — plus the unknown-key
+  fail-closed story, the per-hit half of the EV/MC proc-agreement
+  paragraph, and `poe2_ignite` in the examples tables (the "no
+  `strongest` example" caveat retires everywhere).
+- **The docs discipline is codified as standing rules** in the repo's
+  `CLAUDE.md`, binding on future phases: every config field's rustdoc
+  states its default, its evaluation instant and its interactions; every
+  numeric doc claim ships with a contrast-run pin; every shipped
+  `(default × override)` cell gets a discriminating test. The P8f audit
+  against those rules produced the override-direction test and the
+  `max_depth` boundary pin above.
+
 ### Added — `proc_rolls` (P8e)
 
 ```jsonc
@@ -1034,7 +1198,8 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
-[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.4.0
 [0.3.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.3.0
 [0.2.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.2.0
 [0.1.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.1.0

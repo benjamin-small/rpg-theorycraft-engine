@@ -93,11 +93,14 @@
 //!
 //! 4. [`simdef::SimDef`] — resources (capped pools with regen),
 //!    [`simdef::ActionDef`]s (cast time, cooldown, resource cost/gain, an
-//!    optional per-cast `damage.stats` overlay, and
-//!    [`simdef::ActionDef::apply_buff`]), [`simdef::BuffDef`]s (timed
+//!    optional per-cast `damage.stats` overlay, and an ordered
+//!    [`simdef::ActionDef::effects`] list), [`simdef::BuffDef`]s (timed
 //!    contribution/condition windows, stack policies, optional DoT ticks),
-//!    and [`simdef::ProcDef`]s (chance-triggered, ICD-gated, optionally
-//!    filtered to named actions).
+//!    [`simdef::ProcDef`]s (chance-triggered, ICD-gated, optionally
+//!    filtered to named actions, and rolled once per damaging cast or
+//!    once per measured hit — [`simdef::ProcRolls`]), plus the
+//!    [`simdef::SimDefaults`] block of package-wide semantic knobs (see
+//!    "Configurable semantics" below).
 //! 5. [`simdef::Rotation`] — a SimC-style priority list; the first
 //!    eligible [`simdef::Rule`] wins. Hard gates (off cooldown, cost
 //!    payable, not mid-cast) are automatic; a rule's `when` predicate adds
@@ -123,9 +126,34 @@
 //! own application and ticks it unchanged to expiry. What a stack count
 //! does and does not scale is documented on [`simdef::BuffDef`].
 //!
+//! # Configurable semantics: the `defaults` block
+//!
+//! Real games disagree about semantics a generic engine is tempted to
+//! hard-code — WHEN a cast measures its world, HOW a proc rolls against
+//! a multi-hit cast, WHICH of two same-instant events resolves first.
+//! Each is configuration ([`simdef::SimDefaults`]): a package-wide
+//! `defaults` block — `{ "defaults": { "measure": "cast_start" } }` —
+//! plus per-entity overrides ([`simdef::ActionDef::measure`],
+//! [`simdef::ProcDef::rolls`]), every knob a small named enum whose
+//! serde default reproduces the pre-0.4.0 behavior byte for byte:
+//!
+//! - [`simdef::Measure`] — `cast_complete` (default) | `cast_start`: the
+//!   instant a cast's WORLD (effective build and phase together) is
+//!   captured.
+//! - [`simdef::EventOrder`] — `scheduled` (default) |
+//!   `completions_first`: which of two COINCIDENT queue events resolves
+//!   first. SimDef-global only, by design.
+//! - [`simdef::ProcRolls`] — `per_cast` (default) | `per_hit`: how a
+//!   proc's chance is rolled against one damaging cast's hits.
+//!
+//! Each type documents its default, its instant, and its interactions;
+//! the [`sim`] module docs' "A buff expiring on the cast grid" section
+//! shows the footgun that `measure` and `event_order` each fix from a
+//! different end (both contrasts are RUN in `examples/poe2_triggers.rs`).
+//!
 //! # Examples
 //!
-//! Six runnable walkthroughs, each with hand-worked pins in comments,
+//! Seven runnable walkthroughs, each with hand-worked pins in comments,
 //! asserted and run in CI. Run any with
 //! `cargo run -p rtce --example <name>`:
 //!
@@ -145,7 +173,12 @@
 //!   the skill's own `apply_buff`, re-run via a proc as a contrast.
 //! - `poe2_triggers` — a [`simdef::ProcDef::actions`] trigger filter plus
 //!   `cast_action`, with `apply_buff` on both a primary and the free-cast
-//!   secondary.
+//!   secondary — and the cast-grid footgun's two config fixes as
+//!   contrast runs.
+//! - `poe2_ignite` — [`simdef::ReapplyPolicy::Strongest`] over rising,
+//!   falling and TIED phase power: the win, the discarded loser (whose
+//!   expiry does NOT move), and the same falling timeline under
+//!   `refresh`'s unconditional re-capture as the contrast.
 //!
 //! The `diablo4_*` examples run on a thin SLICE of Diablo 4's damage
 //! formula, not the game, and `diablo4_rotation`'s cadence is a

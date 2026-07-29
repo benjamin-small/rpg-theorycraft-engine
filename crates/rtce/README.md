@@ -52,12 +52,20 @@ Sequencing adds two more, compiled by `sim::compile` against an existing
 
 4. **`SimDef`** — resources (capped pools with regen), actions (cast time,
    cooldown, resource cost/gain, an optional per-cast `damage.stats`
-   overlay, and `apply_buff`), buffs (timed contribution/condition windows
-   with stack policies and optional DoT ticks), and procs
-   (chance-triggered, ICD-gated, optionally filtered to named actions).
+   overlay, and an ordered `effects` list), buffs (timed
+   contribution/condition windows with stack policies and optional DoT
+   ticks), procs (chance-triggered, ICD-gated, optionally filtered to
+   named actions, rolled once per cast or once per measured hit —
+   `ProcRolls`), and a `defaults` block of package-wide semantic knobs
+   (below).
 5. **`Rotation`** — a SimC-style priority list; the first eligible rule
    wins. Hard gates ("off cooldown", "cost payable") are automatic; a
    rule's `when` predicate adds strategy on top.
+
+Unknown config keys FAIL CLOSED everywhere with a did-you-mean ("unknown
+field `tick_objectiv` on buff `poison` — did you mean `tick_objective`?");
+keys starting with `_` are the documented annotation namespace, accepted
+at every nesting level.
 
 Sim expressions compile against the `Plan`'s own stats and conditions
 EXTENDED with sim state: `time`, `duration`, each resource's amount,
@@ -127,9 +135,55 @@ a deliberate linearization, pinned by an example so it stays a stated
 choice. `conditions` are driven at their full configured value while ANY
 instance is live and are never scaled by the count.
 
+## Configurable semantics: the `defaults` block
+
+Real games disagree about semantics a generic engine is tempted to
+hard-code — WHEN a cast measures its world, HOW a proc rolls against a
+multi-hit cast, WHICH of two same-instant events resolves first. Each is
+configuration: a package-wide `defaults` block plus per-entity overrides,
+every knob a small named enum whose serde default reproduces the
+pre-0.4.0 behavior byte for byte (RNG stream included).
+
+```jsonc
+{
+  "defaults": {                        // all fields optional
+    "measure": "cast_complete",        // | "cast_start"
+    "event_order": "scheduled",        // | "completions_first"
+    "proc_rolls": "per_cast"           // | "per_hit"
+  },
+  "actions": { "bolt":  { "measure": "cast_start", ... } },  // per-action
+  "procs":   { "lucky": { "rolls": "per_hit", ... } }        // per-proc
+}
+```
+
+- **`measure`** — the instant a cast's WORLD is captured (effective build
+  and phase together, feeding its damage overlay, `hits_per_use`, crit
+  weight, and snapshot-DoT captures): the completion transaction
+  (default) or the instant the cast begins. Overridable per action.
+- **`event_order`** — whether coincident queue events resolve in
+  scheduling order (default) or with every cast completion outranking a
+  coincident expiry/boundary/wake. SimDef-global only, by design.
+- **`proc_rolls`** — one proc roll per damaging cast (default,
+  `hits_per_use`-blind) or one per measured hit, the ICD hard-gating
+  between fires. Overridable per proc.
+
+The teaching case is the CAST-GRID FOOTGUN: a buff duration that is an
+exact multiple of its refresher's cadence expires first on the shared
+instant, so the refreshing cast measures WITHOUT its own buff — and no
+integrated uptime column shows it. It has TWO config fixes, both run as
+contrasts in `poe2_triggers` against the same on-grid 2.0s shock:
+`measure: "cast_start"` moves the measurement off the collision;
+`event_order: "completions_first"` moves the collision itself. Either
+alone restores bolt damage 1837.5 → 2175 at the same 0.95 uptime.
+
+The canonical semantics live on the types — `simdef::Measure`,
+`simdef::EventOrder`, `simdef::ProcRolls`, each documenting its default,
+its instant, and its interactions — and the `sim` module docs carry the
+footgun section.
+
 ## Examples
 
-Six runnable walkthroughs, each carrying hand-worked pins in comments,
+Seven runnable walkthroughs, each carrying hand-worked pins in comments,
 asserted and run in CI. Run any of them with
 `cargo run -p rtce --example <name>`.
 
@@ -140,11 +194,8 @@ asserted and run in CI. Run any of them with
 | [`diablo4_rotation`](examples/diablo4_rotation.rs) | Sequencing end to end: mana, a spender/generator pair, a cooldown-gated buff window whose `vulnerable` uptime FALLS OUT of the timeline, in both EV and Monte Carlo mode. |
 | [`poe2_charges`](examples/poe2_charges.rs) | `add_refresh_all` with `max_stacks: 3`, an expression `duration`, and `stacks.X` gating a rotation rule. |
 | [`poe2_poison`](examples/poe2_poison.rs) | Unbounded `add_independent` snapshot DoTs, applied by the skill's own `apply_buff` — run again via a proc as a contrast. |
-| [`poe2_triggers`](examples/poe2_triggers.rs) | A `ProcDef::actions` trigger filter plus `cast_action`, with `apply_buff` on both a primary and the free-cast secondary. |
-
-Note what has NO example: `strongest`. Its coverage is the test suite, not
-a runnable slice — worth knowing before reaching for it, because it is
-also the policy with the sharpest edge.
+| [`poe2_triggers`](examples/poe2_triggers.rs) | A `ProcDef::actions` trigger filter plus `cast_action`, with `apply_buff` on both a primary and the free-cast secondary — and the cast-grid footgun's two config fixes as contrast runs. |
+| [`poe2_ignite`](examples/poe2_ignite.rs) | `strongest` over rising, falling and TIED phase power — the win, the discarded loser (whose expiry does NOT move), and the same falling timeline under `refresh`'s unconditional re-capture as the contrast. |
 
 **Scope, honestly.** The `diablo4_*` examples run on a thin SLICE of
 Diablo 4's damage formula (crit/overpower branching, the shared additive
@@ -157,12 +208,12 @@ each pin hand-derives in a comment. What the slices demonstrate is the
 SHAPE: a real game's algorithm expressed entirely as data, exact enough
 that a production calculator runs on it.
 
-Nothing in the three PoE2 configs samples — their crit is closed form and
-every proc they define is `chance: "1"` — so Monte Carlo mode is asserted
-there to reproduce EV *exactly*, with zero spread, rather than within a
-tolerance band. That is the stronger claim, but it is a claim about
-exactness: `diablo4_rotation` is the one example that actually exercises
-sampling.
+Nothing in the four PoE2 configs samples — their crit is closed form and
+no proc they define rolls below `chance: "1"` — so Monte Carlo mode is
+asserted there to reproduce EV *exactly*, with zero spread, rather than
+within a tolerance band. That is the stronger claim, but it is a claim
+about exactness: `diablo4_rotation` is the one example that actually
+exercises sampling.
 
 ## Status
 

@@ -75,6 +75,10 @@ pub enum Op {
 }
 
 /// Maximum evaluation stack depth; checked at compile, never at eval.
+/// NOT public API: the `compiler` module is private and nothing
+/// re-exports this constant, so a caller cannot read the bound — see
+/// [`Program::max_depth`]'s docs for the public statement of the
+/// relationship.
 pub const MAX_STACK: usize = 64;
 
 /// A compiled expression: a flat postfix [`Op`] stream plus its peak stack
@@ -82,7 +86,18 @@ pub const MAX_STACK: usize = 64;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     ops: Vec<Op>,
-    /// Peak stack depth (computed during emission, ≤ MAX_STACK).
+    /// Peak evaluation-stack depth, computed during emission.
+    ///
+    /// Guaranteed `<= 64` by construction: `compile` simulates the
+    /// postfix stack and REJECTS a deeper program with a positioned
+    /// "expression too deep" error (reachable — ~64 levels of
+    /// right-nested grouping like `(1+(1+(…)))` trip it; left-leaning
+    /// chains stay shallow, so no realistic config does). The bound
+    /// itself is a crate-internal constant (`MAX_STACK`), deliberately
+    /// NOT exported: [`Program::eval`]'s fixed stack is sized by the
+    /// same constant, which is why eval never checks depth — a `Program`
+    /// that exists cannot overflow it. This field is the observable
+    /// half: what the compile-time simulation measured for THIS program.
     pub max_depth: usize,
 }
 
@@ -339,20 +354,48 @@ mod tests {
         let _ = !p.eval(&[5.0, f64::NAN, 10.0]).is_nan() || true;
     }
 
+    /// N right-nested levels of `(1+ … 1 … )` — each level parks one
+    /// constant on the stack while descending, so the peak depth is N+1.
+    fn right_nested(levels: usize) -> String {
+        let mut src = String::new();
+        for _ in 0..levels {
+            src.push_str("(1+");
+        }
+        src.push('1');
+        for _ in 0..levels {
+            src.push(')');
+        }
+        src
+    }
+
     #[test]
     fn depth_guard_rejects_pathological_nesting() {
         // Left-associative chains stay shallow; RIGHT-nested groups push one
         // stack slot per level — 70 levels must trip the MAX_STACK=64 guard.
-        let mut src = String::new();
-        for _ in 0..70 {
-            src.push_str("(1+");
-        }
-        src.push('1');
-        for _ in 0..70 {
-            src.push(')');
-        }
-        let e = compile(&src, &syms(&[])).unwrap_err();
+        let e = compile(&right_nested(70), &syms(&[])).unwrap_err();
         assert!(e.msg.contains("deep"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn depth_guard_boundary_is_exactly_max_stack() {
+        // The EXACT boundary `Program::max_depth`'s docs promise (P8f):
+        // 63 levels peak at 64 == MAX_STACK and compile — the fixed eval
+        // stack holds them, `max_depth` reads the bound itself — while 64
+        // levels peak at 65 and are rejected at compile, which is WHY
+        // eval never checks depth.
+        let ok = compile(&right_nested(63), &syms(&[])).unwrap();
+        assert_eq!(
+            ok.max_depth, MAX_STACK,
+            "63 right-nested levels must peak exactly AT the bound"
+        );
+        assert_eq!(ok.eval(&[]), 64.0, "and still evaluate: 63 additions of 1");
+
+        let e = compile(&right_nested(64), &syms(&[])).unwrap_err();
+        assert!(
+            e.msg.contains("expression too deep (stack > 64)"),
+            "one level past the bound must fail closed at compile: {}",
+            e.msg
+        );
     }
 
     #[test]

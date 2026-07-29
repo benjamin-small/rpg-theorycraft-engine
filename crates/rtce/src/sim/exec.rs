@@ -388,18 +388,21 @@ const HORIZON_DRAIN_LIMIT: u32 = 10_000;
 
 /// Preallocated executor buffers: a [`Plan`] [`EvalScratch`] (for every
 /// `Plan::evaluate_phase` call the sim makes) plus the sim's own extended
-/// slot array (see module docs). [`run`] builds one internally per call in
-/// v1 — batch reuse across repeated `run` calls (mirroring
-/// `Plan::scratch`'s role for `evaluate`) is a later phase, once a driver
-/// actually needs to price many sims back to back.
-pub struct SimScratch {
+/// slot array (see module docs). [`run`] builds one internally per call —
+/// CRATE-INTERNAL since 0.4.0 (P8f): the type spent 0.2.0–0.3.0 as public
+/// API that was constructible, re-exported, and accepted by NOTHING (the
+/// 0.3.0 release review's dead-surface finding). If batch reuse across
+/// repeated `run` calls ever earns a `run_with_scratch` variant
+/// (mirroring `Plan::scratch`'s role for `evaluate`), THAT is the moment
+/// this becomes public again — as a parameter something accepts.
+pub(crate) struct SimScratch {
     eval: EvalScratch,
     slots: Vec<f64>,
 }
 
 impl SimScratch {
     /// Allocate scratch sized to `plan`/`sim_plan`'s layout.
-    pub fn new(plan: &Plan, sim_plan: &SimPlan) -> Self {
+    pub(crate) fn new(plan: &Plan, sim_plan: &SimPlan) -> Self {
         SimScratch {
             eval: plan.scratch(),
             slots: vec![0.0; sim_plan.slot_width],
@@ -409,8 +412,8 @@ impl SimScratch {
 
 /// Run `sim_plan`'s rotation against `build` in `scenario` under `mode`,
 /// producing a [`SimReport`] of computed uptimes/dps. `Mode::Expected` runs
-/// once (a single [`SimScratch`], owned internally for v1 — batch reuse
-/// across repeated `run` calls is a later phase). `Mode::MonteCarlo` runs
+/// once (one internally-owned scratch allocation — batch reuse across
+/// repeated `run` calls is a later phase). `Mode::MonteCarlo` runs
 /// `iterations` independent timelines (a FRESH `SimScratch`/`Sim`/`Pcg32`
 /// each — nothing carries across iterations except the derived seed) and
 /// POOLS them: every scalar field in the returned report (`total_damage`,
@@ -10107,6 +10110,56 @@ mod tests {
         }
 
         // --------------------------------------------------------------
+        // The OTHER override direction (P8f audit closure): a NON-default
+        // `defaults` block (`cast_start`) with one action overriding BACK
+        // to `cast_complete`. The layout above, roles swapped — `early`
+        // now names nothing and must INHERIT the block; `late` overrides.
+        // Same cadence, same hand-work:
+        //   early (block's cast_start):      10 × (0 + 4) = 40
+        //   late  (override cast_complete):  10 × 2       = 20
+        // Mutations: an override IGNORED under a non-default block gives
+        // late 10 (measured at its start, t=1); a block that never
+        // reaches un-overridden actions gives early 60 (completions
+        // 1+5). Together with the
+        // sibling above, both resolution directions are discriminated —
+        // the `proc_rolls` knob pins its two directions in ONE test
+        // (`the_per_proc_override_wins_over_the_defaults_block_in_both_directions`);
+        // these two are that pair for `measure`.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_per_action_override_wins_over_a_non_default_defaults_block() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let simdef = r#"{
+              "defaults": { "measure": "cast_start" },
+              "actions": {
+                "early": { "cast_time": "1", "cooldown": 4.0,
+                           "damage": { "stats": { "dmg": "10 * time" } } },
+                "late":  { "cast_time": "1", "cooldown": 4.0,
+                           "measure": "cast_complete",
+                           "damage": { "stats": { "dmg": "10 * time" } } }
+              },
+              "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "early" }, { "action": "late" } ] }"#;
+            let report = ev_json(&plan, &build, simdef, rot, 5);
+            assert_eq!(report.actions["early"].casts, 2);
+            assert_eq!(report.actions["late"].casts, 1);
+            assert!(
+                close(report.actions["early"].damage, 40.0),
+                "early (inherits the block's cast_start): got {} — want \
+                 10×(0+4) (60 would mean the non-default block never \
+                 reached an un-overridden action)",
+                report.actions["early"].damage
+            );
+            assert!(
+                close(report.actions["late"].damage, 20.0),
+                "late (overrides back to cast_complete): got {} — want \
+                 10×2 (10 would mean the block silenced the override)",
+                report.actions["late"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
         // `casts.<self>` at the two instants. Under the default the
         // overlay evaluates AFTER the completing cast is counted (P7b:
         // counts from 1, never 0); under cast_start the in-flight cast
@@ -11847,6 +11900,376 @@ mod tests {
             let sim_plan = compile_json(&plan, &simdef("1e300"), NOVA_ROT);
             let err = run(&plan, &sim_plan, &build, &one, Mode::Expected).unwrap_err();
             assert!(err.what.contains("capped at 10000"), "got: {}", err.what);
+        }
+    }
+
+    // ==================================================================
+    // P8f — coverage debt: `refresh` + a LIVE `tick_objective`, the
+    // 0.2.0 DEFAULT DoT shape (a bare-name `tick_objective` on a
+    // default-policy buff), which until this module had zero behavioral
+    // coverage — every live-tick pin ran under `add_independent`, and
+    // every `refresh` tick pin ran snapshotted. These close the
+    // remaining `(reapply policy × tick mode)` cell the 0.3.0 release
+    // review counted open, in BOTH modes.
+    // ==================================================================
+    mod live_dot {
+        use super::*;
+
+        // ------------------------------------------------------------------
+        // The shared fixture, hand-traced once here.
+        //
+        //   plan    `hit = dmg`, `dot = dmg * 0.5 * boost * event_factors`
+        //           (branched). The `crit` event (chance 0.5, factor 1.5)
+        //           makes the dot objective BRANCH-BLENDED:
+        //             blend = 0.5 × 1.5 + 0.5 × 1 = 1.25
+        //           so a live rate is NOT a plain product of build stats —
+        //           which is what lets the Monte Carlo test below
+        //           discriminate "EV-blended in both modes" from "sampled
+        //           in MC mode". `boost` is a `product` bucket only the
+        //           dot stage reads, the handle a mid-window buff uses to
+        //           move the rate.
+        //   build   `dmg = 100` → R = 100 × 0.5 × 1 × 1.25 = 62.5/s at
+        //           boost 1, and 2R = 125/s once `empower` doubles boost.
+        //   venom   the utility applier: cast_time 0, cooldown 10, no
+        //           damage, `apply_buff: ["venom_dot"]`.
+        //   venom_dot  duration 4, max_stacks 1, on_reapply REFRESH (both
+        //           serde defaults — this is the point), live tick `dot`.
+        //
+        // Cadence (the `expr_cooldown_fixture` shape, hand-worked there):
+        // `venom` instant-casts at t=0, the decision loop schedules a wake
+        // at its cooldown-ready t=10, it recasts at t=10, and the t=20
+        // wake lands ON `duration` where no new cast begins. Windows
+        // [0,4) ∪ [10,14) — 8 live seconds over 20 → uptime 0.4.
+        // ------------------------------------------------------------------
+        fn branched_dot_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "buckets": { "boost": { "fold": "product" } },
+                     "events": { "crit": { "chance": "0.5", "factor": "1.5" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg" },
+                                   { "name": "dot",
+                                     "expr": "dmg * 0.5 * boost * event_factors",
+                                     "branched": true } ],
+                     "objectives": ["hit", "dot"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        fn branched_dot_build() -> BuildState {
+            serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap()
+        }
+
+        /// The utility-applier fixture above. `tick` is parameterized so
+        /// the refold test can run the SAME layout live and snapshotted.
+        fn venom_simdef(tick: TickObjective) -> SimDef {
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "venom".to_string(),
+                ActionDef {
+                    extra: Default::default(),
+                    measure: None,
+                    cast_time: "0".into(),
+                    cooldown: NumOrExpr::Num(10.0),
+                    cost: BTreeMap::new(),
+                    gain: BTreeMap::new(),
+                    damage: None,
+                    apply_buff: vec!["venom_dot".to_string()],
+                    effects: Vec::new(),
+                },
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "venom_dot".to_string(),
+                BuffDef {
+                    extra: Default::default(),
+                    duration: NumOrExpr::Num(4.0),
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: Some(tick),
+                },
+            );
+            SimDef {
+                extra: Default::default(),
+                defaults: Default::default(),
+                resources: BTreeMap::new(),
+                actions,
+                buffs,
+                procs: BTreeMap::new(),
+                damage_objective: "hit".into(),
+            }
+        }
+
+        fn venom_rotation() -> Rotation {
+            Rotation {
+                extra: Default::default(),
+                rules: vec![Rule {
+                    extra: Default::default(),
+                    action: "venom".into(),
+                    when: None,
+                }],
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // The 0.2.0 default DoT shape, pinned: `refresh` + live tick.
+        //
+        //   windows  [0,4) ∪ [10,14)  =  8 live seconds
+        //   rate     R = 62.5/s (branch-blended — see the fixture header)
+        //   total    8 × 62.5 = 500,  dps 25,  uptime = avg_stacks = 0.4
+        //
+        // The wrong numbers this discriminates: 400 (the no-crit branch
+        // only — blending lost), 600 (the crit branch only), 1250 (the
+        // tick never stopped at expiry: 20 × 62.5), 250 (only one window
+        // — the cooldown recast dropped).
+        // ------------------------------------------------------------------
+        #[test]
+        fn refresh_with_a_live_tick_accrues_the_blended_rate_over_both_windows() {
+            let plan = branched_dot_plan();
+            let build = branched_dot_build();
+            let simdef = venom_simdef(TickObjective::live("dot"));
+            let sim_plan = sim_compile(&plan, &simdef, &venom_rotation()).unwrap();
+
+            let report = run(
+                &plan,
+                &sim_plan,
+                &build,
+                &twenty_second_dummy(),
+                Mode::Expected,
+            )
+            .unwrap();
+
+            assert_eq!(report.actions["venom"].casts, 2, "casts at t=0 and t=10");
+            assert!(
+                close(report.total.total_damage, 500.0),
+                "DoT total: got {} — want 8s × R=62.5 = 500 (400/600 would \
+                 mean one crit branch instead of the blend; 1250 that the \
+                 tick outlived its window)",
+                report.total.total_damage
+            );
+            assert!(
+                close(report.total.dps, 25.0),
+                "dps: got {} — want 500/20",
+                report.total.dps
+            );
+            assert!(
+                close(report.buffs["venom_dot"].uptime, 0.4),
+                "uptime: got {} — want 8/20",
+                report.buffs["venom_dot"].uptime
+            );
+            assert!(
+                close(report.buffs["venom_dot"].avg_stacks, 0.4),
+                "avg_stacks: got {} — a one-instance refresh buff's count \
+                 IS its uptime",
+                report.buffs["venom_dot"].avg_stacks
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // A live tick under Monte Carlo — the first live-tick coverage in
+        // that mode at all. Two claims, each exact:
+        //
+        //   1. SAME-SEED DETERMINISM: two runs at one seed are
+        //      byte-identical, whole report.
+        //   2. EXACT EQUALITY WITH EV: a tick rate is branch-blended in
+        //      BOTH modes (`eval_objective` calls `evaluate_phase`, never
+        //      `evaluate_phase_sampled`), so MC's total is EV's 500.0 to
+        //      the bit — NOT a tolerance band. The fixture's crit branch
+        //      is what makes this non-vacuous: a sampled rate would read
+        //      50 or 75 per refold, and pooled means over 8 iterations
+        //      would sit off 500 for this seed. The equality IS the pin.
+        //
+        // (Nothing else here draws: the utility cast has no damage and
+        // there are no procs, so a difference between the modes could
+        // ONLY come from the tick path.)
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_live_tick_under_monte_carlo_is_deterministic_and_equals_ev_exactly() {
+            let plan = branched_dot_plan();
+            let build = branched_dot_build();
+            let simdef = venom_simdef(TickObjective::live("dot"));
+            let sim_plan = sim_compile(&plan, &simdef, &venom_rotation()).unwrap();
+            let dummy = twenty_second_dummy();
+
+            let ev = run(&plan, &sim_plan, &build, &dummy, Mode::Expected).unwrap();
+            let mc = |seed: u64| {
+                run(
+                    &plan,
+                    &sim_plan,
+                    &build,
+                    &dummy,
+                    Mode::MonteCarlo {
+                        iterations: 8,
+                        seed,
+                    },
+                )
+                .unwrap()
+            };
+
+            let a = mc(7);
+            let b = mc(7);
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "same seed must reproduce the whole report byte for byte"
+            );
+
+            assert_eq!(
+                a.total.total_damage, ev.total.total_damage,
+                "MC total must equal EV EXACTLY — a live rate is \
+                 branch-blended in both modes, never sampled"
+            );
+            assert_eq!(a.total.dps, ev.total.dps, "and so must dps");
+            assert!(
+                close(a.total.total_damage, 500.0),
+                "and both must be the hand-worked 500: got {}",
+                a.total.total_damage
+            );
+            assert!(
+                close(a.buffs["venom_dot"].uptime, 0.4),
+                "MC uptime: got {}",
+                a.buffs["venom_dot"].uptime
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // A LIVE rate moves when a MID-WINDOW buff refolds the world; a
+        // snapshot rate refuses. Run on the SAME layout under the SAME
+        // `refresh` policy, this discriminates live from snapshot INSIDE
+        // the policy — the cell's own contrast, not a borrowed one.
+        //
+        // Added to the fixture: a zero-damage 1s `filler` (completions
+        // t=1…20) and an `empower_proc` (`chance: "time == 2"`, icd 0)
+        // applying `empower` (+100 into the `product` bucket `boost`,
+        // duration 100) — so the dot objective DOUBLES at t=2, strictly
+        // inside venom_dot's first [0,4) window.
+        //
+        //   LIVE      [0,2)@62.5 + [2,4)@125 + [10,14)@125
+        //             = 125 + 250 + 500                       =  875
+        //   SNAPSHOT  [0,4)@62.5 (captured at t=0, immune)    =  250
+        //             + [10,14)@125 (refresh RE-CAPTURES)     =  500
+        //                                                     =  750
+        //
+        // The difference is exactly the mid-window doubling on [2,4):
+        // 2 × 62.5 = 125. Both totals are pinned — either alone could be
+        // produced by a fixture that never moved the rate — and so is
+        // the 125 gap. The cadence must NOT move: uptime 0.4 both ways.
+        // ------------------------------------------------------------------
+        #[test]
+        fn a_mid_window_refold_moves_a_live_rate_and_not_a_snapshot_one_under_refresh() {
+            let plan = branched_dot_plan();
+            let build = branched_dot_build();
+            let run_with = |tick: TickObjective| {
+                let mut simdef = venom_simdef(tick);
+                let mut filler_stats = BTreeMap::new();
+                filler_stats.insert("dmg".to_string(), NumOrExpr::Num(0.0));
+                simdef.actions.insert(
+                    "filler".to_string(),
+                    ActionDef {
+                        extra: Default::default(),
+                        measure: None,
+                        cast_time: "1".into(),
+                        cooldown: NumOrExpr::Num(0.0),
+                        cost: BTreeMap::new(),
+                        gain: BTreeMap::new(),
+                        damage: Some(ActionDamage {
+                            extra: Default::default(),
+                            stats: filler_stats,
+                        }),
+                        apply_buff: Vec::new(),
+                        effects: Vec::new(),
+                    },
+                );
+                simdef.buffs.insert(
+                    "empower".to_string(),
+                    BuffDef {
+                        extra: Default::default(),
+                        duration: NumOrExpr::Num(100.0),
+                        contributions: vec![Contribution {
+                            bucket: "boost".into(),
+                            value: 100.0,
+                            event: None,
+                            condition: None,
+                        }],
+                        ..BuffDef::default()
+                    },
+                );
+                simdef.procs.insert(
+                    "empower_proc".to_string(),
+                    ProcDef {
+                        extra: Default::default(),
+                        rolls: None,
+                        trigger: Trigger::OnCast,
+                        chance: "time == 2".into(),
+                        icd: 0.0,
+                        apply_buff: Some("empower".into()),
+                        effects: Vec::new(),
+                        cast_action: None,
+                        actions: None,
+                    },
+                );
+                let rotation = Rotation {
+                    extra: Default::default(),
+                    rules: vec![
+                        Rule {
+                            extra: Default::default(),
+                            action: "venom".into(),
+                            when: None,
+                        },
+                        Rule {
+                            extra: Default::default(),
+                            action: "filler".into(),
+                            when: None,
+                        },
+                    ],
+                };
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                let report = run(
+                    &plan,
+                    &sim_plan,
+                    &build,
+                    &twenty_second_dummy(),
+                    Mode::Expected,
+                )
+                .unwrap();
+                assert!(
+                    close(report.actions["filler"].damage, 0.0),
+                    "the filler's hit damage must be 0 so the total is the \
+                     DoT alone — got {}",
+                    report.actions["filler"].damage
+                );
+                report
+            };
+
+            let live = run_with(TickObjective::live("dot"));
+            let snap = run_with(TickObjective::snapshot("dot"));
+
+            assert!(
+                close(live.total.total_damage, 875.0),
+                "live total: got {} — want 125 + 250 + 500 = 875 (750 would \
+                 mean the live rate stopped being re-evaluated mid-window)",
+                live.total.total_damage
+            );
+            assert!(
+                close(snap.total.total_damage, 750.0),
+                "snapshot total: got {} — want 250 + 500 = 750 (875 would \
+                 mean the t=0 instance was retroactively doubled)",
+                snap.total.total_damage
+            );
+            assert!(
+                close(live.total.total_damage - snap.total.total_damage, 125.0),
+                "the gap must be exactly the [2,4) mid-window doubling: \
+                 2s × 62.5 = 125"
+            );
+            assert!(
+                close(live.buffs["venom_dot"].uptime, 0.4)
+                    && close(snap.buffs["venom_dot"].uptime, 0.4),
+                "the tick mode must not move the cadence: {} vs {}",
+                live.buffs["venom_dot"].uptime,
+                snap.buffs["venom_dot"].uptime
+            );
         }
     }
 

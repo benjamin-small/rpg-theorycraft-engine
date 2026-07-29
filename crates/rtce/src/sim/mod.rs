@@ -269,7 +269,7 @@ pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
     CompiledRule, CompiledTick, CompiledValue, SimPlan,
 };
-pub use exec::{run, Mode, SimScratch};
+pub use exec::{run, Mode};
 pub use report::{
     ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
 };

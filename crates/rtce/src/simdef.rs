@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 /// config's provenance notes survive a load-and-save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SimDef {
-    /// Package-wide semantic defaults (P8c's `measure`, with later knobs
-    /// joining it) — see [`SimDefaults`]. Omitted = every knob at its
-    /// 0.3.0-behavior value, which is what every 0.2.0/0.3.0 config gets
-    /// without naming the block.
+    /// Package-wide semantic defaults — the P8 trio `measure` /
+    /// `event_order` / `proc_rolls`; see [`SimDefaults`]. Omitted = every
+    /// knob at its 0.3.0-behavior value, which is what every
+    /// 0.2.0/0.3.0 config gets without naming the block.
     #[serde(default, skip_serializing_if = "SimDefaults::is_vacuous")]
     pub defaults: SimDefaults,
     /// Resource registry (mana, spirit, …), by name.
@@ -808,7 +808,9 @@ pub enum ReapplyPolicy {
     /// live instance's rate nor its expiry. A weak reapplication cannot
     /// extend a strong ailment — which is the mechanic's whole point, and
     /// the one place `strongest` differs observably from "replace and
-    /// refresh, but keep the higher rate".
+    /// refresh, but keep the higher rate". Worked end to end (rising,
+    /// falling, tie, and the `refresh` re-capture contrast) in
+    /// `examples/poe2_ignite.rs`.
     Strongest,
 }
 
