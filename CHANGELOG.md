@@ -7,6 +7,67 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added — `proc_rolls` (P8e)
+
+```jsonc
+{ "defaults": { "proc_rolls": "per_cast" } }     // | "per_hit"
+// or per proc (the override lives on the proc — rolling is the proc's
+// semantics; the hit count is already the action's):
+{ "procs": { "spark": { "trigger": "on_hit", "chance": "0.2",
+                        "rolls": "per_hit", "apply_buff": "glow" } } }
+```
+
+How a proc's chance is rolled against one damaging cast's hits.
+Governs the hit-driven triggers (`on_hit`, `on_crit`); an `on_cast`
+proc's event is the cast itself and rolls once per cast under either
+setting (the instant-cast × `measure` precedent: documented, not an
+error).
+
+- **`per_cast`** (default) — one roll per damaging cast,
+  `hits_per_use`-blind: the long-standing behavior, bit-identical
+  (including the Monte Carlo RNG draw stream) for every config that
+  names neither field, proven by the untouched suite and the
+  byte-identical `diablo4_rotation` MC block.
+- **`per_hit`** — one roll per MEASURED hit (the snapshot's
+  `hits_per_use`, the same value the damage is multiplied by): the EV
+  accumulator is fed once per hit (the `on_crit` crit-probability
+  weight applies per hit) and multiple crossings can fire per cast at
+  `icd: 0`; MC draws one Bernoulli per hit. The pinned fractional
+  contrast: chance 0.2 × 5 hits × 20 casts → 4 fires per-cast vs 20
+  per-hit.
+- **The ICD-at-one-instant rule, stated and pinned:** all hits of one
+  cast land at the same instant, so any `icd > 0` caps fires at one
+  per cast even under `per_hit` — pinned as an EQUALITY (per_hit ==
+  per_cast == 7 fires at chance 1 / icd 3 / 20 casts, both modes). A
+  mid-cast fire hard-gates the cast's remaining hits (their mass is
+  discarded, not banked — banking is exactly the EV-over-MC inflation
+  the P6-review I1 fix removed; the per-hit ICD-bound EV/MC agreement
+  regression pins 20 EV fires against the pooled MC mean).
+- **Chance is evaluated once per proc per cast** — the hits are
+  simultaneous and share one measured world (P8c), so a fire mid-cast
+  is never visible to its own sibling hits' `chance` (it IS visible to
+  later procs in the batch and to later casts) — pinned by a
+  self-feeding `chance` contrast.
+- **Fail-closed:** `per_hit` rolls a literal count, so a fractional
+  measured `hits_per_use` (legal under the hits-blind `per_cast`) is a
+  positioned run error naming the proc, the action, and the value.
+- Unchanged rules, restated where a reader will ask: a utility cast
+  presents no hit roll under either setting, and a proc-triggered free
+  cast rolls no procs at all (P7d).
+
+### Changed — Rust API (P8e)
+
+- `SimDefaults` gains the public `proc_rolls: ProcRolls` field and
+  `ProcDef` the public `rolls: Option<ProcRolls>` field
+  (source-breaking for exhaustive struct literals; neither consumer
+  constructs either). `ProcRolls` is `#[non_exhaustive]` from birth,
+  for the `Measure`/`EventOrder`/`EffectDef` reason — a third policy
+  (a per-projectile-chain roll, a capped per-hit variant) is plausible
+  and would land on this enum.
+- `sim::CompiledProc` (already `#[non_exhaustive]`) carries the
+  resolved policy per proc; the executor reads it at every roll, never
+  the `defaults` block.
+
 ### Added — `event_order` (P8d)
 
 ```jsonc

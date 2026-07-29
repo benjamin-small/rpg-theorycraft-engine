@@ -103,7 +103,13 @@
 //!   applied (`buff.<applied>` reads `1` in its `chance`). Intrinsic
 //!   effects of the action resolve before effects merely TRIGGERED by
 //!   it, so the whole `effects` list precedes the whole proc batch and
-//!   the two never interleave, whatever the procs' name order.
+//!   the two never interleave, whatever the procs' name order. How many
+//!   rolls the cast presents WITHIN the batch is itself config (P8e,
+//!   [`crate::simdef::ProcRolls`]): one per damaging cast by default, or
+//!   one per measured hit under `per_hit` — the diagram's "proc rolls"
+//!   step is the same either way, only the roll count inside it changes
+//!   (and a proc's `chance` is still evaluated once per cast: the hits
+//!   are simultaneous and share one measured world).
 //! - Within one action's `effects` list, what a later entry sees splits
 //!   across TWO axes (the full statement is on
 //!   [`crate::simdef::ActionDef::effects`]): sim STATE is SEQUENTIAL

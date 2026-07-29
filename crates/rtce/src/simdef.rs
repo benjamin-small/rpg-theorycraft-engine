@@ -75,8 +75,8 @@ impl SimDef {
 /// `SimDef`, and per-entity overrides (e.g. [`ActionDef::measure`]) win
 /// over it.
 ///
-/// P8e adds `proc_rolls` here later; the block is the intended home for
-/// every future knob of this kind.
+/// P8e's `proc_rolls` completed the phase's planned trio; the block is
+/// the intended home for every future knob of this kind.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SimDefaults {
     /// The instant a cast's world is measured at, for every action that
@@ -91,6 +91,14 @@ pub struct SimDefaults {
     /// docs say why a per-spell tie-break would be incoherent).
     #[serde(default)]
     pub event_order: EventOrder,
+    /// How a proc's chance is rolled against a damaging cast's hits, for
+    /// every proc that does not override it — see [`ProcRolls`] for the
+    /// full semantics (the hit-trigger scope, the ICD-at-one-instant
+    /// rule, the once-per-cast chance evaluation). Defaults to
+    /// [`ProcRolls::PerCast`], the long-standing one-roll-per-cast
+    /// behavior.
+    #[serde(default)]
+    pub proc_rolls: ProcRolls,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this block.
@@ -102,7 +110,8 @@ impl SimDefaults {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
     /// Staleness here only degrades the did-you-mean, never
     /// correctness — see `config_keys`' module docs ("Staleness").
-    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["measure", "event_order"];
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] =
+        &["measure", "event_order", "proc_rolls"];
 
     /// `true` when serializing this block would write nothing a reader
     /// needs: every knob at its default AND no `_` annotations to carry
@@ -113,8 +122,8 @@ impl SimDefaults {
     /// content `extra` is FOR). Spelled as whole-struct equality, not a
     /// per-field predicate, so a knob added by a later task cannot be
     /// silently DROPPED on serialize by an un-extended list (P8d's
-    /// `event_order` landed under exactly this cover; P8e's
-    /// `proc_rolls` is next).
+    /// `event_order` and P8e's `proc_rolls` each landed under exactly
+    /// this cover).
     #[must_use]
     pub fn is_vacuous(&self) -> bool {
         *self == Self::default()
@@ -262,6 +271,95 @@ pub enum EventOrder {
     /// phase boundary, and rotation wake; within a class, scheduling
     /// order still decides.
     CompletionsFirst,
+}
+
+/// How a proc's chance is ROLLED against one damaging cast's hits (P8e).
+///
+/// Configured package-wide via [`SimDefaults::proc_rolls`] and overridden
+/// per proc via [`ProcDef::rolls`] — the override lives on the PROC
+/// because rolling is the proc's semantics; the hit count is already the
+/// action's. **Default: [`ProcRolls::PerCast`]** — the long-standing
+/// behavior, bit-identical (including Monte Carlo RNG draw order) for
+/// every config that names neither field.
+///
+/// # The two policies
+///
+/// - [`PerCast`](ProcRolls::PerCast) (default): one roll per damaging
+///   cast, `hits_per_use`-blind — a 5-hit cast presents the same single
+///   qualifying roll a 1-hit cast does.
+/// - [`PerHit`](ProcRolls::PerHit): one roll per HIT, where the hit
+///   count is the cast's measured `hits_per_use` (from the cast's world
+///   snapshot — the [`Measure`] instant, the same value its damage is
+///   multiplied by). In `Mode::Expected` the EV accumulator is fed once
+///   per hit (`acc += chance × weight` per hit — the `on_crit`
+///   crit-probability weight applies per hit) and multiple crossings can
+///   fire within one cast; in `Mode::MonteCarlo` each hit is its own
+///   Bernoulli draw. The two modes' long-run fire rates agree under
+///   either policy: EV's per-hit weight times the hit count is exactly
+///   the expectation of MC's per-hit draws under the cast's one sampled
+///   crit mask (see "on_crit" below).
+///
+/// # Scope: which rolls this governs
+///
+/// The knob governs the HIT-driven triggers ([`Trigger::OnHit`],
+/// [`Trigger::OnCrit`]) — the ones whose event today approximates "the
+/// cast's hits" as a single roll. An [`Trigger::OnCast`] proc's event is
+/// the CAST itself, so it rolls once per cast under either setting,
+/// whatever `rolls` says (the [`Measure`]-on-instant-casts precedent:
+/// documented behavior, not an error — a utility cast has no hits at
+/// all, so there is nothing for `per_hit` to count there). Unchanged
+/// rules: a utility cast (no damage) presents no `on_hit`/`on_crit`
+/// roll under either policy, and a proc-triggered FREE cast rolls no
+/// procs at all (P7d), so its hits are never counted by anyone.
+///
+/// # The ICD-at-one-instant rule
+///
+/// All hits of one cast land at the SAME instant in the current model,
+/// so any `icd > 0` caps fires at ONE per cast even under `per_hit`: the
+/// first fire arms `icd_ready_at = now + icd > now`, and every remaining
+/// hit of that cast is then ICD-gated — skipped outright, its mass
+/// discarded (the P6 review/I1 hard-gate rule, applied per hit; EV
+/// banking what MC's gate discards is exactly the over-fire that rule
+/// exists to prevent). `icd: 0` permits multiple fires per cast.
+///
+/// # Chance is evaluated once per proc per cast
+///
+/// A cast's hits are simultaneous and land in one measured world, so the
+/// `chance` expression is evaluated ONCE per proc per cast and that one
+/// value feeds every hit's roll — a fire mid-cast (its buff, its free
+/// cast) is never visible to its own sibling hits' chance, exactly as a
+/// hit cannot retroactively change the world it landed in (P8c). It IS
+/// visible to every LATER proc in the same trigger batch (the P7b
+/// per-proc slot refresh, unchanged) and to every later cast.
+///
+/// # Fail-closed
+///
+/// `per_hit` rolls a literal count, so the measured `hits_per_use` must
+/// be a whole number `>= 0` at the roll instant — a fractional value is
+/// an EV averaging device with no per-hit reading, and the contradiction
+/// is a positioned run error naming the proc, the action, and the value
+/// (under `per_cast` the roll is hits-blind and any finite value stays
+/// legal).
+///
+/// `#[non_exhaustive]` for [`Measure`]'s reason (the
+/// [`Measure`]/[`EventOrder`]/[`EffectDef`] precedent chain): a third
+/// policy (a per-projectile-chain roll, a capped per-hit variant) is
+/// plausible and would have to land here, so an exhaustive `match`
+/// downstream would make that a breaking change for no gain. Variants
+/// stay freely constructible; only an exhaustive `match` needs a
+/// wildcard arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProcRolls {
+    /// One roll per damaging cast, `hits_per_use`-blind. The
+    /// long-standing behavior, and the default.
+    #[default]
+    PerCast,
+    /// One roll per measured hit — EV feeds the accumulator per hit, MC
+    /// draws per hit; the ICD gates between fires (see the
+    /// ICD-at-one-instant rule on the type docs).
+    PerHit,
 }
 
 /// A literal number or an expression string, evaluated at a documented
@@ -1256,6 +1354,19 @@ pub struct ProcDef {
     /// (omit the key) for "every action".
     #[serde(default)]
     pub actions: Option<Vec<String>>,
+    /// Per-proc override of [`SimDefaults::proc_rolls`] — how THIS
+    /// proc's chance is rolled against a damaging cast's hits (see
+    /// [`ProcRolls`] for the semantics, the default, and the
+    /// interactions). `None` (the default) defers to the `defaults`
+    /// block; two procs on one trigger may resolve to different
+    /// policies.
+    ///
+    /// The override lives HERE, on the proc, because rolling is the
+    /// proc's semantics — the hit count is already the action's
+    /// (`hits_per_use`), and one action's hits can feed a per-cast proc
+    /// and a per-hit proc in the same batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolls: Option<ProcRolls>,
     /// Ordered list of effects this proc executes when it FIRES — the
     /// first-class spelling of what [`ProcDef::apply_buff`] /
     /// [`ProcDef::cast_action`] each express one entry of. Executed in
@@ -1291,6 +1402,7 @@ impl ProcDef {
         "apply_buff",
         "cast_action",
         "actions",
+        "rolls",
         "effects",
     ];
 }
@@ -1941,11 +2053,13 @@ mod tests {
         let def: SimDef = serde_json::from_str(P6_SPEC_SIMDEF_JSON).unwrap();
         assert_eq!(def.defaults.measure, Measure::CastComplete);
         assert_eq!(def.defaults.event_order, EventOrder::Scheduled);
+        assert_eq!(def.defaults.proc_rolls, ProcRolls::PerCast);
         assert_eq!(def.defaults, SimDefaults::default());
         assert_eq!(def.actions["fireball"].measure, None);
+        assert_eq!(def.procs["conflagrate"].rolls, None);
         let json = serde_json::to_string(&def).unwrap();
         assert!(
-            !json.contains("defaults") && !json.contains("measure"),
+            !json.contains("defaults") && !json.contains("measure") && !json.contains("rolls"),
             "a config that never wrote the block round-trips without it: {json}"
         );
     }
@@ -2051,6 +2165,74 @@ mod tests {
         assert!(
             e.to_string()
                 .contains("expected `scheduled` or `completions_first`"),
+            "got: {e}"
+        );
+    }
+
+    // ==================================================================
+    // P8e — `proc_rolls` at the parse layer.
+    // ==================================================================
+
+    // The omitted-block contract extends to the third knob, and the
+    // per-proc override round-trips: `Some` survives, `None` (deferral)
+    // never reappears as a key.
+    #[test]
+    fn proc_rolls_and_the_per_proc_override_parse_and_round_trip() {
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "defaults": { "proc_rolls": "per_hit" },
+              "procs": {
+                "spark": { "trigger": "on_hit", "chance": "0.2",
+                           "apply_buff": "glow", "rolls": "per_cast" },
+                "flare": { "trigger": "on_hit", "chance": "0.2",
+                           "apply_buff": "glow" }
+              },
+              "buffs": { "glow": { "duration": 1.0 } },
+              "damage_objective": "hit"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(def.defaults.proc_rolls, ProcRolls::PerHit);
+        assert_eq!(
+            def.defaults.measure,
+            Measure::CastComplete,
+            "naming one knob must not disturb the others"
+        );
+        assert_eq!(def.defaults.event_order, EventOrder::Scheduled);
+        assert_eq!(def.procs["spark"].rolls, Some(ProcRolls::PerCast));
+        assert_eq!(def.procs["flare"].rolls, None, "deferral is None");
+
+        let round: SimDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(round.defaults, def.defaults);
+        assert_eq!(round.procs["spark"].rolls, Some(ProcRolls::PerCast));
+        assert_eq!(round.procs["flare"].rolls, None);
+    }
+
+    // A malformed `proc_rolls`/`rolls` VALUE names the two variants —
+    // the same serde-derived voice as `measure`'s and `event_order`'s.
+    // The probe values are the plausible ones: a `per_hitt` typo on the
+    // block, and a `per_use` guess (the `hits_per_use` echo) on the proc.
+    #[test]
+    fn a_malformed_proc_rolls_value_names_the_two_variants() {
+        let e = serde_json::from_str::<SimDef>(
+            r#"{ "defaults": { "proc_rolls": "per_hitt" },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("expected `per_cast` or `per_hit`"),
+            "got: {e}"
+        );
+
+        let e = serde_json::from_str::<SimDef>(
+            r#"{ "procs": { "spark": { "trigger": "on_hit", "chance": "1",
+                                       "apply_buff": "x", "rolls": "per_use" } },
+                 "buffs": { "x": { "duration": 1.0 } },
+                 "damage_objective": "hit" }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("expected `per_cast` or `per_hit`"),
             "got: {e}"
         );
     }

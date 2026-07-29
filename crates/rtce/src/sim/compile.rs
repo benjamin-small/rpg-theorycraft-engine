@@ -8,7 +8,7 @@ use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
 use crate::simdef::{
-    EffectDef, EventOrder, Measure, NumOrExpr, ReapplyPolicy, Rotation, SimDef, Trigger,
+    EffectDef, EventOrder, Measure, NumOrExpr, ProcRolls, ReapplyPolicy, Rotation, SimDef, Trigger,
 };
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
@@ -244,6 +244,12 @@ pub struct CompiledProc {
     /// `Some(empty)` — [`compile`] rejects that (see
     /// [`crate::simdef::ProcDef::actions`]).
     pub actions: Option<Vec<usize>>,
+    /// The RESOLVED roll policy for this proc (P8e):
+    /// [`crate::simdef::ProcDef::rolls`] where the config named one, else
+    /// [`crate::simdef::SimDefaults::proc_rolls`] — the executor never
+    /// consults the `defaults` block again. See [`ProcRolls`] for what
+    /// the policy means.
+    pub rolls: ProcRolls,
 }
 
 /// One compiled [`crate::simdef::Rule`]: the action index it casts and its
@@ -918,6 +924,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .actions
                 .as_ref()
                 .map(|list| list.iter().map(|a| action_index(a)).collect()),
+            rolls: p.rolls.unwrap_or(simdef.defaults.proc_rolls),
         });
     }
 
@@ -1084,6 +1091,7 @@ mod tests {
             "conflagrate".to_string(),
             ProcDef {
                 extra: Default::default(),
+                rolls: None,
                 trigger: Trigger::OnCrit,
                 chance: "lucky_hit_chance / 100 * 0.3".into(),
                 icd: 2.0,
