@@ -166,13 +166,13 @@ NOT decided in 0.3.0. Three groups:
 
 - [x] ~~Harmonize `apply_buff`'s ARITY between `ActionDef` (a
       `Vec<String>` list) and `ProcDef` (a single `Option<String>`)~~ —
-      **landed in P8b** (Unreleased), by a different shape than the
+      **landed in P8b** (0.4.0), by a different shape than the
       untagged string-or-list this entry guessed at: the ordered
       `effects` list (`"effects": [ { "apply_buff": … }, … ]`) is one
       list form on BOTH entities, and the old fields stay as 0.x sugar
       that desugars into it at `sim::compile` (mixing sugar with an
       explicit list on one entity is an "ambiguous order" compile
-      error). See the CHANGELOG's Unreleased entry.
+      error). See the CHANGELOG's 0.4.0 entry.
 - [ ] `cast_action` effects on ACTIONS (combo chains) — deferred, and the
       `sim::compile` error for one points at this entry. A proc-fired
       free cast cannot recurse because a free cast rolls no procs; an
@@ -205,7 +205,7 @@ NOT decided in 0.3.0. Three groups:
       shape should be chosen by a config that needs it, most likely one
       of the PoE2 trigger slices.
 - [x] ~~Crate-wide `deny_unknown_fields` on the config structs~~ —
-      **landed in P8a** (Unreleased), though NOT at the serde layer:
+      **landed in P8a** (0.4.0), though NOT at the serde layer:
       unknown keys are collected and rejected at `plan::compile`/
       `sim::compile` with a did-you-mean (or at parse via hand-written
       `Deserialize` for the seven structs both consumers construct in
@@ -215,9 +215,9 @@ NOT decided in 0.3.0. Three groups:
       `tick_objective` object form now report what was expected via
       hand-written `Deserialize` (the `TickObjectiveObj` +
       `deny_unknown_fields` machinery is gone). See the CHANGELOG's
-      Unreleased migration note.
+      0.4.0 migration note.
 - [x] ~~**Should `CastComplete` out-rank a coincident `BuffExpire`?**~~
-      (P7e-T2 review) — **answered BY CONFIG in P8d** (Unreleased):
+      (P7e-T2 review) — **answered BY CONFIG in P8d** (0.4.0):
       both orders are legitimate semantics, so neither was hardcoded —
       `defaults.event_order` picks one. `"scheduled"` (the default) is
       the honest name for the long-standing behavior: same-instant
@@ -293,7 +293,7 @@ NOT decided in 0.3.0. Three groups:
       contribution flag) rather than a `SimDef` one — so the shape should
       be chosen by a config that actually needs `×1.331`, not guessed at.
 - [x] ~~**Should a same-list `apply_buff` capture freeze the PHASE
-      too?**~~ — **answered YES in P8c** (Unreleased): a cast's
+      too?**~~ — **answered YES in P8c** (0.4.0): a cast's
       `ApplyBuff` captures read the cast's ONE world snapshot — build
       AND phase, captured together at the action's resolved `measure`
       instant — so both orderings of `["mark", "poison"]` now capture
@@ -306,7 +306,7 @@ NOT decided in 0.3.0. Three groups:
       live ambient capture. See the CHANGELOG migration note for exactly
       which configs move.
 - [x] ~~**Should `Trigger::OnHit` scale with `hits_per_use`?**~~ (0.3.0
-      release review) — **answered BY CONFIG in P8e** (Unreleased): both
+      release review) — **answered BY CONFIG in P8e** (0.4.0): both
       readings are legitimate semantics, so neither was hardcoded —
       `defaults.proc_rolls` / `ProcDef.rolls` picks one. `"per_cast"`
       (the default) keeps the long-standing hits-blind roll,
@@ -325,7 +325,7 @@ NOT decided in 0.3.0. Three groups:
       fractional EV contrast, the 7==7 ICD equality, the per-hit
       ICD-bound EV/MC agreement regression).
 - [x] ~~**`Contribution::value` is never checked for finiteness**~~ —
-      **landed in P8a** (Unreleased): rejected on BOTH halves of the
+      **landed in P8a** (0.4.0): rejected on BOTH halves of the
       shared type (`Plan` build resolution for `BuildState.contributions`,
       `sim::compile` for `BuffDef.contributions`), alongside the same
       guard for `BuildState.stats` and `Phase.stats` values. The original
@@ -359,7 +359,7 @@ NOT decided in 0.3.0. Three groups:
       0.3.0 purely because it is a behavior change caught at release-review
       time; it is not a design question and wants no config to justify it.
 - [x] ~~`sim::SimScratch` is public, constructible, and accepted by
-      nothing~~ — **REMOVED from the public API in P8f** (Unreleased):
+      nothing~~ — **REMOVED from the public API in P8f** (0.4.0):
       "remove" won over "give `run` a `_with_scratch` variant", because
       no driver has asked for batch scratch reuse and dead surface
       should not wait for one. The type itself survives crate-internally
@@ -370,14 +370,14 @@ NOT decided in 0.3.0. Three groups:
       CHANGELOG'd as the 0.4.0 breaking note.
 - [x] ~~A `ProcDef` can do exactly ONE of `apply_buff` / `cast_action`,
       and the limitation is enforced but not stated on the type (0.3.0
-      release review)~~ — **landed in P8b** (Unreleased): "allow both"
+      release review)~~ — **landed in P8b** (0.4.0): "allow both"
       won, as the ordered `ProcDef::effects` list — a proc that applies a
       buff AND free-casts is now one list with two entries, order
       explicit and pinned (the 0.2/0.1 order contrast). The exactly-one
       check generalized to "a proc must do something" (empty after
       desugar is the error; both SUGAR fields at once is still refused).
 - [x] ~~Coverage gaps recorded rather than closed in 0.3.0~~ — **all
-      three closed in P8f** (Unreleased), and none was hiding a bug:
+      three closed in P8f** (0.4.0), and none was hiding a bug:
       `refresh` + LIVE `tick_objective` is pinned behaviorally
       (`sim::exec`'s `mod live_dot` — the 500/0.4 two-window pin, plus a
       mid-window refold contrast that discriminates live from snapshot
@@ -392,7 +392,7 @@ NOT decided in 0.3.0. Three groups:
       test — the CLAUDE.md docs-discipline rule 3 audit is what
       confirmed the matrix.
 - [x] ~~`expr::MAX_STACK` is unreachable in practice~~ — **documented
-      honestly in P8f** (Unreleased). What was true: the constant is
+      honestly in P8f** (0.4.0). What was true: the constant is
       `pub` only inside the PRIVATE `expr::compiler` module — never
       re-exported, so unreachable as public API — while
       `Program::max_depth`'s public doc named it as though a reader

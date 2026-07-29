@@ -164,6 +164,16 @@ impl SimDefaults {
 ///   it is never frozen to the triggering cast's snapshot, whatever
 ///   either action's `measure` says (a free cast begins and completes at
 ///   the firing proc's instant, so the two measures coincide there).
+/// - **Measurement is not ATTRIBUTION.** A `cast_start` cast that spans
+///   a phase boundary is PRICED against the start instant's world (the
+///   snapshot's phase) but its damage is CREDITED to the phase it
+///   completes in — the completion instant's row of the per-phase
+///   report, where damage has always landed. This knob moves what a
+///   cast is worth, never which phase's ledger the worth is written
+///   into. (Which phase a COINCIDENT boundary-instant cast lands in is
+///   [`EventOrder`]'s question — its zero-weight-phase flip moves both
+///   measurement and attribution together, because it reorders the
+///   events themselves.)
 /// - **Instant casts** (`cast_time` `0`): an instant cast is ALWAYS
 ///   measured at the completion position, whatever `measure` says. Cast
 ///   start and cast complete share the wall-clock instant, but the
@@ -330,7 +340,12 @@ pub enum EventOrder {
 /// cast) is never visible to its own sibling hits' chance, exactly as a
 /// hit cannot retroactively change the world it landed in (P8c). It IS
 /// visible to every LATER proc in the same trigger batch (the P7b
-/// per-proc slot refresh, unchanged) and to every later cast.
+/// per-proc slot refresh, unchanged) and to every later cast. Note the
+/// evaluation is LIVE at the roll instant — the once-per-cast rule is
+/// about the COUNT of evaluations, not their world: `chance` reads the
+/// current sim state when the proc batch runs (the completion), never
+/// the cast's [`Measure`] snapshot, which feeds only `Plan` evaluations
+/// (damage, `hits_per_use`, crit weight, tick captures).
 ///
 /// # Fail-closed
 ///

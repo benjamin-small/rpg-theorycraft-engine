@@ -138,6 +138,32 @@ bug found hiding:
   pinned too, mutation-proven both ways
   (`a_per_action_override_wins_over_a_non_default_defaults_block`),
   matching the two-direction coverage `proc_rolls` already had.
+- From the whole-phase review: the LAST doc-claimed snapshot consumer
+  with only one cell pinned — `Measure`'s rustdoc promises the snapshot
+  feeds the tick capture of every `ApplyBuff` entry, but every
+  tick-capture pin ran under the default measure. Now pinned in both
+  cells on one single-cast fixture
+  (`a_snapshot_tick_capture_reads_the_cast_start_world_under_cast_start`):
+  a `rate = 100 × (1 + time)` overlay captured at t=1 under the default
+  (rate 200 → DoT 600) and at t=0 under `cast_start` (rate 100 → DoT
+  300); discarding the pending snapshot and re-measuring at completion
+  reddens exactly the `cast_start` literal at 600.
+
+### Fixed — positioned-error labels tell the truth under `cast_start` (P8f review)
+
+The `damage.stats`/`hits_per_use` error contexts hardcoded "at cast
+complete (t={now})" — under `measure: "cast_start"` a NaN stat at t=0
+therefore errored "at cast complete (t=0)", where t=0 IS the cast start:
+self-contradictory. The label is now the capture position ("at cast
+start" / "at cast complete", supplied by the capture's caller — an
+instant cast correctly keeps the completion label under `cast_start`).
+Same family: `proc_roll_count`'s "measured hits_per_use {h} at t=…"
+stamped the ROLL instant (the completion) on a value measured at cast
+start; the stamp is now the MEASURED instant, which the cast's
+measurement carries. Default-path wording is untouched (its long-standing
+pins stay green); the `cast_start`-path wording has its own pin now
+(`measured_value_errors_name_the_cast_start_instant_under_cast_start` —
+all three error sites), so the labels cannot regress.
 
 ### Changed — Rust API (P8f)
 
@@ -169,7 +195,19 @@ bug found hiding:
   numeric doc claim ships with a contrast-run pin; every shipped
   `(default × override)` cell gets a discriminating test. The P8f audit
   against those rules produced the override-direction test and the
-  `max_depth` boundary pin above.
+  `max_depth` boundary pin above; the whole-phase review added a
+  corollary (now also in `CLAUDE.md`): the release-staging commit
+  re-sweeps ROADMAP's version pointers, since cutting Unreleased into a
+  version stales every "(Unreleased)" cross-reference in the same
+  commit.
+- Two review clarifications on the knob docs, each verified against the
+  executor: `Measure` now states the measurement/attribution split (a
+  boundary-spanning `cast_start` cast is PRICED against the start
+  instant's world but CREDITED to the completion instant's per-phase
+  row), and `ProcRolls`' once-per-cast chance rule now says outright
+  that `chance` evaluates LIVE at the roll instant — the rule is about
+  the count of evaluations, not their world; the `Measure` snapshot
+  feeds only `Plan` evaluations.
 
 ### Added — `proc_rolls` (P8e)
 

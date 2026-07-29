@@ -913,6 +913,15 @@ struct DamageMeasure {
     /// `None` in `Mode::MonteCarlo` (the branch is sampled outright) and
     /// for a proc-triggered free cast (which rolls no procs).
     crit_chance: Option<f64>,
+    /// The wall-clock instant this measurement was TAKEN — the capture's
+    /// `now`, which under `measure: "cast_start"` precedes the completion
+    /// (and therefore the proc rolls) by the cast time. Carried so a
+    /// positioned error about a measured value ([`Sim::proc_roll_count`]'s
+    /// fractional/over-cap `hits_per_use` rejections) can stamp the
+    /// instant the value was MEASURED at, not the instant the error
+    /// surfaced (P8f review fix — the two differ exactly when the label
+    /// matters most).
+    measured_at: f64,
 }
 
 /// Running integral of one tracked condition's effective value over time
@@ -2346,7 +2355,7 @@ impl<'a> Sim<'a> {
                 // The cast-start world: cost paid, cooldown armed — the
                 // world this cast leaves behind as it starts (`casts.<self>`
                 // not yet counted, `gain` not yet credited).
-                self.pending_snapshot = self.capture_world(action, true)?;
+                self.pending_snapshot = self.capture_world(action, true, "at cast start")?;
             }
             self.mid_cast = true;
             self.schedule(now + ct, Event::CastComplete { action })
@@ -2375,7 +2384,7 @@ impl<'a> Sim<'a> {
             // The default instant (`cast_complete`): measure here, in the
             // transaction — after `gain` and the `casts` increment,
             // before this cast's effects and proc rolls.
-            None => self.capture_world(action, true)?,
+            None => self.capture_world(action, true, "at cast complete")?,
         };
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
@@ -2411,9 +2420,8 @@ impl<'a> Sim<'a> {
         if self.rng.is_some() {
             self.roll_procs_mc(Trigger::OnCast, true, action, None)?;
             if let Some(d) = damage_measure {
-                let hits = d.hits;
-                self.roll_procs_mc(Trigger::OnHit, true, action, Some(hits))?;
-                self.roll_procs_mc(Trigger::OnCrit, is_crit, action, Some(hits))?;
+                self.roll_procs_mc(Trigger::OnHit, true, action, Some(d))?;
+                self.roll_procs_mc(Trigger::OnCrit, is_crit, action, Some(d))?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0, action, None)?;
@@ -2422,9 +2430,8 @@ impl<'a> Sim<'a> {
                     "capture_world(.., true) fills crit_chance for a \
                      damaging action in EV mode",
                 );
-                let hits = d.hits;
-                self.roll_procs_ev(Trigger::OnHit, 1.0, action, Some(hits))?;
-                self.roll_procs_ev(Trigger::OnCrit, crit_chance, action, Some(hits))?;
+                self.roll_procs_ev(Trigger::OnHit, 1.0, action, Some(d))?;
+                self.roll_procs_ev(Trigger::OnCrit, crit_chance, action, Some(d))?;
             }
         }
         Ok(())
@@ -2459,6 +2466,17 @@ impl<'a> Sim<'a> {
     /// which rolls no procs and would otherwise pay for a `Plan` query
     /// nothing reads.
     ///
+    /// `instant` is the human-readable name of the position this capture
+    /// runs at — `"at cast start"` from [`Sim::begin_cast`], `"at cast
+    /// complete"` from the completion positions — threaded into every
+    /// positioned error a measured value can raise, so an error under
+    /// `measure: "cast_start"` names the instant the value was actually
+    /// evaluated at (P8f review fix: the label used to hardcode "at cast
+    /// complete", which at t=0 under `cast_start` was self-contradictory).
+    /// The CALLER supplies it, rather than this method deriving it from
+    /// the resolved [`Measure`], because the mapping is not one-to-one:
+    /// an instant cast resolves `cast_start` to the completion position.
+    ///
     /// # Intra-instant ordering under the default measure
     ///
     /// Under `cast_complete` the completion instant has internal order
@@ -2480,6 +2498,7 @@ impl<'a> Sim<'a> {
         &mut self,
         action: usize,
         needs_crit_chance: bool,
+        instant: &'static str,
     ) -> Result<Option<WorldSnapshot>, PlanError> {
         let now = self.time;
         let damaging = self.sim_plan.actions[action].damage.is_some();
@@ -2489,14 +2508,21 @@ impl<'a> Sim<'a> {
         self.refresh_time_varying_slots();
         let phase = self.effective_phase.clone();
         let (build, damage) = if damaging {
-            let build = self.overlay_build_for_action(action, now)?;
-            let hits = self.eval_hits_per_use(action, now)?;
+            let build = self.overlay_build_for_action(action, now, instant)?;
+            let hits = self.eval_hits_per_use(action, now, instant)?;
             let crit_chance = if needs_crit_chance && self.rng.is_none() {
                 Some(self.eval_action_crit_chance(&build, &phase)?)
             } else {
                 None
             };
-            (build, Some(DamageMeasure { hits, crit_chance }))
+            (
+                build,
+                Some(DamageMeasure {
+                    hits,
+                    crit_chance,
+                    measured_at: now,
+                }),
+            )
         } else {
             // A utility action with effects: its captures read the plain
             // effective build — the frozen-build rule P7d set, captured
@@ -2515,15 +2541,23 @@ impl<'a> Sim<'a> {
     /// active buffs' contributions) with `action`'s own `damage.stats`
     /// overlaid on top (`hits_per_use` excluded — read directly by
     /// [`Sim::eval_hits_per_use`], never fed to the `Plan`; see
-    /// [`crate::simdef::ActionDamage`]). Built ONCE per cast, at cast
-    /// complete, and shared by every per-cast `Plan` query that cast needs
-    /// (EV damage, EV crit chance, sampled damage+mask) so all of them see
-    /// the identical stats.
+    /// [`crate::simdef::ActionDamage`]). Built ONCE per cast, at the
+    /// action's measured instant ([`Sim::capture_world`] — cast complete
+    /// by default, cast start under [`Measure::CastStart`]), and shared
+    /// by every per-cast `Plan` query that cast needs (EV damage, EV crit
+    /// chance, sampled damage+mask) so all of them see the identical
+    /// stats.
     ///
     /// Each value is evaluated at THIS instant (the caller refreshes the
     /// slot array's time-varying tail first) and need only be FINITE — a
-    /// stat may legitimately be negative.
-    fn overlay_build_for_action(&self, action: usize, now: f64) -> Result<BuildState, PlanError> {
+    /// stat may legitimately be negative. `instant` is the caller's name
+    /// for the position, for the positioned error.
+    fn overlay_build_for_action(
+        &self,
+        action: usize,
+        now: f64,
+        instant: &'static str,
+    ) -> Result<BuildState, PlanError> {
         let damage_stats = self.sim_plan.actions[action]
             .damage
             .as_ref()
@@ -2535,7 +2569,7 @@ impl<'a> Sim<'a> {
             }
             let v = self.eval_stat(v, || {
                 format!(
-                    "action `{}` damage.stats `{k}` at cast complete (t={now})",
+                    "action `{}` damage.stats `{k}` {instant} (t={now})",
                     self.sim_plan.actions[action].name
                 )
             })?;
@@ -2545,10 +2579,15 @@ impl<'a> Sim<'a> {
     }
 
     /// `action`'s per-cast hit count — `damage.stats`'s `hits_per_use`
-    /// entry (default `1.0` when absent), evaluated at the same cast-
-    /// complete instant and under the same finite-only rule as the rest of
-    /// that map.
-    fn eval_hits_per_use(&self, action: usize, now: f64) -> Result<f64, PlanError> {
+    /// entry (default `1.0` when absent), evaluated at the same measured
+    /// instant and under the same finite-only rule as the rest of that
+    /// map.
+    fn eval_hits_per_use(
+        &self,
+        action: usize,
+        now: f64,
+        instant: &'static str,
+    ) -> Result<f64, PlanError> {
         match self.sim_plan.actions[action]
             .damage
             .as_ref()
@@ -2557,7 +2596,7 @@ impl<'a> Sim<'a> {
         {
             Some(v) => self.eval_stat(v, || {
                 format!(
-                    "action `{}` damage.stats `hits_per_use` at cast complete (t={now})",
+                    "action `{}` damage.stats `hits_per_use` {instant} (t={now})",
                     self.sim_plan.actions[action].name
                 )
             }),
@@ -2655,11 +2694,12 @@ impl<'a> Sim<'a> {
     ///
     /// # `per_hit` rolling (P8e)
     ///
-    /// `hits` is the cast's MEASURED `hits_per_use` (from the same
-    /// [`WorldSnapshot`] its damage was multiplied by), `None` for the
-    /// `OnCast` roll and never present for a utility cast. A proc whose
-    /// resolved [`ProcRolls`] is `per_hit` accumulates ONCE PER HIT
-    /// instead of once per cast — [`Sim::proc_roll_count`] turns `hits`
+    /// `measure` is the cast's [`DamageMeasure`] — its MEASURED
+    /// `hits_per_use` (the same value its damage was multiplied by) plus
+    /// the instant it was measured at. `None` for the `OnCast` roll and
+    /// never present for a utility cast. A proc whose resolved
+    /// [`ProcRolls`] is `per_hit` accumulates ONCE PER HIT instead of
+    /// once per cast — [`Sim::proc_roll_count`] turns the measured count
     /// into the literal loop count (fail-closed on a fractional value).
     /// Inside the loop:
     ///
@@ -2683,7 +2723,7 @@ impl<'a> Sim<'a> {
         trigger: Trigger,
         weight: f64,
         action: usize,
-        hits: Option<f64>,
+        measure: Option<&DamageMeasure>,
     ) -> Result<(), PlanError> {
         let now = self.time;
         for pi in 0..self.sim_plan.procs.len() {
@@ -2696,7 +2736,7 @@ impl<'a> Sim<'a> {
             // Before the ICD gate, so a per_hit/fractional-hits config
             // contradiction surfaces on the FIRST qualifying cast, not
             // whenever the ICD happens to be open.
-            let rolls = self.proc_roll_count(pi, action, hits)?;
+            let rolls = self.proc_roll_count(pi, action, measure)?;
             if now < self.procs[pi].icd_ready_at {
                 // ICD hard gate (I1): this roll's mass is discarded, not
                 // banked — matches `roll_procs_mc`'s "skip outright".
@@ -2739,9 +2779,10 @@ impl<'a> Sim<'a> {
 
     /// How many rolls proc `pi` presents for ONE qualifying event (P8e):
     /// `1` under [`ProcRolls::PerCast`] (the default — hits-blind, the
-    /// long-standing behavior) and for any roll that carries no hit
-    /// count (`hits: None` — the `OnCast` roll, whose event is the cast
-    /// itself); the measured hit count under [`ProcRolls::PerHit`].
+    /// long-standing behavior) and for any roll that carries no
+    /// measurement (`measure: None` — the `OnCast` roll, whose event is
+    /// the cast itself); the measured hit count under
+    /// [`ProcRolls::PerHit`].
     ///
     /// Fail-closed, twice: `per_hit` rolls a LITERAL count, so a
     /// measured `hits_per_use` that is not a whole number `>= 0` (a
@@ -2763,12 +2804,19 @@ impl<'a> Sim<'a> {
         &self,
         pi: usize,
         action: usize,
-        hits: Option<f64>,
+        measure: Option<&DamageMeasure>,
     ) -> Result<u64, PlanError> {
-        match (self.sim_plan.procs[pi].rolls, hits) {
+        match (self.sim_plan.procs[pi].rolls, measure) {
             (ProcRolls::PerCast, _) | (ProcRolls::PerHit, None) => Ok(1),
-            (ProcRolls::PerHit, Some(h)) => {
+            (ProcRolls::PerHit, Some(m)) => {
+                let h = m.hits;
                 let n = h.round();
+                // The error stamps `m.measured_at` — the instant the
+                // value was MEASURED (`Sim::capture_world`'s `now`), not
+                // `self.time` (the roll instant): under `measure:
+                // "cast_start"` the two differ by the cast time, and
+                // "measured X at t" must name the measurement (P8f
+                // review fix).
                 if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
                     return Err(PlanError {
                         what: format!(
@@ -2777,7 +2825,7 @@ impl<'a> Sim<'a> {
                              whole number >= 0",
                             self.sim_plan.procs[pi].name,
                             self.sim_plan.actions[action].name,
-                            self.time
+                            m.measured_at
                         ),
                     });
                 }
@@ -2789,7 +2837,7 @@ impl<'a> Sim<'a> {
                              capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
                             self.sim_plan.procs[pi].name,
                             self.sim_plan.actions[action].name,
-                            self.time
+                            m.measured_at
                         ),
                     });
                 }
@@ -2819,7 +2867,7 @@ impl<'a> Sim<'a> {
     ///
     /// # `per_hit` rolling (P8e)
     ///
-    /// `hits` as on [`Sim::roll_procs_ev`]. A `per_hit` proc presents
+    /// `measure` as on [`Sim::roll_procs_ev`]. A `per_hit` proc presents
     /// one Bernoulli draw PER MEASURED HIT ([`Sim::proc_roll_count`]),
     /// with the same two loop rules as EV's: `chance` evaluated once
     /// per cast (before the loop — the hits share one world), and the
@@ -2849,7 +2897,7 @@ impl<'a> Sim<'a> {
         trigger: Trigger,
         qualifies: bool,
         action: usize,
-        hits: Option<f64>,
+        measure: Option<&DamageMeasure>,
     ) -> Result<(), PlanError> {
         if !qualifies {
             return Ok(());
@@ -2863,7 +2911,7 @@ impl<'a> Sim<'a> {
                 continue;
             }
             // Before the ICD gate — see `roll_procs_ev`.
-            let rolls = self.proc_roll_count(pi, action, hits)?;
+            let rolls = self.proc_roll_count(pi, action, measure)?;
             if self.procs[pi].icd_ready_at > now {
                 continue; // hard gate — no accumulation, no memory.
             }
@@ -2987,8 +3035,10 @@ impl<'a> Sim<'a> {
         // the P8b sequential rule. Pinned by
         // `a_free_cast_measures_live_ambient_not_the_outer_casts_snapshot`.
         // No crit chance: this path rolls no procs (see this method's doc
-        // comment).
-        let snap = self.capture_world(action, false)?;
+        // comment). A free cast begins AND completes here, measured at
+        // the completion position — "at cast complete" is its instant
+        // whatever either action's `measure` says.
+        let snap = self.capture_world(action, false, "at cast complete")?;
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = self.eval_action_damage(&s.build, &s.phase, d.hits)?;
@@ -10156,6 +10206,163 @@ mod tests {
                 "late (overrides back to cast_complete): got {} — want \
                  10×2 (10 would mean the block silenced the override)",
                 report.actions["late"].damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The snapshot-tick capture reads the MEASURED world under BOTH
+        // measures (P8f review fix — the last doc-claimed snapshot
+        // consumer with only one cell pinned: [`Measure`]'s rustdoc
+        // promises the snapshot feeds "the tick capture of every
+        // ApplyBuff entry", and every other tick-capture pin runs under
+        // the default measure only).
+        //
+        // One cast isolates the cell: `beam` (1s cast, cooldown 1000 —
+        // exactly one cast in a 5s fight) sets `rate = 100 * (1 + time)`
+        // in its overlay and applies `burn`, a duration-3 SNAPSHOT tick
+        // of the `dot = rate` objective. The buff is APPLIED at the
+        // completion (t=1) under either measure — only the world its
+        // capture reads moves:
+        //   cast_complete (default): capture at t=1 → rate 200
+        //     → DoT = 200 × [1,4) = 600
+        //   cast_start:              capture at t=0 → rate 100
+        //     → DoT = 100 × [1,4) = 300
+        // The build's own `rate` is 0 and `hit = dmg` is 0, so the total
+        // IS the DoT and a capture that missed the overlay reads 0 —
+        // three-way discrimination: 600 = completion world, 300 = start
+        // world, 0 = no overlay. The mutation is capturing from the LIVE
+        // world at application instead of the snapshot: both cells then
+        // read 600 and the cast_start literal goes red.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_snapshot_tick_capture_reads_the_cast_start_world_under_cast_start() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "rate"],
+                     "pipeline": [ { "name": "hit", "expr": "dmg" },
+                                   { "name": "dot", "expr": "rate" } ],
+                     "objectives": ["hit", "dot"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 0.0, "rate": 0.0 } }"#).unwrap();
+            let dot_total = |measure_line: &str| {
+                let simdef: SimDef = serde_json::from_str(&format!(
+                    r#"{{ "actions": {{
+                           "beam": {{ "cast_time": "1", "cooldown": 1000.0,
+                                      {measure_line}
+                                      "damage": {{ "stats": {{ "rate": "100 * (1 + time)" }} }},
+                                      "apply_buff": ["burn"] }} }},
+                         "buffs": {{ "burn": {{ "duration": 3.0,
+                                     "tick_objective": {{ "objective": "dot",
+                                                          "snapshot": true }} }} }},
+                         "damage_objective": "hit" }}"#
+                ))
+                .unwrap();
+                let rotation: Rotation =
+                    serde_json::from_str(r#"{ "rules": [ { "action": "beam" } ] }"#).unwrap();
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                let report = run(&plan, &sim_plan, &build, &dummy(5), Mode::Expected).unwrap();
+                assert_eq!(
+                    report.actions["beam"].casts, 1,
+                    "one cast isolates the cell"
+                );
+                report.total.total_damage
+            };
+
+            let at_complete = dot_total("");
+            let at_start = dot_total(r#""measure": "cast_start","#);
+            assert!(
+                close(at_complete, 600.0),
+                "default: got {at_complete} — want the t=1 world's rate 200 \
+                 × 3s (0 would mean the capture missed the overlay)",
+            );
+            assert!(
+                close(at_start, 300.0),
+                "cast_start: got {at_start} — want the t=0 world's rate 100 \
+                 × 3s (600 would mean the capture read the live/completion \
+                 world instead of the cast's measured snapshot)",
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Positioned-error labels tell the truth under `cast_start`
+        // (P8f review fix). The overlay/`hits_per_use` error contexts
+        // used to hardcode "at cast complete (t={now})" — under
+        // `measure: "cast_start"` a NaN stat at t=0 therefore errored
+        // "at cast complete (t=0)" where t=0 IS the cast start:
+        // self-contradictory. The label is now the capture position.
+        // The default-path wording keeps its own long-standing pins
+        // (`non_finite_expr_damage_stat_fails_closed_at_cast_complete`);
+        // this is the cast_start-path twin, on both error sites.
+        // --------------------------------------------------------------
+        #[test]
+        fn measured_value_errors_name_the_cast_start_instant_under_cast_start() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let err_with = |damage: &str| {
+                let simdef: SimDef = serde_json::from_str(&format!(
+                    r#"{{ "actions": {{
+                           "beam": {{ "cast_time": "1", "cooldown": 0.0,
+                                      "measure": "cast_start",
+                                      "damage": {{ "stats": {damage} }} }} }},
+                         "damage_objective": "hit" }}"#
+                ))
+                .unwrap();
+                let rotation: Rotation =
+                    serde_json::from_str(r#"{ "rules": [ { "action": "beam" } ] }"#).unwrap();
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                run(&plan, &sim_plan, &build, &dummy(5), Mode::Expected).unwrap_err()
+            };
+
+            let e = err_with(r#"{ "dmg": "0 / 0" }"#);
+            assert!(
+                e.what
+                    .contains("action `beam` damage.stats `dmg` at cast start (t=0)"),
+                "the overlay error must name the instant the value was \
+                 evaluated at — got: {}",
+                e.what
+            );
+            assert!(e.what.contains("NaN"), "got: {}", e.what);
+
+            let e = err_with(r#"{ "hits_per_use": "0 / 0" }"#);
+            assert!(
+                e.what
+                    .contains("action `beam` damage.stats `hits_per_use` at cast start (t=0)"),
+                "the hits_per_use error must name the same instant — got: {}",
+                e.what
+            );
+
+            // The third measured-value error site: `proc_roll_count`'s
+            // fractional-hits rejection surfaces at the ROLL (the
+            // completion, t=1) but the value was MEASURED at cast start
+            // (t=0) — the stamp must name the measurement. Only under
+            // `cast_start` do the two instants differ, which is exactly
+            // why the default-path pin
+            // (`a_fractional_hits_per_use_fails_closed_under_per_hit_only`)
+            // could never catch a roll-instant stamp.
+            let simdef: SimDef = serde_json::from_str(
+                r#"{ "actions": {
+                       "beam": { "cast_time": "1", "cooldown": 0.0,
+                                 "measure": "cast_start",
+                                 "damage": { "stats": { "hits_per_use": 2.5 } } } },
+                     "buffs": { "glow": { "duration": 0.5 } },
+                     "procs": { "spark": { "trigger": "on_hit", "chance": "1",
+                                            "icd": 0.0, "rolls": "per_hit",
+                                            "apply_buff": "glow" } },
+                     "damage_objective": "hit" }"#,
+            )
+            .unwrap();
+            let rotation: Rotation =
+                serde_json::from_str(r#"{ "rules": [ { "action": "beam" } ] }"#).unwrap();
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            let e = run(&plan, &sim_plan, &build, &dummy(5), Mode::Expected).unwrap_err();
+            assert!(
+                e.what
+                    .contains("measured hits_per_use 2.5 at t=0 — per-hit rolling"),
+                "the stamp must be the MEASURED instant (t=0), not the roll \
+                 instant (t=1) — got: {}",
+                e.what
             );
         }
 

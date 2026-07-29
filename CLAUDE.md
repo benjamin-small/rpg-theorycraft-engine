@@ -40,6 +40,10 @@ Docs are a deliverable with the same gate as code:
    answer lives. A cell that is deliberately NOT pinned is listed as
    open debt (ROADMAP), never left implicit.
 
+The release-staging commit re-sweeps ROADMAP's version pointers: cutting
+CHANGELOG's Unreleased into `[X.Y.Z]` stales every "(Unreleased)"
+cross-reference in the same commit (the 0.4.0 staging proved it).
+
 ## Standing gates (all clean, per task)
 
 - `cargo test --workspace`
