@@ -8,7 +8,21 @@ truth) and `docs/superpowers/plans/` for the active plan.
 
     cargo test --workspace     # the whole gate — must be green to commit
 
-## Conventions (inherited from ../diablo4-calc — non-negotiable)
+## Consumers
+
+Both consume `rtce` as a PATH dependency (`../rpg-theorycraft-engine`), so
+a change here reaches them immediately — and both were renamed and
+restructured in 2026-08:
+
+| now | was | consumes |
+|---|---|---|
+| `../d4-theory-crafting` | `diablo4-calc` | `plan` (production: its native math is deleted) |
+| `../poe2-theory-crafting` | `poe2-calcs` | `plan` + `sim` + `search` (parity proof; its `calc.rs` stays normative) |
+
+Older entries in CHANGELOG and `docs/superpowers/` use the previous names
+and are left alone — they record what was true when written.
+
+## Conventions (inherited from d4-theory-crafting — non-negotiable)
 
 - Small verified slices; every commit carries a hand-checked number where
   one exists (P1 handshake: base_hit 8,573.0184).
@@ -17,8 +31,10 @@ truth) and `docs/superpowers/plans/` for the active plan.
   the input or the code path, watch the SPECIFIC pin fail, restore,
   report the contrast).
 - Zero allocation on evaluation hot paths; compilation may be expensive.
-- Consumers: diablo4-calc first (its parity suite gates migration);
-  knowledge-graph drivers are OUT OF SCOPE — we only price candidates.
+- Consumers: d4-theory-crafting first (its parity suite gates migration);
+  knowledge-graph drivers are OUT OF SCOPE here — we only price
+  candidates. (`poe2-search` is such a driver and lives in the consumer
+  repo, which is exactly where this line says it belongs.)
 - Fail closed, with positioned errors. Never guess at a config's intent.
 
 ## Docs discipline (P8f — binding on every phase)
@@ -49,9 +65,12 @@ cross-reference in the same commit (the 0.4.0 staging proved it).
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` · `cargo fmt
   --all --check` · `#![warn(missing_docs)]` · `cargo doc` zero warnings
-- Both consumers re-verified: `../diablo4-calc` workspace green + no-arg
-  `eval` golden `17574.299999999996`; `../poe2-calcs` (from `engine/`)
-  `cargo test --test rtce_parity` → 63 passed.
+- Both consumers re-verified (each from its own repo root):
+  - `../d4-theory-crafting` — `cargo test --workspace` green, and
+    `cargo run -q -p d4-core --example eval` (no args) golden
+    `17574.299999999996`.
+  - `../poe2-theory-crafting` — `cargo test --workspace` green, and
+    `cargo test -p poe2-core --test rtce_parity` → 63 passed.
 - `examples/diablo4_rotation.rs` EV **and** MC blocks byte-identical
   under serde defaults (the standing proof no RNG draw or event
   reordering leaked into the default path).

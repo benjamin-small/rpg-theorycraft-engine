@@ -1,4 +1,4 @@
-//! The P3 gate: Diablo 4's algorithm as config, reproducing diablo4-calc's
+//! The P3 gate: Diablo 4's algorithm as config, reproducing d4-theory-crafting's
 //! hand-worked T1–T10 through the generic engine. Every case file carries
 //! its arithmetic in `source`. T9's crit-invariance is a separate test.
 

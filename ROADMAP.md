@@ -2,8 +2,9 @@
 
 ## Proven
 - P1 expression engine · P2 damage model · P3 D4-as-config · P4 parity
-  proof (7 real builds identical through diablo4-calc's native engine and
-  rtce — the standing numbers 8,096.02 … 6,769.10) · **P4c diablo4-calc
+  proof (7 real builds identical through d4-theory-crafting's native engine
+  and
+  rtce — the standing numbers 8,096.02 … 6,769.10) · **P4c d4-theory-crafting
   switchover** — native `calc.rs`/`stats.rs` math deleted, `calc::evaluate`
   is a Breakdown shim over `rtce_adapter` + the compiled `gamedef/`
   stage objectives, WASM/web re-verified at 8,096.02 (rtce proven on
@@ -30,7 +31,8 @@
   pair, a proc-gated buff window, hand-worked EV + Monte Carlo pins),
   CI-run. Published at `rtce` 0.2.0 (`cargo publish --dry-run` clean).
 - **P7 — PoE2 test bed + instance mechanics, DONE (0.3.0).** A SECOND
-  consumer proves the engine is not shaped around one game: `poe2-calcs`
+  consumer proves the engine is not shaped around one game:
+  `poe2-theory-crafting`
   carries a generated 209-stage `GameDef` + adapter reproducing its native
   calculator to 1e-9 across 63 parity tests (124.53 / 129.51 / 793.76),
   with a 156-pair `(StatId, ModKind)` sweep against silent routing drift.

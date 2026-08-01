@@ -219,13 +219,13 @@ exercises sampling.
 
 Parity-proven against two independent consumers.
 
-`diablo4-calc`: all 7 of its archetype builds reproduced to <1e-9 relative
+`d4-theory-crafting`: all 7 of its archetype builds reproduced to <1e-9 relative
 during the P4 cross-engine proof (the standing numbers 8,096.02 …
 6,769.10). As of its P4c switchover it runs **solely** on `rtce` in
 production — native damage math deleted, `calc::evaluate` a thin shim over
 an rtce-compiled plan — including in the browser via WASM.
 
-`poe2-calcs`: a generated 209-stage `GameDef` reproduces that
+`poe2-theory-crafting`: a generated 209-stage `GameDef` reproduces that
 calculator's native math to 1e-9 across 63 parity tests (standing
 references 124.53 / 129.51 / 793.76 dps), with a 156-pair
 `(StatId, ModKind)` sweep guarding against silent routing drift. That

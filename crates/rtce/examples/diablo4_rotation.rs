@@ -9,7 +9,7 @@
 //! resulting cast sequence is a clean, hand-verifiable alternation (see
 //! the pin comments below). A production rotation would tune these from
 //! real skill data the way `diablo4_basics`'s `GameDef` slice was
-//! transcribed from `diablo4-calc`.
+//! transcribed from `d4-theory-crafting`.
 //!
 //! Run: `cargo run -p rtce --example diablo4_rotation`
 //!

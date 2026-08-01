@@ -5,7 +5,7 @@ it as a dev-dependency.
 
 It carries no test logic of its own — just the house rules an
 `rtce`-based game's test suite is expected to share, inherited from
-`diablo4-calc`'s M1 milestone:
+`d4-theory-crafting`'s M1 milestone:
 
 - **Golden fixtures live in JSON files, one case per file.**
   `for_each_fixture` walks a directory, parses each `*.json` as a

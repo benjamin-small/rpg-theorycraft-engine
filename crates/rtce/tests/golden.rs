@@ -1,6 +1,6 @@
 //! Golden fixtures through the full pipeline: JSON → compile → eval →
 //! assert. The first fixture is the cross-repo handshake with
-//! diablo4-calc's parity suite (base_hit 8,573.0184).
+//! d4-theory-crafting's parity suite (base_hit 8,573.0184).
 
 use rtce::expr::compile;
 use rtce_testkit::{assert_close, for_each_fixture};
