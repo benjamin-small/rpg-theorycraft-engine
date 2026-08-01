@@ -1,0 +1,9 @@
+{
+  "stats": { "attack_power": 120.0, "crit_chance": 30.0 },
+  "contributions": [
+    { "bucket": "additive", "value": 30.0 },
+    { "bucket": "additive", "value": 25.0 },
+    { "bucket": "crit_damage", "value": 50.0 },
+    { "bucket": "crit_damage", "value": 50.0, "condition": "focused" }
+  ]
+}

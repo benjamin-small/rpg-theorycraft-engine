@@ -1,0 +1,14 @@
+{
+  "stats": ["attack_power"],
+  "buckets": {
+    "as_sum": { "fold": "sum" },
+    "as_summed_group": { "fold": "summed_group" },
+    "as_product": { "fold": "product" }
+  },
+  "pipeline": [
+    { "name": "sum_result", "expr": "attack_power * (1 + as_sum / 100)" },
+    { "name": "summed_group_result", "expr": "attack_power * as_summed_group" },
+    { "name": "product_result", "expr": "attack_power * as_product" }
+  ],
+  "objectives": ["sum_result", "summed_group_result", "product_result"]
+}

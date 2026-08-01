@@ -1,0 +1,11 @@
+{
+  "stats": { "attack_power": 120.0 },
+  "contributions": [
+    { "bucket": "as_sum", "value": 30.0 },
+    { "bucket": "as_sum", "value": 25.0 },
+    { "bucket": "as_summed_group", "value": 30.0 },
+    { "bucket": "as_summed_group", "value": 25.0 },
+    { "bucket": "as_product", "value": 30.0 },
+    { "bucket": "as_product", "value": 25.0 }
+  ]
+}

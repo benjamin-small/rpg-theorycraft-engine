@@ -1,0 +1,19 @@
+{
+  "stats": ["attack_power", "crit_chance"],
+  "buckets": {
+    "additive": { "fold": "sum" },
+    "crit_damage": { "fold": "summed_group" }
+  },
+  "events": {
+    "crit": { "chance": "crit_chance / 100", "factor": "crit_damage" }
+  },
+  "pipeline": [
+    { "name": "base_hit", "expr": "attack_power" },
+    {
+      "name": "hit",
+      "expr": "base_hit * (1 + additive / 100) * event_factors",
+      "branched": true
+    }
+  ],
+  "objectives": ["hit"]
+}

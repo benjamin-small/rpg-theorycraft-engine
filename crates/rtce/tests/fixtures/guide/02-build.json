@@ -1,0 +1,7 @@
+{
+  "stats": { "attack_power": 120.0 },
+  "contributions": [
+    { "bucket": "additive", "value": 30.0 },
+    { "bucket": "additive", "value": 25.0 }
+  ]
+}

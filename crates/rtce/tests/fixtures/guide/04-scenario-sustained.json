@@ -1,0 +1,10 @@
+{
+  "phases": [
+    {
+      "name": "average",
+      "weight": 1,
+      "uptimes": { "focused": 0.2 },
+      "stats": { "enemy_armor": 20.0 }
+    }
+  ]
+}

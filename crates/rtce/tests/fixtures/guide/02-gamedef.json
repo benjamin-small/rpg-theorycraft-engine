@@ -1,0 +1,10 @@
+{
+  "stats": ["attack_power"],
+  "buckets": {
+    "additive": { "fold": "sum" }
+  },
+  "pipeline": [
+    { "name": "hit", "expr": "attack_power * (1 + additive / 100)" }
+  ],
+  "objectives": ["hit"]
+}

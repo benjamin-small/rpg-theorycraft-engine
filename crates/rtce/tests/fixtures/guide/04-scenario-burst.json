@@ -1,0 +1,10 @@
+{
+  "phases": [
+    {
+      "name": "armor_break",
+      "weight": 1,
+      "uptimes": { "focused": 1.0 },
+      "stats": { "enemy_armor": 5.0 }
+    }
+  ]
+}

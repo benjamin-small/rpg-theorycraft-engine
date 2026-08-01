@@ -1,0 +1,5 @@
+{
+  "phases": [
+    { "name": "dummy", "weight": 1 }
+  ]
+}
