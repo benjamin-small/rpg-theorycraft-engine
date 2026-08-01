@@ -21,8 +21,11 @@ Use these exact values:
 - Repository owner: `benjamin-small`
 - Repository name: `rpg-theorycraft-engine`
 - Workflow filename: `release.yml`
+- Environment name: `crates-io`
 
-The workflow grants `id-token: write` only to the publishing job and uses
+The GitHub environment is restricted to `v*` tags. The workflow grants
+`id-token: write` only to the publishing job, binds that job to the
+`crates-io` environment, and uses
 `rust-lang/crates-io-auth-action@v1` to exchange GitHub's OIDC identity
 for a short-lived crates.io token. No `CARGO_REGISTRY_TOKEN` repository
 secret is required.
@@ -64,7 +67,7 @@ already-published versions are skipped.
 | --- | --- |
 | Tag does not match `rtce` | Delete the incorrect local and remote tag, fix the manifest, and tag again. |
 | Changelog heading is missing | Delete the tag, add the matching heading on `main`, and tag the corrected commit. |
-| OIDC authentication fails | Confirm both trusted-publisher entries use the exact owner, repository, and `release.yml` filename above. |
+| OIDC authentication fails | Confirm both trusted-publisher entries use the exact owner, repository, `release.yml` filename, and `crates-io` environment above. |
 | Packaging fails | Fix the named manifest or packaged files in a pull request, then re-run with a new version if anything was already published. |
 | One crate published before another failed | Fix the failure and re-run the same workflow; the published crate is skipped. |
 

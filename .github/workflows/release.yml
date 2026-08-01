@@ -19,6 +19,7 @@ jobs:
     name: Verify and publish crates
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: crates-io
     permissions:
       contents: read
       id-token: write
