@@ -981,7 +981,8 @@ impl Plan {
     /// example in this crate already calls its crit event `"crit"` (see
     /// `plan.rs`'s own `toy_def`, `search.rs`, `gamedef.rs`,
     /// `sim::exec`'s own toy fixtures, and the `diablo4_basics`/
-    /// `your_own_game` examples) — a documented v1 convention, not a
+    /// `guide_03_events_and_branches` examples) — a documented v1
+    /// convention, not a
     /// silent guess.
     pub(crate) fn crit_chance(
         &self,

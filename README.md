@@ -10,6 +10,9 @@ stats, fold rules, probabilistic events, damage pipeline — is
 configuration, compiled once into a fast evaluation plan. Extracted from
 the proven patterns of `diablo4-calc` and `poe2-calcs`.
 
+- **Guide: [`docs/guide/`](docs/guide/README.md)** — a seven-chapter
+  walkthrough building one small RPG from a single stat to a Monte Carlo
+  distribution, each chapter with a runnable example
 - Design: `docs/superpowers/specs/2026-07-21-rtce-design.md`
 - Test: `cargo test --workspace`
 
@@ -126,8 +129,9 @@ Diablo 4 basics — one build, two playbooks
 Same build, two playbooks, two truths — which is the point: an external
 driver (an optimizer, a knowledge-graph explorer) calls
 `search::price(plan, base, candidates, scenarios, …)` and collects the
-Pareto front across fights. For the smallest-possible starting point, see
-`cargo run -p rtce --example your_own_game`.
+Pareto front across fights. For the smallest-possible starting point, start
+the guide at [`docs/guide/`](docs/guide/README.md) — chapter 1 is one stat
+and one pipeline stage.
 
 ## Sequencing: from average to timeline
 
@@ -299,8 +303,11 @@ and no proc they define rolls below `chance: "1"` — so Monte Carlo mode
 is asserted to reproduce EV *exactly*, with zero spread, rather than
 within a tolerance band. That is the stronger claim: it fails if an RNG
 draw ever appears on a path that must stay deterministic. But it is a
-claim about exactness, not about MC's distribution machinery:
-`diablo4_rotation` remains the only example that actually samples.
+claim about exactness, not about MC's distribution machinery: the only
+examples that actually sample are `diablo4_rotation` and the guide's
+`guide_07_monte_carlo`, which asserts the opposite direction — a
+non-zero spread, plus a hand-derived hard bound `[112.84, 181.04]` dps
+that no sampled fight may escape.
 
 ## Configurable semantics: the `defaults` block
 
