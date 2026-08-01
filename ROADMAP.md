@@ -16,7 +16,7 @@
   `examples/your_own_game.rs` walkthrough; MIT OR Apache-2.0 licensing
   with crates.io-ready package metadata (`cargo publish --dry-run`
   clean for both crates); GitHub Actions CI (test + clippy + fmt).
-  (`your_own_game.rs` was retired in the Unreleased docs guide — its
+  (`your_own_game.rs` was retired into the 0.4.0 docs guide — its
   walkthrough is now chapters 1–4 of `docs/guide/`, grown one concept at
   a time, with pins superseded 148.20/113.28 → 229.71/175.584.)
 - **P6 — sequencing, DONE (0.2.0).** Expression predicates (comparisons +

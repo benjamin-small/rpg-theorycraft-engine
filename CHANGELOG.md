@@ -7,73 +7,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-### Added
+Nothing yet.
 
-- **A progressive guide — `docs/guide/`.** Seven markdown chapters
-  building one made-up archer RPG concept by concept, from a single stat
-  (chapter 1, `hit = 120`) to a sampled distribution over a 60s fight
-  (chapter 7). Each chapter has a runnable, CI-gated companion,
-  `examples/guide_01_one_number.rs` … `guide_07_monte_carlo.rs`, carrying
-  the chapter's numbers as hand-derived assertions. The examples grow
-  strictly by addition, so `diff`ing chapter N against N+1 shows exactly
-  what a concept cost.
-
-  Chapters 1–4 are the calc tier; 5–7 the sequencing tier, sharing one
-  `GameDef` unchanged from chapter 4. **Chapter 6 names a divergence that
-  was previously derived but unnamed**: a buff's *time-weighted* uptime
-  (0.25 here) is not the *cast-weighted* uptime the damage actually
-  experienced (0.20), because a 2.5s window straddles two integer cast
-  completions rather than two and a half — and because the completion
-  coincident with the buff's application is scheduled first and measures
-  without it. Both uptimes are pinned, in both directions, along with the
-  41.85-damage error a naive round-trip through the calc tier produces.
-  The same divergence is latent in `examples/diablo4_rotation.rs`
-  (0.4 integrated, 3 active completions per 10 slots).
-
-  The chapter also runs `defaults: { measure: "cast_start" }` as a
-  contrast and pins what it actually does: the cast-weighted uptime moves
-  to **0.30**, overshooting rather than converging (8064.96 damage /
-  134.416 dps, a 7-and-11 active split). `measure` and `event_order`
-  choose which side of a boundary a model errs on; they cannot make the
-  integrated 0.25 reachable, because a 2.5s window cannot contain two and
-  a half casts. The example asserts that 0.20 and 0.30 *bracket* 0.25
-  rather than converging on it.
-
-- **`crates/rtce/tests/guide.rs` — the guide's drift gate.** Every fenced
-  ```json block in a chapter must carry `title=<file>` and be
-  byte-identical to that file in `tests/fixtures/guide/`, which is what
-  the chapter's example `include_str!`s. Untitled blocks are rejected
-  (the gate would otherwise be bypassable by omitting the title),
-  orphaned configs are rejected, and the block count is floored so the
-  scanner cannot pass vacuously.
-
-  A fourth test, `no_example_includes_from_outside_the_crate`, closes a
-  **blind spot in the release gate** found while staging this work. The
-  guide's configs were first written under `docs/guide/configs/`, which
-  builds fine from a git checkout and produces a crate that *cannot
-  compile its own examples* once installed from crates.io — `cargo
-  package` ships only files under the crate root. `cargo publish
-  --dry-run` does not catch it, because its verify step builds the
-  library and not the examples. The configs now live in
-  `tests/fixtures/guide/` alongside the `d4`/`poe2` fixtures, and the
-  test rejects any example whose `include_str!` escapes the crate.
-
-### Changed
-
-- **`examples/your_own_game.rs` is retired** — chapters 1–4 of the guide
-  are it, grown one concept at a time. Its pins **148.20 / 113.28 are
-  superseded** by chapter 4's **229.71 / 175.584**: the game picks up an
-  `additive` modifier pool in chapter 2 that `your_own_game` never had,
-  so the numbers legitimately move. No engine behavior changed —
-  `crates/rtce/src/` carries doc updates only, and `diablo4_rotation`'s
-  EV and Monte Carlo blocks are byte-identical.
-- Crate-level docs: the examples list now names all thirteen examples,
-  and "the one example that exercises sampling" is corrected to two —
-  `guide_07_monte_carlo` samples too, and asserts a non-zero spread plus
-  a hand-derived hard bound `[112.84, 181.04]` dps that no sampled fight
-  may escape. The same correction lands in `README.md`.
-
-## [0.4.0] — 2026-07-29
+## [0.4.0] — 2026-08-01
 
 **P8 — configurable semantics + one-world measurement.** A generic
 engine should not hard-code the semantic choices real games make
@@ -90,7 +26,10 @@ coming back `Ok(NaN)`, and the ONE deliberate behavior change fixes the
 semantics the 0.3.0 release review flagged as arguably wrong — a cast
 now measures one world, build AND phase. The phase closes with the
 `refresh`+live-DoT coverage debt paid, a `strongest` worked example
-(`poe2_ignite`), and the docs discipline codified as standing rules.
+(`poe2_ignite`), and the docs discipline codified as standing rules. Shipping
+alongside it, and the reason this version is dated later than it was
+staged: `docs/guide/`, a seven-chapter walkthrough that builds one small
+RPG from a single stat to a Monte Carlo distribution.
 
 ### Upgrading from 0.3.0 — read this first
 
@@ -154,6 +93,72 @@ affected type, and both were re-verified byte-identical per task:
 - The new enums — `Measure`, `EventOrder`, `ProcRolls`, `EffectDef` —
   are `#[non_exhaustive]` from birth: `match` them with a wildcard arm.
   (`NumOrExpr` stays exhaustive by design.)
+
+### Added — a progressive guide (docs)
+
+- **A progressive guide — `docs/guide/`.** Seven markdown chapters
+  building one made-up archer RPG concept by concept, from a single stat
+  (chapter 1, `hit = 120`) to a sampled distribution over a 60s fight
+  (chapter 7). Each chapter has a runnable, CI-gated companion,
+  `examples/guide_01_one_number.rs` … `guide_07_monte_carlo.rs`, carrying
+  the chapter's numbers as hand-derived assertions. The examples grow
+  strictly by addition, so `diff`ing chapter N against N+1 shows exactly
+  what a concept cost.
+
+  Chapters 1–4 are the calc tier; 5–7 the sequencing tier, sharing one
+  `GameDef` unchanged from chapter 4. **Chapter 6 names a divergence that
+  was previously derived but unnamed**: a buff's *time-weighted* uptime
+  (0.25 here) is not the *cast-weighted* uptime the damage actually
+  experienced (0.20), because a 2.5s window straddles two integer cast
+  completions rather than two and a half — and because the completion
+  coincident with the buff's application is scheduled first and measures
+  without it. Both uptimes are pinned, in both directions, along with the
+  41.85-damage error a naive round-trip through the calc tier produces.
+  The same divergence is latent in `examples/diablo4_rotation.rs`
+  (0.4 integrated, 3 active completions per 10 slots).
+
+  The chapter also runs `defaults: { measure: "cast_start" }` as a
+  contrast and pins what it actually does: the cast-weighted uptime moves
+  to **0.30**, overshooting rather than converging (8064.96 damage /
+  134.416 dps, a 7-and-11 active split). `measure` and `event_order`
+  choose which side of a boundary a model errs on; they cannot make the
+  integrated 0.25 reachable, because a 2.5s window cannot contain two and
+  a half casts. The example asserts that 0.20 and 0.30 *bracket* 0.25
+  rather than converging on it.
+
+- **`crates/rtce/tests/guide.rs` — the guide's drift gate.** Every fenced
+  ```json block in a chapter must carry `title=<file>` and be
+  byte-identical to that file in `tests/fixtures/guide/`, which is what
+  the chapter's example `include_str!`s. Untitled blocks are rejected
+  (the gate would otherwise be bypassable by omitting the title),
+  orphaned configs are rejected, and the block count is floored so the
+  scanner cannot pass vacuously.
+
+  A fourth test, `no_example_includes_from_outside_the_crate`, closes a
+  **blind spot in the release gate** found while staging this work. The
+  guide's configs were first written under `docs/guide/configs/`, which
+  builds fine from a git checkout and produces a crate that *cannot
+  compile its own examples* once installed from crates.io — `cargo
+  package` ships only files under the crate root. `cargo publish
+  --dry-run` does not catch it, because its verify step builds the
+  library and not the examples. The configs now live in
+  `tests/fixtures/guide/` alongside the `d4`/`poe2` fixtures, and the
+  test rejects any example whose `include_str!` escapes the crate.
+
+### Changed — `your_own_game.rs` retired into the guide (docs)
+
+- **`examples/your_own_game.rs` is retired** — chapters 1–4 of the guide
+  are it, grown one concept at a time. Its pins **148.20 / 113.28 are
+  superseded** by chapter 4's **229.71 / 175.584**: the game picks up an
+  `additive` modifier pool in chapter 2 that `your_own_game` never had,
+  so the numbers legitimately move. No engine behavior changed —
+  `crates/rtce/src/` carries doc updates only, and `diablo4_rotation`'s
+  EV and Monte Carlo blocks are byte-identical.
+- Crate-level docs: the examples list now names all thirteen examples,
+  and "the one example that exercises sampling" is corrected to two —
+  `guide_07_monte_carlo` samples too, and asserts a non-zero spread plus
+  a hand-derived hard bound `[112.84, 181.04]` dps that no sampled fight
+  may escape. The same correction lands in `README.md`.
 
 ### Added — the `strongest` worked example (P8f)
 
