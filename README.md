@@ -13,6 +13,8 @@ the proven patterns of `diablo4-calc` and `poe2-calcs`.
 - **Guide: [`docs/guide/`](docs/guide/README.md)** — a seven-chapter
   walkthrough building one small RPG from a single stat to a Monte Carlo
   distribution, each chapter with a runnable example
+- **Releasing: [`docs/RELEASING.md`](docs/RELEASING.md)** — trusted
+  publishing setup, release checklist, and recovery paths
 - Design: `docs/superpowers/specs/2026-07-21-rtce-design.md`
 - Test: `cargo test --workspace`
 
