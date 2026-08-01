@@ -1,0 +1,18 @@
+{
+  "resources": {
+    "stamina": { "max": "100", "regen_per_sec": "0" }
+  },
+  "actions": {
+    "power_shot": {
+      "cast_time": "1",
+      "cost": { "stamina": 40.0 },
+      "damage": { "stats": { "attack_power": 120.0 } }
+    },
+    "quick_shot": {
+      "cast_time": "1",
+      "gain": { "stamina": 40.0 },
+      "damage": { "stats": { "attack_power": 60.0 } }
+    }
+  },
+  "damage_objective": "hit_after_armor"
+}
