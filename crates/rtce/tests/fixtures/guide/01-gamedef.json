@@ -1,0 +1,7 @@
+{
+  "stats": ["attack_power"],
+  "pipeline": [
+    { "name": "hit", "expr": "attack_power" }
+  ],
+  "objectives": ["hit"]
+}

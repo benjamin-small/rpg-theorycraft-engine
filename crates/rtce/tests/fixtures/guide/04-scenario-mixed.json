@@ -1,0 +1,16 @@
+{
+  "phases": [
+    {
+      "name": "armor_break",
+      "weight": 1,
+      "uptimes": { "focused": 1.0 },
+      "stats": { "enemy_armor": 5.0 }
+    },
+    {
+      "name": "average",
+      "weight": 3,
+      "uptimes": { "focused": 0.2 },
+      "stats": { "enemy_armor": 20.0 }
+    }
+  ]
+}
