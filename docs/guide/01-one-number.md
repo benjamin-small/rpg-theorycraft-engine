@@ -19,16 +19,20 @@ That description splits into three pieces, each with a different lifetime:
 
 | Tier | What it is | Changes |
 |---|---|---|
-| `GameDef` | The **algorithm** — stats, how modifiers fold, the pipeline of derived values | Once per game |
-| `BuildState` | **One candidate** — this character's stat values and modifiers | Per candidate |
+| `GameDef` | The **rules of the game** — stats, how modifiers fold, the pipeline of derived values | Once per game |
+| `BuildState` | **The character** — one player's gear, stats and modifiers | Per character |
 | `Scenario` | **The fight** being asked about — its phases and their conditions | Per question |
+
+In plain terms: the `GameDef` is the rulebook, the `BuildState` is a
+character sheet, and the `Scenario` is the monster you are pointing that
+character at.
 
 Keeping them separate is what makes the engine cheap. The expensive work
 (parsing expressions, resolving names to slots) happens once when the
-`GameDef` compiles. After that, pricing a candidate is a walk over a
+`GameDef` compiles. After that, evaluating a character is a walk over a
 preallocated array.
 
-## Tier 1 — the GameDef
+## Tier 1 — the GameDef (the rulebook)
 
 Our archer, at its very simplest. One stat, one stage, one answer:
 
@@ -58,7 +62,11 @@ A `GameDef` also accepts `conditions`, `buckets`, and `events`. All three
 default to empty, which is why they are absent above — we add them in
 chapters 2, 3, and 4.
 
-## Tier 2 — the BuildState
+## Tier 2 — the BuildState (the character sheet)
+
+This is the player. One specific archer, with whatever gear and stats they
+are currently carrying — the thing you edit when you swap a ring, and the
+thing you copy when you want to ask "what if I did it this way instead?"
 
 ```json title=01-build.json
 {
@@ -66,11 +74,22 @@ chapters 2, 3, and 4.
 }
 ```
 
-One archer, 120 attack power. A `BuildState` also carries a
-`contributions` list — the modifiers — but it defaults to empty and we have
-nowhere to put modifiers yet. Chapter 2.
+One archer, 120 attack power. That is the whole character so far.
 
-## Tier 3 — the Scenario
+A `BuildState` also carries a `contributions` list — every modifier the
+character has, from gear, passives and skills. It defaults to empty and we
+have nowhere to put modifiers yet, so it is absent here. Chapter 2 fills it
+in, and from then on it is the bulk of the file.
+
+> **About the name.** "Build" is the ARPG player's word for a character
+> configuration — a *lightning sorcerer build*, a *bow build*. `rtce` also
+> calls one a **candidate**, because the engine exists to compare a great
+> many of them: an optimizer generates thousands of `BuildState`s that
+> differ by one ring and prices them all against the same `GameDef`. Same
+> object, two vocabularies. When this guide says "the build", it means your
+> character.
+
+## Tier 3 — the Scenario (the fight)
 
 ```json title=01-scenario.json
 {
