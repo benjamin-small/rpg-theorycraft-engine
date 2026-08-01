@@ -23,8 +23,11 @@ fn main() {
     // is built at startup and reused across thousands of candidates.
     let plan = plan::compile(&def).expect("gamedef compiles");
 
-    // ── Tier 2 — the BuildState: ONE candidate. Just raw stat values so
-    //    far; chapter 2 adds the second half (contributions).
+    // ── Tier 2 — the BuildState: THE CHARACTER. One specific archer and
+    //    the gear it is carrying — the character sheet, and what an
+    //    optimizer varies when it compares thousands of candidates. Just
+    //    raw stat values so far; chapter 2 adds the second half, the
+    //    `contributions` list that holds every modifier.
     let build_json = include_str!("../tests/fixtures/guide/01-build.json");
     let build: BuildState = serde_json::from_str(build_json).expect("valid build");
 

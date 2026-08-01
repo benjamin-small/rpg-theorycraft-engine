@@ -50,9 +50,13 @@ build's contributions to the `additive` bucket folded to".
 }
 ```
 
-A **contribution** is one modifier: a value and the bucket it lands in.
-This is the artifact that changes per candidate — a search driver varying
-gear is varying this list and nothing else.
+A **contribution** is one modifier: a value and the bucket it lands in. One
+line per passive, per gear affix, per skill point.
+
+This list is the part of the character that actually changes. Swapping a
+ring edits one entry here; an optimizer comparing ten thousand gear
+combinations is varying this list and nothing else, against the same
+`GameDef` every time.
 
 Contributions can also carry an `event` or a `condition` tag, which is how a
 modifier becomes conditional. Chapters 3 and 4.
