@@ -1,0 +1,9 @@
+{
+  "phases": [
+    {
+      "name": "dummy",
+      "weight": 60,
+      "stats": { "enemy_armor": 20.0 }
+    }
+  ]
+}

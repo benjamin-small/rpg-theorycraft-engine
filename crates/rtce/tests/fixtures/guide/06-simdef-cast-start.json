@@ -1,0 +1,27 @@
+{
+  "defaults": { "measure": "cast_start" },
+  "resources": {
+    "stamina": { "max": "100", "regen_per_sec": "0" }
+  },
+  "actions": {
+    "focus_fire": {
+      "cast_time": "0",
+      "cooldown": 10.0,
+      "apply_buff": ["focus_window"]
+    },
+    "power_shot": {
+      "cast_time": "1",
+      "cost": { "stamina": 40.0 },
+      "damage": { "stats": { "attack_power": 120.0 } }
+    },
+    "quick_shot": {
+      "cast_time": "1",
+      "gain": { "stamina": 40.0 },
+      "damage": { "stats": { "attack_power": 60.0 } }
+    }
+  },
+  "buffs": {
+    "focus_window": { "duration": 2.5, "conditions": { "focused": 1.0 } }
+  },
+  "damage_objective": "hit_after_armor"
+}

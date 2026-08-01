@@ -1,0 +1,7 @@
+{
+  "rules": [
+    { "action": "focus_fire" },
+    { "action": "power_shot", "when": "stamina >= 40" },
+    { "action": "quick_shot" }
+  ]
+}
