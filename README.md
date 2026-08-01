@@ -8,7 +8,7 @@
 A generic, config-driven theorycrafting engine. The game's algorithm —
 stats, fold rules, probabilistic events, damage pipeline — is
 configuration, compiled once into a fast evaluation plan. Extracted from
-the proven patterns of `diablo4-calc` and `poe2-calcs`.
+the proven patterns of `d4-theory-crafting` and `poe2-theory-crafting`.
 
 - **Guide: [`docs/guide/`](docs/guide/README.md)** — a seven-chapter
   walkthrough building one small RPG from a single stat to a Monte Carlo
@@ -36,7 +36,7 @@ Three tiers of configuration and nothing else answer the closed-form
 question. **Tier 1 — the GameDef** is the slice's algorithm. Below is an
 ABRIDGED transcription of the real one from
 [`crates/rtce/tests/fixtures/d4/gamedef.json`](crates/rtce/tests/fixtures/d4/gamedef.json),
-the same file the test suite pins against the `diablo4-calc` production
+the same file the test suite pins against the `d4-theory-crafting` production
 calculator. Every cut is marked with `…`; nothing here is a simplification
 of a formula, only an omission of whole entries. (The fixture has 11
 buckets and 12 pipeline stages; read it if you want the exact thing.)
@@ -170,7 +170,7 @@ mana regen is zeroed and Firebolt's mana gain is set equal to Fireball's
 cost purely so the cast sequence hand-verifies cleanly (see the pin
 comments in the example itself). A production rotation would tune these
 from real skill data the same way `diablo4_basics`'s `GameDef` slice was
-transcribed from `diablo4-calc`.
+transcribed from `d4-theory-crafting`.
 
 **SimDef** (trimmed — the full version adds Firebolt; see the example):
 
@@ -260,8 +260,8 @@ PoE2's `increased`(additive pool)/`more`(independent multiplier) split,
 per-type resistance with penetration, an ailment as a condition, and a DoT
 objective derived from the same pre-mitigation magnitude as the hit. Every
 coefficient in it is `representative`, chosen so each pin hand-derives in
-a comment. The real thing lives in `../poe2-calcs` as a GENERATED
-`gamedef/poe2.gamedef.json` — 67 stats, 73 buckets, 209 pipeline stages,
+a comment. The real thing lives in `../poe2-theory-crafting` as a
+GENERATED `model/gamedef/poe2.gamedef.json` — 67 stats, 73 buckets, 209 pipeline stages,
 80 objectives, pinned to that repo's native `calc.rs` at 1e-9, standing
 reference 124.53 dps for a default Monk build. A 209-stage pipeline is not
 hand-derivable, which is exactly why the fixture here is trimmed rather
@@ -300,7 +300,8 @@ Monte Carlo (N=128, seed=5): mean 881.2500  std 0.0000
 ```
 
 Nothing in these four configs samples — the fixture's crit is closed
-form (`1 + c·(m−1)`, the same choice poe2-calcs' generated gamedef makes)
+form (`1 + c·(m−1)`, the same choice poe2-theory-crafting's generated
+gamedef makes)
 and no proc they define rolls below `chance: "1"` — so Monte Carlo mode
 is asserted to reproduce EV *exactly*, with zero spread, rather than
 within a tolerance band. That is the stronger claim: it fails if an RNG
@@ -368,14 +369,16 @@ namespace.
 
 Parity-proven against two independent consumers.
 
-**`../diablo4-calc`** — all 7 of its archetype builds reproduced to <1e-9
+**`../d4-theory-crafting`** (formerly `diablo4-calc`) — all 7 of its
+archetype builds reproduced to <1e-9
 relative during the P4 cross-engine proof through rtce (the standing
-numbers 8,096.02 … 6,769.10). As of the P4c switchover, diablo4-calc runs
+numbers 8,096.02 … 6,769.10). As of the P4c switchover, that repo runs
 **solely** on rtce in production — its native damage math is deleted, and
 `calc::evaluate` is a thin shim over an rtce-compiled plan (including in
 the browser, via WASM).
 
-**`../poe2-calcs`** — a GENERATED `gamedef/poe2.gamedef.json` (67 stats,
+**`../poe2-theory-crafting`** (formerly `poe2-calcs`) — a GENERATED
+`model/gamedef/poe2.gamedef.json` (67 stats,
 73 buckets, 209 pipeline stages, 80 objectives) plus an adapter reproduce
 that calculator's native math to 1e-9 across 63 parity tests, standing
 references 124.53 / 129.51 / 793.76 dps, with a 156-pair

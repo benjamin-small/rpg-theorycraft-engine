@@ -14,8 +14,9 @@
 //! ailment as a condition. It is NOT Path of Exile 2's damage model and
 //! NOT derived from game data — every coefficient below is
 //! `representative`, picked so the arithmetic hand-derives. The real thing
-//! is `../poe2-calcs`' GENERATED `gamedef/poe2.gamedef.json` (67 stats /
-//! 73 buckets / 209 stages / 80 objectives; standing reference 124.53 dps
+//! is `../poe2-theory-crafting`'s GENERATED
+//! `model/gamedef/poe2.gamedef.json` (67 stats / 73 buckets / 209 stages /
+//! 80 objectives; standing reference 124.53 dps
 //! for a default Monk build); a 209-stage pipeline is not hand-derivable,
 //! which is the whole reason this fixture is trimmed. The `SimDef` is
 //! likewise a demonstration cadence, not PoE2 skill data.

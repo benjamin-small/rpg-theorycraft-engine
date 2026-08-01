@@ -11,9 +11,10 @@
 //! `tests/fixtures/poe2/gamedef.json`, a PoE2-*shaped* demonstration
 //! slice, not Path of Exile 2's damage model and not derived from game
 //! data. Every coefficient here is `representative`, picked so the
-//! arithmetic hand-derives. The real thing is `../poe2-calcs`' GENERATED
-//! `gamedef/poe2.gamedef.json` (209 pipeline stages; standing reference
-//! 124.53 dps for a default Monk build). One extra liberty this slice
+//! arithmetic hand-derives. The real thing is
+//! `../poe2-theory-crafting`'s GENERATED
+//! `model/gamedef/poe2.gamedef.json` (209 pipeline stages; standing
+//! reference 124.53 dps for a default Monk build). One extra liberty this slice
 //! takes: the fixture has exactly ONE ailment chain, named `poison_*`,
 //! and the ignite borrows it as its tick objective — the POLICY is the
 //! lesson here, not the element.

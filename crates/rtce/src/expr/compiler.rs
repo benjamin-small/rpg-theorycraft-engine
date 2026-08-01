@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn hand_worked_d4_base_hit_shape() {
-        // The diablo4-calc handshake expression (values from its parity
+        // The d4-theory-crafting handshake expression (values from its parity
         // suite): 1728 × (314.5/100) × (1 + 462/800)
         //        = 1728 × 3.145 × 1.5775 = 8573.0184 exactly.
         let s = syms(&["weapon_avg", "coeff", "mainstat"]);

@@ -3,7 +3,7 @@
 //!
 //! This crate carries no test logic of its own; it's the small set of
 //! house rules every `rtce`-based game's test suite is expected to share,
-//! inherited from `diablo4-calc`'s M1 milestone:
+//! inherited from `d4-theory-crafting`'s M1 milestone:
 //!
 //! - **Golden fixtures live in JSON files, one case per file.**
 //!   [`for_each_fixture`] walks a directory, parses each `*.json` as a
