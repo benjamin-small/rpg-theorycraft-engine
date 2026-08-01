@@ -73,8 +73,11 @@
 //! one). [`search`] builds on `evaluate` to price and rank whole batches of
 //! candidates expressed as reversible [`search::Move`] sequences.
 //!
-//! See `examples/your_own_game.rs` for a full walkthrough (a ~40-line JSON
-//! game, two scenarios, an objectives table, and `explain()` output), and
+//! See the guide at
+//! <https://github.com/benjamin-small/rpg-theorycraft-engine/blob/main/docs/guide/README.md>
+//! for a progressive walkthrough (one made-up game built up over seven
+//! chapters, from a single stat to a Monte Carlo distribution, each
+//! chapter backed by a runnable example), and
 //! <https://github.com/benjamin-small/rpg-theorycraft-engine/blob/main/docs/superpowers/specs/2026-07-21-rtce-design.md>
 //! for the design log.
 //!
@@ -153,20 +156,23 @@
 //!
 //! # Examples
 //!
-//! Seven runnable walkthroughs, each with hand-worked pins in comments,
-//! asserted and run in CI. Run any with
+//! Thirteen runnable walkthroughs, each with hand-worked pins in
+//! comments, asserted and run in CI. Run any with
 //! `cargo run -p rtce --example <name>`:
 //!
-//! - `your_own_game` — the smallest starting point: the three closed-form
-//!   config tiers on a made-up archer game, two scenarios, `explain()`
-//!   output. Level 1 only; it never calls [`sim::run`].
+//! - `guide_01_one_number` … `guide_07_monte_carlo` — the seven chapters
+//!   of the guide, one made-up archer game grown from a single stat to a
+//!   sampled distribution. Chapters 1–4 are Level 1 only; chapter 5 is
+//!   the first to call [`sim::run`]. Read alongside `docs/guide/`.
 //! - `diablo4_basics` — one build priced against two fights on a real
 //!   game's damage slice, plus the branch table behind the crit
 //!   expectation.
 //! - `diablo4_rotation` — sequencing end to end: mana, a spender/generator
 //!   pair, a cooldown-gated buff window whose `vulnerable` uptime falls
-//!   OUT of the timeline, in both EV and Monte Carlo mode. The one example
-//!   that exercises sampling.
+//!   OUT of the timeline, in both EV and Monte Carlo mode. One of the two
+//!   examples that exercise sampling (`guide_07_monte_carlo` is the
+//!   other; the `poe2_*` configs sample nothing and pin MC to reproduce
+//!   EV with std exactly zero).
 //! - `poe2_charges` — `add_refresh_all` at `max_stacks: 3`, an expression
 //!   `duration`, and `stacks.<buff>` gating a rotation rule.
 //! - `poe2_poison` — unbounded `add_independent` snapshot DoTs applied by

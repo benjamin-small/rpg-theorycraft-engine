@@ -35,8 +35,20 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      - name: cargo run -p rtce --example your_own_game
-        run: cargo run -p rtce --example your_own_game
+      - name: cargo run -p rtce --example guide_01_one_number
+        run: cargo run -p rtce --example guide_01_one_number
+      - name: cargo run -p rtce --example guide_02_buckets_and_folds
+        run: cargo run -p rtce --example guide_02_buckets_and_folds
+      - name: cargo run -p rtce --example guide_03_events_and_branches
+        run: cargo run -p rtce --example guide_03_events_and_branches
+      - name: cargo run -p rtce --example guide_04_conditions_and_scenarios
+        run: cargo run -p rtce --example guide_04_conditions_and_scenarios
+      - name: cargo run -p rtce --example guide_05_a_rotation
+        run: cargo run -p rtce --example guide_05_a_rotation
+      - name: cargo run -p rtce --example guide_06_buffs_and_uptime
+        run: cargo run -p rtce --example guide_06_buffs_and_uptime
+      - name: cargo run -p rtce --example guide_07_monte_carlo
+        run: cargo run -p rtce --example guide_07_monte_carlo
       - name: cargo run -p rtce --example diablo4_basics
         run: cargo run -p rtce --example diablo4_basics
       - name: cargo run -p rtce --example diablo4_rotation
