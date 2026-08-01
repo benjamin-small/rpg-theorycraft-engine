@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-crates:
+    name: Verify and publish crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag and changelog
+        run: |
+          set -o pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if printf '%s' "$TAG_VERSION" | grep -q -- '-'; then
+            echo "::error::prerelease tags are not supported: $GITHUB_REF_NAME"
+            exit 1
+          fi
+          CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "rtce") | .version')
+          if [ -z "$CRATE_VERSION" ] || [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match rtce version $CRATE_VERSION"
+            exit 1
+          fi
+          if ! grep -q "^## \[$TAG_VERSION\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no heading for $TAG_VERSION"
+            exit 1
+          fi
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Verify crate packages
+        run: |
+          cargo publish -p rtce-testkit --dry-run
+          cargo publish -p rtce --dry-run
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish missing crate versions
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          set -o pipefail
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          for crate in rtce-testkit rtce; do
+            version=$(printf '%s' "$metadata" |
+              jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version')
+            if [ -z "$version" ]; then
+              echo "::error::could not determine the version for $crate"
+              exit 1
+            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'User-Agent: rpg-theorycraft-engine-release-ci' \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            case "$code" in
+              200)
+                echo "$crate@$version is already published; skipping"
+                ;;
+              404)
+                cargo publish -p "$crate"
+                ;;
+              *)
+                echo "::error::unexpected HTTP $code checking $crate@$version on crates.io"
+                exit 1
+                ;;
+            esac
+          done
