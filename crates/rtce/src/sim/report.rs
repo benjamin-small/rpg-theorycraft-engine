@@ -63,8 +63,8 @@ pub struct SimReport {
     pub distribution: Option<Distribution>,
 }
 
-/// Monte Carlo's summary of one run's per-iteration `dps` samples: mean,
-/// population standard deviation, and three percentiles. Percentiles use
+/// Monte Carlo's summary of one run's per-iteration `dps` samples: sample
+/// count, range, mean, population standard deviation, and three percentiles. Percentiles use
 /// the NEAREST-RANK estimator (no interpolation between order statistics —
 /// `rank = ceil(p/100 * n)`, 1-indexed, clamped into `[1, n]`): simple,
 /// deterministic, and exact on the sorted sample itself (no rounding
@@ -77,8 +77,14 @@ pub struct SimReport {
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[non_exhaustive]
 pub struct Distribution {
+    /// Number of complete simulation timelines sampled.
+    pub iterations: usize,
+    /// Lowest `dps` result among all iterations.
+    pub min: f64,
     /// Arithmetic mean of every iteration's `dps`.
     pub mean: f64,
+    /// Highest `dps` result among all iterations.
+    pub max: f64,
     /// Population standard deviation of every iteration's `dps`.
     pub std: f64,
     /// 10th percentile `dps` (nearest-rank estimator).
@@ -105,7 +111,10 @@ impl Distribution {
         let mut sorted: Vec<f64> = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("dps samples are finite"));
         Distribution {
+            iterations: n,
+            min: sorted[0],
             mean,
+            max: sorted[n - 1],
             std,
             p10: percentile(&sorted, 10.0),
             p50: percentile(&sorted, 50.0),
@@ -197,4 +206,19 @@ pub struct ResourceReport {
     /// resource being insufficient (hard gates + `when` all passed; only
     /// cost failed).
     pub time_starved: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Distribution;
+
+    #[test]
+    fn distribution_reports_the_sample_count_and_observed_range() {
+        let distribution = Distribution::from_samples(&[4.0, 1.0, 3.0, 2.0]);
+
+        assert_eq!(distribution.iterations, 4);
+        assert_eq!(distribution.min, 1.0);
+        assert_eq!(distribution.mean, 2.5);
+        assert_eq!(distribution.max, 4.0);
+    }
 }

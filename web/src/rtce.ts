@@ -55,7 +55,10 @@ export interface SimulationResult {
     resources: Record<string, { time_capped: number; time_starved: number }>;
     proc_counts: Record<string, number>;
     distribution: null | {
+      iterations: number;
+      min: number;
       mean: number;
+      max: number;
       std: number;
       p10: number;
       p50: number;
