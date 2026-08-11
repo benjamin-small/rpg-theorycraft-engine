@@ -7,7 +7,30 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- A private `rtce-cli` workspace binary with `evaluate`, `explain`, and
+  `simulate` commands, plus bundled `demo calc|sim|monte-carlo` runs. Outputs
+  are versioned JSON envelopes shared with the browser interface.
+- A multi-target Dockerfile. The default `cli` target is the primary command
+  demo; the `tutorial` target serves a static TypeScript/Wasm walkthrough.
+- A private `rtce-runner` JSON adapter and `rtce-wasm` binding so native and
+  browser interfaces compile and execute the same engine paths.
+- A seven-step browser tutorial powered by
+  `@benjamin-small/browser-terminal`, with live editors for the committed guide
+  fixtures and structured, pipeable `rtce` commands.
+- A self-contained `rtce-field-guide.html` build that embeds both Wasm engines,
+  JavaScript, and CSS so the tutorial also runs directly from a `file://` URL.
+- Terminal-driven lesson runs: the GUI Run button now enters the real command
+  at the browser-terminal prompt, streams compilation, branch, cast, hit, buff,
+  and distribution playback there, and updates the workbench from the same
+  structured command result.
+- Browser tutorial commands now mirror the native CLI's `--game`, `--build`,
+  `--scenario`, `--sim`, and `--rotation` arguments. Browser-terminal 0.2.0
+  injects each live editor document as a real `$game`, `$build`, `$scenario`,
+  `$sim`, or `$rotation` shell variable in place of a filesystem path.
+- A GitHub Pages workflow builds and publishes the split TypeScript/Wasm
+  tutorial from `main` with project-path-safe relative assets.
 
 ## [0.4.0] — 2026-08-01
 
