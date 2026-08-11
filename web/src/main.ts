@@ -88,7 +88,10 @@ app.innerHTML = `
       <div class="keyword-example">
         <span id="keyword-label"></span>
         <div><code id="keyword-code"></code><p id="keyword-summary"></p></div>
-        <button id="keyword-lookup" type="button">Look it up</button>
+        <div class="keyword-actions">
+          <button id="keyword-source" type="button">Show in config</button>
+          <button id="keyword-lookup" type="button">Explain term</button>
+        </div>
       </div>
       <details id="config-lexicon" class="config-lexicon">
         <summary><span><strong>Config lexicon</strong><small>Schema, declared names, built-ins, and engine context—labeled honestly.</small></span><code>rtce lexicon</code></summary>
@@ -142,6 +145,14 @@ function prettyConfig(config: ConfigSet): ConfigSet {
     }
   }
   return pretty;
+}
+
+for (const lesson of lessons) {
+  const { source, sourceNeedle } = lesson.keywordExample;
+  const sourceDocument = prettyConfig(lesson.config)[source];
+  if (!sourceDocument?.includes(sourceNeedle)) {
+    throw new Error(`lesson ${lesson.number} callout must quote its ${source} config`);
+  }
 }
 
 let currentLesson = lessons[0];
@@ -215,6 +226,7 @@ function loadLesson(number: number): Lesson {
   byId('keyword-label').textContent = lesson.keywordExample.label;
   byId('keyword-code').textContent = lesson.keywordExample.code;
   byId('keyword-summary').textContent = lesson.keywordExample.summary;
+  byId('keyword-source').textContent = `Show in ${configLabels[lesson.keywordExample.source].split(' · ')[0]}`;
   const mode = byId('lesson-mode');
   mode.textContent = lesson.mode === 'sheet' ? 'Sheet calculation · no timeline' : 'Combat simulation · running timeline';
   mode.dataset.mode = lesson.mode;
@@ -297,7 +309,10 @@ function summarize(result: RtceResult): string {
     return [...branchCards, ...objectiveCards].join('');
   }
   const distribution = result.report.distribution;
-  return `<article><span>DPS</span><strong>${result.report.total.dps.toFixed(3)}</strong></article><article><span>total damage</span><strong>${result.report.total.total_damage.toFixed(1)}</strong></article><article><span>duration</span><strong>${result.report.total.duration.toFixed(0)}s</strong></article>${distribution ? `<article><span>p10 · p50 · p90</span><strong>${distribution.p10.toFixed(1)} · ${distribution.p50.toFixed(1)} · ${distribution.p90.toFixed(1)}</strong></article>` : ''}`;
+  const distributionRows = distribution
+    ? `<article class="distribution-card"><span>Monte Carlo distribution</span><small>${distribution.iterations.toLocaleString('en-US')} complete fights sampled</small><div class="distribution-rows"><div><span>minimum</span><strong>${distribution.min.toFixed(1)} DPS</strong></div><div><span>average</span><strong>${distribution.mean.toFixed(1)} DPS</strong></div><div><span>maximum</span><strong>${distribution.max.toFixed(1)} DPS</strong></div></div></article>`
+    : '';
+  return `<article><span>DPS</span><strong>${result.report.total.dps.toFixed(3)}</strong></article><article><span>total damage</span><strong>${result.report.total.total_damage.toFixed(1)}</strong></article><article><span>duration</span><strong>${result.report.total.duration.toFixed(0)}s</strong></article>${distributionRows}`;
 }
 
 function showResult<T extends RtceResult>(result: T): T {
@@ -466,9 +481,11 @@ function simulationPlayback(result: SimulationResult, config: ConfigSet): string
   }
   if (report.distribution) {
     const distribution = report.distribution;
-    lines.push(
-      `[distribution] mean=${distribution.mean.toFixed(3)} · std=${distribution.std.toFixed(3)} · p10=${distribution.p10.toFixed(3)} · p50=${distribution.p50.toFixed(3)} · p90=${distribution.p90.toFixed(3)}`,
-    );
+    lines.push(`[monte-carlo] ${distribution.iterations.toLocaleString('en-US')} complete fights sampled`);
+    lines.push(`[minimum] ${distribution.min.toFixed(3)} DPS`);
+    lines.push(`[average] ${distribution.mean.toFixed(3)} DPS · std dev ${distribution.std.toFixed(3)}`);
+    lines.push(`[maximum] ${distribution.max.toFixed(3)} DPS`);
+    lines.push(`[percentiles] p10 ${distribution.p10.toFixed(3)} · p50 ${distribution.p50.toFixed(3)} · p90 ${distribution.p90.toFixed(3)}`);
   }
   lines.push(
     `[done] ${report.total.total_damage.toFixed(2)} damage / ${report.total.duration.toFixed(1)}s = ${report.total.dps.toFixed(4)} DPS`,
@@ -501,6 +518,18 @@ function renderLexicon(entries: LexiconEntry[], query = ''): void {
 renderLexicon(lexicon.entries);
 byId<HTMLInputElement>('lexicon-search').addEventListener('input', (event) => {
   renderLexicon(lexicon.entries, (event.currentTarget as HTMLInputElement).value);
+});
+byId('keyword-source').addEventListener('click', () => {
+  const { source, sourceNeedle } = currentLesson.keywordExample;
+  selectTab(source);
+  const start = editor.value.indexOf(sourceNeedle);
+  if (start < 0) return;
+
+  editor.focus();
+  editor.setSelectionRange(start, start + sourceNeedle.length);
+  const line = editor.value.slice(0, start).split('\n').length - 1;
+  const lineHeight = Number.parseFloat(getComputedStyle(editor).lineHeight);
+  editor.scrollTop = Math.max(0, line * lineHeight - editor.clientHeight / 3);
 });
 byId('keyword-lookup').addEventListener('click', () => {
   const details = byId<HTMLDetailsElement>('config-lexicon');

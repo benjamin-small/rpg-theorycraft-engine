@@ -75,8 +75,9 @@ h1 { max-width: 650px; margin: 0; font: 500 clamp(28px, 3vw, 44px)/1.08 Georgia,
 .insight p { margin: 0; color: #c4c0b6; font: italic 13px/1.5 Georgia, serif; }
 .keyword-example { display: grid; grid-template-columns: 118px minmax(0, 1fr) max-content; gap: 15px; align-items: center; margin: -10px 0 12px; padding: 12px 15px; border: 1px solid #2c3f49; background: #101920; }
 .keyword-example > span { color: #89a6b5; font: 9px ui-monospace, monospace; text-transform: uppercase; letter-spacing: .12em; }
-.keyword-example code { display: block; overflow: hidden; color: var(--mint); font: 11px ui-monospace, monospace; white-space: nowrap; text-overflow: ellipsis; }
+.keyword-example code { display: block; overflow-wrap: anywhere; color: var(--mint); font: 11px/1.45 ui-monospace, monospace; }
 .keyword-example p { margin: 4px 0 0; color: var(--faint); font-size: 11px; line-height: 1.4; }
+.keyword-actions { display: grid; gap: 7px; }
 .keyword-example button { padding: 7px 9px; border: 1px solid #3a515d; background: #14232b; color: #a9bbc3; font: 9px ui-monospace, monospace; text-transform: uppercase; letter-spacing: .07em; cursor: pointer; }
 .keyword-example button:hover { border-color: var(--mint); color: var(--mint); }
 
@@ -138,6 +139,12 @@ h1 { max-width: 650px; margin: 0; font: 500 clamp(28px, 3vw, 44px)/1.08 Georgia,
 .result-summary strong { margin-top: 8px; color: var(--gold); font: 18px ui-monospace, monospace; }
 .result-summary small { margin-top: 5px; color: var(--faint); font: 10px ui-monospace, monospace; }
 .result-summary .average-card { background: rgba(99, 157, 127, .08); }
+.result-summary .distribution-card { flex-basis: 100%; background: rgba(99, 157, 127, .08); }
+.distribution-card > small { margin-top: 4px; }
+.distribution-rows { margin-top: 12px; border-top: 1px solid var(--line); }
+.distribution-rows > div { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.distribution-rows > div:last-child { border-bottom: 0; }
+.distribution-rows strong { margin: 0; font-size: 14px; }
 .result-summary .error-copy { color: #e28d7e; }
 .result-card details { border-top: 1px solid var(--line); }
 .result-card summary { padding: 9px 15px; color: var(--faint); font: 10px ui-monospace, monospace; cursor: pointer; }
@@ -178,8 +185,9 @@ h1 { max-width: 650px; margin: 0; font: 500 clamp(28px, 3vw, 44px)/1.08 Georgia,
   .step-stamp { font-size: 27px; }
   h1 { font-size: 31px; }
   .insight { grid-template-columns: 1fr; gap: 7px; }
-  .keyword-example { grid-template-columns: 1fr max-content; }
+  .keyword-example { grid-template-columns: 1fr; }
   .keyword-example > span { grid-column: 1 / -1; }
+  .keyword-actions { flex-wrap: wrap; }
   .config-lexicon > summary { align-items: flex-start; }
   .config-lexicon > summary code { display: none; }
   .lexicon-list { grid-template-columns: 1fr; }

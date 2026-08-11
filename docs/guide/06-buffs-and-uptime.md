@@ -16,6 +16,7 @@ that the answer is more interesting than a single number.
   },
   "actions": {
     "focus_fire": {
+      "_guide": "This skill deals no damage. When used, it applies the declared focus_window buff below.",
       "cast_time": "0",
       "cooldown": 10.0,
       "apply_buff": ["focus_window"]
@@ -32,7 +33,11 @@ that the answer is more interesting than a single number.
     }
   },
   "buffs": {
-    "focus_window": { "duration": 2.5, "conditions": { "focused": 1.0 } }
+    "focus_window": {
+      "_guide": "While active, this sets focused to 1, unlocking Focused Fury's focused contribution in Build.",
+      "duration": 2.5,
+      "conditions": { "focused": 1.0 }
+    }
   },
   "damage_objective": "hit_after_armor"
 }
