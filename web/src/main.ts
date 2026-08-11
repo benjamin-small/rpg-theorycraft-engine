@@ -74,8 +74,11 @@ app.innerHTML = `
         <div class="step-stamp"><span id="step-number"></span><small>/ 07</small></div>
       </div>
       <div class="run-row">
-        <div><span>CLI demo</span><code id="lesson-command"></code></div>
-        <button id="run-button" class="run-button" type="button"><span>Run CLI demo</span><b>⌘↵</b></button>
+        <div class="run-row-head">
+          <span>CLI demo</span>
+          <button id="run-button" class="run-button" type="button"><span>Run CLI demo</span><b>⌘↵</b></button>
+        </div>
+        <code id="lesson-command"></code>
       </div>
       <div id="gamer-guide" class="gamer-guide">
         <span id="lesson-mode" class="mode-chip"></span>
