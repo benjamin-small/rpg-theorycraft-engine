@@ -188,7 +188,7 @@ you would if you were using the sim to source uptimes for a fast closed-form
 sweep:
 
 ```
-crit_damage  = 1 + (50 + 0.25 × 50)/100                    = 1.625
+crit branch  crit_damage = 1 + (50 + 0.25 × 50)/100        = 1.625
 power_shot   = 120 × 1.55 × (0.7 + 0.3 × 1.625) × 0.8      = 176.7
 naive total  = 31 × 176.7 + 29 × 88.35                     = 8039.85
 ```
@@ -205,13 +205,17 @@ is what makes it worth a chapter.
 ## Where the numbers came from
 
 ```
-focused ACTIVE     crit_damage = 1 + (50+50)/100 = 2.0
+focused ACTIVE     crit branch crit_damage = 1 + (50+50)/100 = 2.0
   power_shot  120 × 1.55 × (0.7 + 0.3 × 2.0) × 0.8 = 193.44
   quick_shot                                       =  96.72
-focused INACTIVE   crit_damage = 1 + 50/100 = 1.5
+focused INACTIVE   crit branch crit_damage = 1 + 50/100 = 1.5
   power_shot                                       = 171.12
   quick_shot                                       =  85.56
 ```
+
+The normal branch keeps the event-gated bucket at its ×1 identity in both
+cases; the weighted formulas above apply the larger value only to the 30%
+crit branch.
 
 A completion at `t` started at `t-1`; `power_shot` runs at `t=0` and every
 odd second, `quick_shot` at every even second from 2. Reading off the twelve

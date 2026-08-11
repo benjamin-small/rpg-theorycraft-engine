@@ -42,16 +42,25 @@ build's contributions to the `additive` bucket folded to".
 
 ```json title=02-build.json
 {
+  "_guide": "Gear labels are notes for players. Within each contribution, only bucket and value change this lesson's math.",
   "stats": { "attack_power": 120.0 },
   "contributions": [
-    { "bucket": "additive", "value": 30.0 },
-    { "bucket": "additive", "value": 25.0 }
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 }
   ]
 }
 ```
 
 A **contribution** is one modifier: a value and the bucket it lands in. One
 line per passive, per gear affix, per skill point.
+
+Read the first line like a gamer: the **Serrated Edge affix on the
+Stormstring Bow grants +30% damage**, and that bonus goes into the shared
+`additive` bucket. The gloves add another +25% to the same pool, so the gear
+screen's two bonuses become +55% before the hit formula uses them. Keys that
+begin with `_`, such as `_source` and `_guide`, are human-readable notes. The
+engine deliberately ignores them, so they can explain a config without
+changing its result.
 
 This list is the part of the character that actually changes. Swapping a
 ring edits one entry here; an optimizer comparing ten thousand gear

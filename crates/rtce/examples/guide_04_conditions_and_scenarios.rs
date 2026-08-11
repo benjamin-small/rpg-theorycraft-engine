@@ -62,12 +62,14 @@ fn main() {
     //    contribution gated on it — LINEARLY, which is the modelling
     //    assumption this tier makes and chapter 6 comes back to.
     //
-    //    burst — focused = 1.0, so BOTH crit_damage members are fully in:
+    //    burst — focused = 1.0, so BOTH crit_damage members are fully in
+    //    on the crit branch (the normal branch keeps the ×1 identity):
     //      crit_damage = 1 + (50 + 1.0 × 50)/100 = 2.0
     //      hit = 120 × 1.55 × (0.7 × 1.0 + 0.3 × 2.0) = 186 × 1.3 = 241.8
     //      hit_after_armor = 241.8 × (1 - 5/100) = 241.8 × 0.95 = 229.71
     //
-    //    sustained — focused = 0.2, so the gated member counts for a fifth:
+    //    sustained — focused = 0.2, so the condition-gated member counts
+    //    for a fifth on the crit branch:
     //      crit_damage = 1 + (50 + 0.2 × 50)/100 = 1.6
     //      hit = 120 × 1.55 × (0.7 × 1.0 + 0.3 × 1.6) = 186 × 1.18 = 219.48
     //      hit_after_armor = 219.48 × (1 - 20/100) = 219.48 × 0.8 = 175.584

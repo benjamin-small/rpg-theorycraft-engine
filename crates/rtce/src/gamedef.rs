@@ -63,14 +63,17 @@ pub enum FoldKind {
 }
 
 /// A probabilistic event (crit, proc, …): a chance of firing and a factor
-/// it contributes to `event_factors` when it does. Every combination of
+/// it contributes to the engine-provided `event_multiplier` when it does.
+/// (`event_factors` remains a compatibility alias.) Every combination of
 /// events is enumerated as a branch inside a `branched` stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventDef {
-    /// Expression over stats; engine clamps the result to [0, 1].
+    /// Expression over declared stats, conditions, and buckets; the engine
+    /// clamps the result to [0, 1].
     pub chance: String,
-    /// Expression over stats/buckets (branch-recomputed); multiplied into
-    /// `event_factors` when this event fires.
+    /// Expression over declared stats, conditions, and buckets (with buckets
+    /// refolded for this branch); multiplied into `event_multiplier` when this
+    /// event fires.
     pub factor: String,
     /// Unknown keys collected at parse (P8a). `_`-prefixed keys are the
     /// annotation namespace: accepted at every nesting level and carried
@@ -100,7 +103,9 @@ pub struct StageDef {
     /// The stage's expression, evaluated over the unified slot layout.
     pub expr: String,
     /// A branched stage is evaluated per event-branch and stores the
-    /// probability-weighted EV. `event_factors` is only legal here.
+    /// probability-weighted EV. Engine-provided `event_multiplier` (and its
+    /// compatibility alias `event_factors`) is only legal here; a config that
+    /// already declares `event_multiplier` keeps that ordinary declared name.
     #[serde(default)]
     pub branched: bool,
 }

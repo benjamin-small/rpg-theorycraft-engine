@@ -1,7 +1,8 @@
 {
+  "_guide": "Gear labels are notes for players. Within each contribution, only bucket and value change this lesson's math.",
   "stats": { "attack_power": 120.0 },
   "contributions": [
-    { "bucket": "additive", "value": 30.0 },
-    { "bucket": "additive", "value": 25.0 }
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 }
   ]
 }

@@ -95,7 +95,8 @@ fn main() {
     // Per-hit damage. NOTHING drives `focused` in this chapter — the
     // scenario asserts no uptime and there are no buffs yet — so it is 0
     // and the build's `focused`-gated +50 crit_damage contributes
-    // nothing: crit_damage = 1 + 50/100 = 1.5, exactly chapter 3's value.
+    // nothing. On the crit branch, crit_damage = 1 + 50/100 = 1.5,
+    // exactly chapter 3's value; the normal branch keeps its ×1 identity.
     //   power_shot (attack_power 120, per `damage.stats`):
     //     120 × 1.55 × (0.7 × 1.0 + 0.3 × 1.5) = 186 × 1.15 = 213.9
     //     × (1 - 20/100) armor                              = 171.12

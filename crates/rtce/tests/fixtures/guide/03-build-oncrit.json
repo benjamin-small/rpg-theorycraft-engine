@@ -1,9 +1,10 @@
 {
+  "_guide": "Gear labels are notes for players. The event tag turns a contribution on only in that branch.",
   "stats": { "attack_power": 120.0, "crit_chance": 30.0 },
   "contributions": [
-    { "bucket": "additive", "value": 30.0 },
-    { "bucket": "additive", "value": 25.0 },
-    { "bucket": "crit_damage", "value": 50.0 },
-    { "bucket": "additive", "value": 20.0, "event": "crit" }
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 },
+    { "_source": "Eagle Eye Amulet · Deadly Precision affix", "bucket": "crit_damage", "value": 50.0, "event": "crit" },
+    { "_source": "Bullseye Quiver · Critical Ambush affix", "bucket": "additive", "value": 20.0, "event": "crit" }
   ]
 }

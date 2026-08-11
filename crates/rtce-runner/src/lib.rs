@@ -16,6 +16,52 @@ use std::fmt::{Display, Formatter};
 /// Version of the JSON response envelope produced by this crate.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Return the expression/config vocabulary shared by the CLI and browser
+/// tutorial. Entries say whether a name comes from the user's config or is
+/// supplied by the engine, so convenient context values never masquerade as
+/// ordinary declarations.
+pub fn lexicon() -> Value {
+    let entries = vec![
+        json!({ "term": "stat name", "kind": "declared", "scope": "GameDef and sim expressions", "meaning": "A value declared in GameDef.stats and supplied by the build or scenario.", "example": "attack_power * 2" }),
+        json!({ "term": "condition name", "kind": "declared", "scope": "GameDef and sim expressions", "meaning": "A state declared in GameDef.conditions and supplied by scenario uptime or an active buff.", "example": "1 + focused * 0.25" }),
+        json!({ "term": "bucket name", "kind": "declared", "scope": "GameDef expressions", "meaning": "A modifier group declared in GameDef.buckets and refolded from build contributions.", "example": "1 + additive / 100" }),
+        json!({ "term": "earlier stage name", "kind": "declared", "scope": "GameDef pipeline expressions", "meaning": "The output of an earlier pipeline stage; forward references are rejected.", "example": "base_hit * crit_damage" }),
+        json!({ "term": "resource name", "kind": "declared", "scope": "sim expressions", "meaning": "The current amount of a resource declared in SimDef.resources.", "example": "stamina >= 40" }),
+        json!({ "term": "fold", "kind": "schema", "scope": "GameDef.buckets.<name>", "meaning": "How one bucket combines contributions: sum adds raw values, summed_group returns 1 + sum/100, and product multiplies each 1 + value/100 factor.", "example": "\"fold\": \"summed_group\"" }),
+        json!({ "term": "branched", "kind": "schema", "scope": "GameDef.pipeline stage", "meaning": "Evaluate a stage once per fired/not-fired event combination, then store the probability-weighted average.", "example": "\"branched\": true" }),
+        json!({ "term": "contribution.event", "kind": "schema", "scope": "BuildState.contributions[]", "meaning": "Gate this contribution behind a declared event. It is absent normally and folded in only when that event fires.", "example": "\"event\": \"crit\"" }),
+        json!({ "term": "events.<name>.chance", "kind": "schema", "scope": "GameDef.events", "meaning": "Expression that sets an event's probability. The engine clamps its result to the 0-to-1 range.", "example": "\"chance\": \"crit_chance / 100\"" }),
+        json!({ "term": "events.<name>.factor", "kind": "schema", "scope": "GameDef.events", "meaning": "Expression recorded for a fired branch and multiplied into event_multiplier when that optional shortcut is used.", "example": "\"factor\": \"crit_damage\"" }),
+        json!({ "term": "+ - * /", "kind": "operator", "scope": "all expressions", "meaning": "Arithmetic operators; parentheses control grouping.", "example": "base_hit * (1 + additive / 100)" }),
+        json!({ "term": "> < >= <= == !=", "kind": "operator", "scope": "all expressions", "meaning": "Comparisons returning exactly 1 for true or 0 for false.", "example": "stamina >= 40" }),
+        json!({ "term": "min(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return the smaller value.", "example": "min(attack_speed, 2)" }),
+        json!({ "term": "max(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return the larger value.", "example": "max(0, 1 - enemy_armor / 100)" }),
+        json!({ "term": "clamp(x, lo, hi)", "kind": "function", "scope": "all expressions", "meaning": "Limit a value to an inclusive range.", "example": "clamp(crit_chance / 100, 0, 1)" }),
+        json!({ "term": "floor(x)", "kind": "function", "scope": "all expressions", "meaning": "Round a value down to the nearest integer.", "example": "floor(stacks.combo / 3)" }),
+        json!({ "term": "and(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when both values are nonzero; this does not short-circuit.", "example": "and(stamina >= 40, buff.focus == 1)" }),
+        json!({ "term": "or(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when either value is nonzero; this does not short-circuit.", "example": "or(time < 5, buff.burst == 1)" }),
+        json!({ "term": "not(a)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when a value is zero, otherwise 0.", "example": "not(buff.focus_window)" }),
+        json!({ "term": "event_multiplier", "kind": "engine", "scope": "branched GameDef stages only", "meaning": "Convenience product of every fired event's declared factor; 1 when none fire. Raw gated buckets are clearer when they can express the same rule. A config-declared name with this spelling keeps its declared meaning.", "example": "base_hit * event_multiplier", "aliases": ["event_factors"] }),
+        json!({ "term": "time", "kind": "engine", "scope": "sim expressions", "meaning": "Current simulation clock in seconds.", "example": "time < 10" }),
+        json!({ "term": "duration", "kind": "engine", "scope": "sim expressions", "meaning": "Total fight duration: the sum of scenario phase weights.", "example": "time < duration / 2" }),
+        json!({ "term": "cooldown.<action>", "kind": "engine", "scope": "sim expressions", "meaning": "Seconds until a declared action is ready; 0 means ready.", "example": "cooldown.focus_fire == 0" }),
+        json!({ "term": "buff.<buff>", "kind": "engine", "scope": "sim expressions", "meaning": "1 when at least one instance of a declared buff is active, otherwise 0.", "example": "not(buff.focus_window)" }),
+        json!({ "term": "buff_remaining.<buff>", "kind": "engine", "scope": "sim expressions", "meaning": "Seconds remaining on the longest live instance of a declared buff; 0 when inactive.", "example": "buff_remaining.poison < 1" }),
+        json!({ "term": "casts.<action>", "kind": "engine", "scope": "sim expressions", "meaning": "Number of completed casts of a declared action.", "example": "casts.power_shot >= 3" }),
+        json!({ "term": "stacks.<buff>", "kind": "engine", "scope": "sim expressions", "meaning": "Number of live instances of a declared buff.", "example": "stacks.combo >= 3" }),
+        json!({ "term": "hits_per_use", "kind": "convention", "scope": "action.damage.stats", "meaning": "Executor-handled hit count for one cast. It defaults to 1 and is not passed to the GameDef as a stat.", "example": "\"hits_per_use\": 3" }),
+        json!({ "term": "crit", "kind": "convention", "scope": "GameDef event name", "meaning": "The event name used by on_crit proc behavior. Other event names still branch damage normally.", "example": "\"event\": \"crit\"" }),
+        json!({ "term": "on_cast / on_hit / on_crit", "kind": "convention", "scope": "ProcDef.trigger", "meaning": "The three supported proc trigger values. on_crit uses the GameDef event named crit.", "example": "\"trigger\": \"on_crit\"" }),
+        json!({ "term": "_source / _guide", "kind": "annotation", "scope": "config objects", "meaning": "Human-readable notes. Any underscore-prefixed key is ignored by the calculation.", "example": "\"_source\": \"Stormstring Bow\"" }),
+    ];
+
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "lexicon",
+        "entries": entries,
+    })
+}
+
 /// A contextual parse, compile, or evaluation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerError {
@@ -167,5 +213,21 @@ mod tests {
     fn errors_name_the_document_that_failed() {
         let error = evaluate("{}", BUILD, SCENARIO).unwrap_err().to_string();
         assert!(error.starts_with("invalid gamedef JSON:"), "got: {error}");
+    }
+
+    #[test]
+    fn lexicon_distinguishes_declared_names_from_engine_context() {
+        let output = lexicon();
+        assert_eq!(output["kind"], "lexicon");
+        let entries = output["entries"].as_array().unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| { entry["term"] == "bucket name" && entry["kind"] == "declared" }));
+        assert!(entries
+            .iter()
+            .any(|entry| { entry["term"] == "event_multiplier" && entry["kind"] == "engine" }));
+        assert!(entries
+            .iter()
+            .any(|entry| { entry["term"] == "contribution.event" && entry["kind"] == "schema" }));
     }
 }

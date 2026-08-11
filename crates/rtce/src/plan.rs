@@ -1,7 +1,7 @@
 //! GameDef → Plan (compile once) and Plan × BuildState × Scenario →
 //! objectives (hot path, borrowed from scratch — no allocation). One
 //! unified slot array is shared by every compiled expression:
-//! [stats | conditions | buckets | stages | event_factors].
+//! [stats | conditions | buckets | stages | event multiplier].
 
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
@@ -44,7 +44,7 @@ impl From<ExprError> for PlanError {
 /// A `GameDef` compiled once into a flat, ready-to-evaluate form: every
 /// expression parsed and slot-resolved, every name checked, laid out over
 /// the unified slot array `[stats | conditions | buckets | stages |
-/// event_factors]`. Build one with `plan::compile` and reuse it for every
+/// event multiplier]`. Build one with `plan::compile` and reuse it for every
 /// `evaluate`/`explain` call — that's the whole "compile once, evaluate
 /// fast" contract.
 #[derive(Debug)]
@@ -78,8 +78,11 @@ struct CompiledStage {
     branched: bool,
 }
 
-/// Compile-time symbol table over the unified slot layout. `event_factors`
-/// resolves only when `branched` is set (the engine's per-branch slot).
+/// Compile-time symbol table over the unified slot layout. The engine's
+/// per-branch event-multiplier slot is exposed through the reserved legacy
+/// `event_factors` name and the clearer `event_multiplier` alias. The alias is
+/// a fallback: an existing config declaration with that name keeps its
+/// original meaning. Engine context resolves only when `branched` is set.
 struct StageSymbols<'a> {
     stats: &'a [String],
     conditions: &'a [String],
@@ -104,27 +107,33 @@ impl Symbols for StageSymbols<'_> {
         if let Some(i) = self.prior_stages.iter().position(|s| s == name) {
             return Some((n_stats + n_conditions + n_buckets + i) as u16);
         }
-        // event_factors lives after ALL stages; prior_stages grows per
+        // The event multiplier lives after ALL stages; prior_stages grows per
         // stage but the slot is fixed using the FULL stage count, patched
         // by compile() via `total_stages`.
         None
     }
 }
 
-/// Wrapper that makes `event_factors` resolvable only in branched stages,
-/// at the fixed slot after all stages.
+/// Wrapper that first preserves ordinary declared-name resolution, then makes
+/// the engine event-multiplier names available in branched stages at the fixed
+/// slot after all stages.
 struct WithEventFactors<'a> {
     inner: StageSymbols<'a>,
     slot: u16,
-    enabled: bool,
+    branched: bool,
+    readable_alias_available: bool,
 }
 
 impl Symbols for WithEventFactors<'_> {
     fn slot(&self, name: &str) -> Option<u16> {
-        if name == "event_factors" {
-            return self.enabled.then_some(self.slot);
+        if let Some(slot) = self.inner.slot(name) {
+            return Some(slot);
         }
-        self.inner.slot(name)
+        if name == "event_factors" || (name == "event_multiplier" && self.readable_alias_available)
+        {
+            return self.branched.then_some(self.slot);
+        }
+        None
     }
 }
 
@@ -180,8 +189,9 @@ pub(crate) fn validate_finite_phase_stats(phase: &Phase) -> Result<(), PlanError
 
 /// Compile a `GameDef` into a `Plan`: validate names (no collisions across
 /// stats/conditions/buckets/stages, no more than `MAX_EVENTS` events, no
-/// stage seeing a later stage, `event_factors` reserved and legal only in
-/// `branched` stages), parse and slot-resolve every expression, and lay
+/// stage seeing a later stage, the legacy `event_factors` name reserved, and
+/// engine event context legal only in `branched` stages), parse and
+/// slot-resolve every expression, and lay
 /// out the unified slot array. This is the only place expressions get
 /// parsed — do it once per `GameDef` and reuse the result.
 pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
@@ -197,10 +207,20 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         )?;
     }
 
-    // `event_factors` is the engine's injected identifier (the per-branch
-    // slot); a user name that collides would be silently shadowed.
+    // `event_factors` has always been reserved for the injected per-branch
+    // slot. `event_multiplier` is a new readable alias, so a pre-existing
+    // config declaration with that name must keep winning rather than become
+    // a compatibility break; in that uncommon case only the legacy spelling
+    // exposes the engine slot.
     let bucket_names: Vec<String> = def.buckets.keys().cloned().collect();
     let stage_names: Vec<String> = def.pipeline.iter().map(|s| s.name.clone()).collect();
+    let readable_alias_available = !def
+        .stats
+        .iter()
+        .chain(&bucket_names)
+        .chain(&stage_names)
+        .chain(&def.conditions)
+        .any(|name| name == "event_multiplier");
     for name in def
         .stats
         .iter()
@@ -210,7 +230,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     {
         if name == "event_factors" {
             return Err(PlanError {
-                what: "`event_factors` is reserved".into(),
+                what: format!("`{name}` is reserved"),
             });
         }
     }
@@ -272,7 +292,8 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
                 prior_stages: &stage_names[..i],
             },
             slot: event_factors_slot,
-            enabled: s.branched,
+            branched: s.branched,
+            readable_alias_available,
         };
         let program = compile_expr(&s.expr, &syms).map_err(|e| PlanError {
             what: format!("stage `{}`: {e}", s.name),
@@ -374,8 +395,9 @@ pub struct BranchTrace {
     /// This branch's probability weight (product of fired chances and
     /// unfired 1-chances); branches summing to zero weight are skipped.
     pub weight: f64,
-    /// `event_factors` for this branch: the product of every fired
-    /// event's factor expression (1.0 if none fired).
+    /// The `event_multiplier` for this branch: the product of every fired
+    /// event's factor expression (1.0 if none fired). The serialized field
+    /// retains its original `event_factors` name for API compatibility.
     pub event_factors: f64,
     /// This branch's stage expression value.
     pub value: f64,
@@ -397,7 +419,7 @@ impl Plan {
     }
 
     /// pub(crate): a condition's slot index within this plan's OWN unified
-    /// layout (`[stats | conditions | buckets | stages | event_factors]`),
+    /// layout (`[stats | conditions | buckets | stages | event multiplier]`),
     /// or `None` if it isn't in this plan's condition registry. Mirrors
     /// `stat_id`; `sim::compile` uses both to extend the flat namespace
     /// without exposing the plan's internal layout publicly.
@@ -409,8 +431,8 @@ impl Plan {
     }
 
     /// pub(crate): the total width of this plan's own unified slot array
-    /// (`n_stats + n_conditions + n_buckets + n_stages + 1` for
-    /// `event_factors`). `sim::compile` appends its own sim-state slots
+    /// (`n_stats + n_conditions + n_buckets + n_stages + 1` for the
+    /// event multiplier). `sim::compile` appends its own sim-state slots
     /// immediately after this offset — see `sim` module docs for the
     /// documented order.
     pub(crate) fn own_slot_width(&self) -> usize {
@@ -1142,11 +1164,37 @@ mod tests {
     }
 
     #[test]
+    fn event_multiplier_is_a_gamer_readable_alias_for_event_factors() {
+        let legacy = compile(&toy_def()).unwrap();
+        let mut readable_def = toy_def();
+        readable_def.pipeline[1].expr = readable_def.pipeline[1]
+            .expr
+            .replace("event_factors", "event_multiplier");
+        let readable = compile(&readable_def).unwrap();
+
+        let mut legacy_scratch = legacy.scratch();
+        let mut readable_scratch = readable.scratch();
+        assert_eq!(
+            legacy
+                .evaluate(&toy_build(), &arena(), &mut legacy_scratch)
+                .unwrap(),
+            readable
+                .evaluate(&toy_build(), &arena(), &mut readable_scratch)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn event_factors_is_illegal_outside_branched_stages() {
         let mut def = toy_def();
         def.pipeline[0].expr = "weapon * event_factors".into();
         let e = compile(&def).unwrap_err();
         assert!(e.what.contains("event_factors"), "got: {}", e.what);
+
+        let mut def = toy_def();
+        def.pipeline[0].expr = "weapon * event_multiplier".into();
+        let e = compile(&def).unwrap_err();
+        assert!(e.what.contains("event_multiplier"), "got: {}", e.what);
     }
 
     #[test]
@@ -1179,6 +1227,31 @@ mod tests {
         let mut def = toy_def();
         def.conditions.push("event_factors".into());
         assert!(compile(&def).unwrap_err().what.contains("reserved"));
+    }
+
+    #[test]
+    fn declared_event_multiplier_shadows_the_new_readable_alias() {
+        let mut def = toy_def();
+        def.buckets.insert(
+            "event_multiplier".into(),
+            crate::gamedef::BucketDef {
+                fold: FoldKind::Sum,
+            },
+        );
+        def.pipeline[1].expr = "event_multiplier".into();
+        def.objectives = vec!["hit".into()];
+
+        let plan = compile(&def).unwrap();
+        let mut build = toy_build();
+        build.contributions.push(crate::build::Contribution {
+            bucket: "event_multiplier".into(),
+            value: 7.0,
+            event: None,
+            condition: None,
+        });
+        let mut scratch = plan.scratch();
+        let objectives = plan.evaluate(&build, &arena(), &mut scratch).unwrap();
+        assert!((objectives[0] - 7.0).abs() < 1e-9, "got {}", objectives[0]);
     }
 
     #[test]

@@ -32,10 +32,10 @@ fn main() {
     println!("Guide chapter 3 — events and branches");
     println!("  hit (expected value) = {:.4}", objectives[0]);
 
-    // ── Hand-worked pin: `crit_damage` folds `summed_group`, so its one
-    //    member gives 1 + 50/100 = 1.5 — that is the crit branch's
-    //    `event_factors`. `additive` is unchanged at 55, so the branched
-    //    stage evaluates twice:
+    // ── Hand-worked pin: the `crit_damage` member is tagged `event: crit`.
+    //    Its `summed_group` is therefore the ×1 identity in the no-crit
+    //    branch and 1 + 50/100 = 1.5 in the crit branch. `additive` is
+    //    unchanged at 55, so the branched stage evaluates twice:
     //      no crit  weight 1 - 30/100 = 0.7   120 × 1.55 × 1.0 = 186
     //      crit     weight     30/100 = 0.3   120 × 1.55 × 1.5 = 279
     //    hit = 0.7 × 186 + 0.3 × 279 = 130.2 + 83.7 = 213.9
@@ -59,7 +59,7 @@ fn main() {
     println!("\n  branch table (stage `hit`):");
     println!(
         "    {:<8} {:>8} {:>15} {:>10}",
-        "fired", "weight", "event_factors", "value"
+        "fired", "weight", "trace factor", "value"
     );
     for phase in &explanation.phases {
         for b in &phase.branches {

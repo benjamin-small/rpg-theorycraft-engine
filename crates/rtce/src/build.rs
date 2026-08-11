@@ -134,4 +134,27 @@ mod tests {
         assert_eq!(b.contributions[1].event.as_deref(), Some("crit"));
         assert_eq!(b.contributions[2].condition.as_deref(), Some("enraged"));
     }
+
+    #[test]
+    fn player_facing_gear_annotations_do_not_change_the_build() {
+        let b: BuildState = serde_json::from_str(
+            r#"{
+                "_guide": "notes beginning with an underscore are for humans",
+                "stats": { "weapon": 100.0 },
+                "contributions": [
+                    {
+                        "_source": "Stormstring Bow · Serrated Edge affix",
+                        "bucket": "additive",
+                        "value": 30.0
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(b.stats["weapon"], 100.0);
+        assert_eq!(b.contributions.len(), 1);
+        assert_eq!(b.contributions[0].bucket, "additive");
+        assert_eq!(b.contributions[0].value, 30.0);
+    }
 }

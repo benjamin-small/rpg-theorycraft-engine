@@ -57,3 +57,15 @@ fn a_bad_path_is_a_clean_error_and_nonzero_exit() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("could not read gamedef"), "got: {stderr}");
 }
+
+#[test]
+fn lexicon_labels_engine_supplied_names() {
+    let output = rtce().args(["--compact", "lexicon"]).output().unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["kind"], "lexicon");
+    let entries = value["entries"].as_array().unwrap();
+    assert!(entries
+        .iter()
+        .any(|entry| { entry["term"] == "event_multiplier" && entry["kind"] == "engine" }));
+}

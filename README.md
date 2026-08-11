@@ -15,7 +15,8 @@ the proven patterns of `d4-theory-crafting` and `poe2-theory-crafting`.
   distribution, each chapter with a runnable example
 - **CLI + browser lab: [`docs/CLI.md`](docs/CLI.md)** — run calculations and
   simulations from a Dockerized `rtce` command, or edit the same seven guide
-  configs in a TypeScript/Wasm tutorial powered by browser-terminal
+  configs in a TypeScript/Wasm tutorial powered by browser-terminal; the
+  searchable config lexicon is also available as `rtce lexicon`
 - **Releasing: [`docs/RELEASING.md`](docs/RELEASING.md)** — trusted
   publishing setup, release checklist, and recovery paths
 - Design: `docs/superpowers/specs/2026-07-21-rtce-design.md`
@@ -95,7 +96,7 @@ buckets and 12 pipeline stages; read it if you want the exact thing.)
     { "name": "base", "expr": "weapon_avg * coeff_pct / 100 * mainstat_mult" },
     { "name": "vuln_factor", "expr": "1 + vulnerable * (1.2 * vuln_group - 1)" },
     { "name": "hit", "branched": true,
-      "expr": "base * (1 + additive / 100) * event_factors * gen_group * elem_group * tag_group * vuln_factor * indep" },
+      "expr": "base * (1 + additive / 100) * event_multiplier * gen_group * elem_group * tag_group * vuln_factor * indep" },
     { "name": "hit_after_dr", "expr": "hit * (1 - enemy_dr / 100)" },
     { "name": "raw_aps", "expr": "base_aps * (1 + min(as_sum, 100) / 100)" },
     { "name": "hit_dps", "expr": "hit_after_dr * hits_per_use * raw_aps" },
@@ -152,8 +153,8 @@ Diablo 4 basics — one build, two playbooks
   raid boss      (vuln  60%, 90% DR):    1114.9693 dps
 
   dummy branch table (stage `hit`):
-    —            weight  0.80  event_factors  1.00  hit     8611.200
-    crit         weight  0.20  event_factors  1.80  hit    18480.960
+    —            weight  0.80  event_multiplier  1.00  hit     8611.200
+    crit         weight  0.20  event_multiplier  1.80  hit    18480.960
 
   pins hold: 9526.6368 / 1114.969344 ✓
 ```

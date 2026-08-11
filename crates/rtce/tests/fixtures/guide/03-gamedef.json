@@ -5,13 +5,18 @@
     "crit_damage": { "fold": "summed_group" }
   },
   "events": {
-    "crit": { "chance": "crit_chance / 100", "factor": "crit_damage" }
+    "crit": {
+      "_guide": "Chance selects the crit branch. Factor is shown in branch traces and powers optional event_multiplier; this lesson's hit formula reads crit_damage directly.",
+      "chance": "crit_chance / 100",
+      "factor": "crit_damage"
+    }
   },
   "pipeline": [
     { "name": "base_hit", "expr": "attack_power" },
     {
       "name": "hit",
-      "expr": "base_hit * (1 + additive / 100) * event_factors",
+      "_guide": "crit_damage is a declared bucket: x1.0 normally, x1.5 when crit-tagged gear turns on.",
+      "expr": "base_hit * (1 + additive / 100) * crit_damage",
       "branched": true
     }
   ],

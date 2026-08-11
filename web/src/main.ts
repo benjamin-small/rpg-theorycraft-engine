@@ -7,6 +7,7 @@ import { lessons, type Lesson } from './lessons';
 import {
   RtceClient,
   type ConfigSet,
+  type LexiconEntry,
   type RtceResult,
   type SimulationResult,
 } from './rtce';
@@ -16,10 +17,18 @@ type ConfigKey = keyof ConfigSet;
 
 const configLabels: Record<ConfigKey, string> = {
   gamedef: 'GameDef',
-  build: 'Build',
+  build: 'Build · gear & stats',
   scenario: 'Scenario',
   simdef: 'SimDef',
   rotation: 'Rotation',
+};
+
+const configHints: Record<ConfigKey, string> = {
+  gamedef: 'Game rules: stat names, modifier buckets, and the formulas that produce each answer.',
+  build: 'Your loadout: `_source` names the item or affix for humans; bucket, value, event, and condition are the parts used by the damage math.',
+  scenario: 'The encounter: target defenses, fight phases, and conditional uptime.',
+  simdef: 'Combat rules: skills, resources, buffs, cooldowns, and the fight clock.',
+  rotation: 'Your button priority: which skill the character tries to use next.',
 };
 
 const calcFlags: FlagSpec[] = [
@@ -69,12 +78,26 @@ app.innerHTML = `
         <div><strong>What this means in-game</strong><p id="gamer-summary"></p></div>
       </div>
       <div class="insight"><span>Engine note</span><p id="lesson-insight"></p></div>
+      <div class="keyword-example">
+        <span id="keyword-label"></span>
+        <div><code id="keyword-code"></code><p id="keyword-summary"></p></div>
+        <button id="keyword-lookup" type="button">Look it up</button>
+      </div>
+      <details id="config-lexicon" class="config-lexicon">
+        <summary><span><strong>Config lexicon</strong><small>Schema, declared names, built-ins, and engine context—labeled honestly.</small></span><code>rtce lexicon</code></summary>
+        <div class="lexicon-body">
+          <label for="lexicon-search">Search the dictionary</label>
+          <input id="lexicon-search" type="search" placeholder="Try buff, clamp, event, resource…" autocomplete="off">
+          <div id="lexicon-list" class="lexicon-list"></div>
+        </div>
+      </details>
       <div class="editor-card">
         <div class="editor-bar">
           <div id="editor-tabs" class="tabs" role="tablist"></div>
           <button id="reset-config" class="text-button" type="button">Reset lesson</button>
         </div>
         <textarea id="config-editor" spellcheck="false" aria-label="JSON configuration editor"></textarea>
+        <p id="config-hint" class="config-hint"></p>
       </div>
       <div class="run-row">
         <div><span>Try in the terminal</span><code id="lesson-command"></code></div>
@@ -107,9 +130,20 @@ const resultBadge = byId<HTMLElement>('result-badge');
 const resultSummary = byId<HTMLElement>('result-summary');
 const rawResult = byId<HTMLElement>('raw-result');
 
+function prettyConfig(config: ConfigSet): ConfigSet {
+  const pretty = { ...config };
+  for (const key of Object.keys(config) as ConfigKey[]) {
+    const document = config[key];
+    if (document !== undefined) {
+      pretty[key] = JSON.stringify(JSON.parse(document), null, 2);
+    }
+  }
+  return pretty;
+}
+
 let currentLesson = lessons[0];
 let currentKey: ConfigKey = 'gamedef';
-let workingConfig: ConfigSet = { ...currentLesson.config };
+let workingConfig: ConfigSet = prettyConfig(currentLesson.config);
 let terminal: BrowserTerminal | undefined;
 
 function availableKeys(config: ConfigSet): ConfigKey[] {
@@ -139,6 +173,7 @@ function selectTab(key: ConfigKey): void {
   saveEditor();
   currentKey = key;
   editor.value = workingConfig[key] ?? '';
+  byId('config-hint').textContent = configHints[key];
   [...tabs.querySelectorAll('button')].forEach((button) => {
     const selected = button.dataset.key === key;
     button.classList.toggle('active', selected);
@@ -167,13 +202,16 @@ function loadLesson(number: number): Lesson {
   const lesson = lessons.find((candidate) => candidate.number === number);
   if (!lesson) throw new Error(`lesson must be between 1 and ${lessons.length}`);
   currentLesson = lesson;
-  workingConfig = { ...lesson.config };
+  workingConfig = prettyConfig(lesson.config);
   currentKey = 'gamedef';
   byId('eyebrow').textContent = lesson.eyebrow;
   byId('lesson-title').textContent = lesson.title;
   byId('lesson-summary').textContent = lesson.summary;
   byId('gamer-summary').textContent = lesson.gamerSummary;
   byId('lesson-insight').textContent = lesson.insight;
+  byId('keyword-label').textContent = lesson.keywordExample.label;
+  byId('keyword-code').textContent = lesson.keywordExample.code;
+  byId('keyword-summary').textContent = lesson.keywordExample.summary;
   const mode = byId('lesson-mode');
   mode.textContent = lesson.mode === 'sheet' ? 'Sheet calculation · no timeline' : 'Combat simulation · running timeline';
   mode.dataset.mode = lesson.mode;
@@ -228,6 +266,14 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[character] ?? character);
 }
 
+function eventBranchLabel(fired: string[]): string {
+  return fired.length === 0 ? 'normal hit' : `${fired.join(' + ')} hit`;
+}
+
+function formatPercent(fraction: number): string {
+  return `${(fraction * 100).toFixed(2).replace(/\.?0+$/, '')}%`;
+}
+
 function summarize(result: RtceResult): string {
   if (result.kind === 'evaluation') {
     return Object.entries(result.objectives)
@@ -235,8 +281,17 @@ function summarize(result: RtceResult): string {
       .join('');
   }
   if (result.kind === 'explanation') {
-    const branches = result.trace.phases.reduce((count, phase) => count + phase.branches.length, 0);
-    return `<article><span>objectives</span><strong>${result.objective_names.length}</strong></article><article><span>traced phases</span><strong>${result.trace.phases.length}</strong></article><article><span>event branches</span><strong>${branches}</strong></article>`;
+    const branchStages = new Set(result.trace.phases.flatMap((phase) => phase.branches.map((branch) => branch.stage)));
+    const showBranchStage = branchStages.size > 1;
+    const branchCards = result.trace.phases.flatMap((phase) => phase.branches.map((branch) => {
+      const phaseLabel = result.trace.phases.length > 1 ? `${phase.name} · ` : '';
+      const stageLabel = showBranchStage ? `${branch.stage} · ` : '';
+      return `<article><span>${escapeHtml(phaseLabel + stageLabel + eventBranchLabel(branch.fired))} · ${formatPercent(branch.weight)} chance</span><strong>${branch.value.toFixed(1)} damage</strong><small>optional factor trace ×${branch.event_factors.toFixed(2)}</small></article>`;
+    }));
+    const objectiveCards = result.objective_names.map((name, index) =>
+      `<article class="average-card"><span>weighted average · ${escapeHtml(name.replaceAll('_', ' '))}</span><strong>${result.trace.objectives[index].toFixed(1)} damage</strong><small>your calculated sheet result</small></article>`,
+    );
+    return [...branchCards, ...objectiveCards].join('');
   }
   const distribution = result.report.distribution;
   return `<article><span>DPS</span><strong>${result.report.total.dps.toFixed(3)}</strong></article><article><span>total damage</span><strong>${result.report.total.total_damage.toFixed(1)}</strong></article><article><span>duration</span><strong>${result.report.total.duration.toFixed(0)}s</strong></article>${distribution ? `<article><span>p10 · p50 · p90</span><strong>${distribution.p10.toFixed(1)} · ${distribution.p50.toFixed(1)} · ${distribution.p90.toFixed(1)}</strong></article>` : ''}`;
@@ -292,7 +347,34 @@ function configCount(config: ConfigSet, key: ConfigKey): number {
   const document = config[key];
   if (!document) return 0;
   const parsed = JSON.parse(document) as Record<string, unknown>;
-  return Object.keys(parsed).length;
+  return Object.keys(parsed).filter((name) => !name.startsWith('_')).length;
+}
+
+function gearContributionLines(config: ConfigSet): string[] {
+  const build = JSON.parse(config.build) as {
+    contributions?: Array<{
+      _source?: unknown;
+      bucket?: unknown;
+      value?: unknown;
+      event?: unknown;
+      condition?: unknown;
+    }>;
+  };
+
+  return (build.contributions ?? []).flatMap((contribution) => {
+    if (
+      typeof contribution._source !== 'string'
+      || typeof contribution.bucket !== 'string'
+      || typeof contribution.value !== 'number'
+    ) return [];
+
+    const gates = [
+      typeof contribution.event === 'string' ? `when ${contribution.event} procs` : '',
+      typeof contribution.condition === 'string' ? `while ${contribution.condition}` : '',
+    ].filter(Boolean);
+    const gate = gates.length > 0 ? ` ${gates.join(' and ')}` : '';
+    return [`[gear] ${contribution._source} → +${contribution.value}% ${contribution.bucket}${gate}`];
+  });
 }
 
 function evaluationPlayback(result: RtceResult, config: ConfigSet): string[] {
@@ -305,6 +387,7 @@ function evaluationPlayback(result: RtceResult, config: ConfigSet): string[] {
   const lines = [
     `[compile] GameDef · ${game.stats?.length ?? 0} stats · ${Object.keys(game.buckets ?? {}).length} buckets · ${Object.keys(game.events ?? {}).length} events · ${game.pipeline?.length ?? 0} stages`,
     `[resolve] Build + Scenario · ${configCount(config, 'build')} build sections · ${configCount(config, 'scenario')} scenario sections`,
+    ...gearContributionLines(config),
   ];
 
   if (result.kind === 'evaluation') {
@@ -312,27 +395,42 @@ function evaluationPlayback(result: RtceResult, config: ConfigSet): string[] {
       lines.push(`[objective] ${name} = ${value.toFixed(4)}`);
     }
   } else if (result.kind === 'explanation') {
+    const branchStages = new Set(result.trace.phases.flatMap((phase) => phase.branches.map((branch) => branch.stage)));
+    const showBranchStage = branchStages.size > 1;
     for (const phase of result.trace.phases) {
       lines.push(`[phase] ${phase.name} · weight ${(phase.weight * 100).toFixed(1)}%`);
       for (const branch of phase.branches) {
-        const fired = branch.fired.length === 0 ? 'base' : branch.fired.join('+');
+        const stageLabel = showBranchStage ? `${branch.stage} · ` : '';
         lines.push(
-          `  [branch] ${branch.stage} · ${fired} · p=${branch.weight.toFixed(3)} · value=${branch.value.toFixed(3)}`,
+          `[event] ${stageLabel}${eventBranchLabel(branch.fired)} · ${formatPercent(branch.weight)} chance · ${branch.value.toFixed(2)} damage · optional factor trace ×${branch.event_factors.toFixed(2)}`,
         );
       }
     }
     result.objective_names.forEach((name, index) => {
       lines.push(`[objective] ${name} = ${result.trace.objectives[index].toFixed(4)}`);
     });
+    if (
+      result.trace.phases.length === 1
+      && result.trace.phases[0].branches.length > 1
+      && result.objective_names.length === 1
+      && branchStages.size === 1
+      && branchStages.has(result.objective_names[0])
+    ) {
+      const terms = result.trace.phases[0].branches
+        .map((branch) => `${formatPercent(branch.weight)} × ${branch.value.toFixed(1)}`)
+        .join(' + ');
+      lines.push(`[average] ${terms} = ${result.trace.objectives[0].toFixed(1)} damage`);
+    }
   }
   lines.push('[done] result committed to the workbench');
   return lines;
 }
 
-function simulationPlayback(result: SimulationResult): string[] {
+function simulationPlayback(result: SimulationResult, config: ConfigSet): string[] {
   const { report } = result;
   const lines = [
     `[compile] Plan + SimDef + Rotation ready`,
+    ...gearContributionLines(config),
     `[timeline] ${report.total.duration.toFixed(1)}s · ${result.mode.replace('_', ' ')}`,
     '[playback] report-derived stream; cast counts and damage totals are exact',
   ];
@@ -376,12 +474,50 @@ function simulationPlayback(result: SimulationResult): string[] {
 }
 
 const client = await RtceClient.create();
+const lexicon = client.lexicon();
+
+function renderLexicon(entries: LexiconEntry[], query = ''): void {
+  const needle = query.trim().toLowerCase();
+  const matches = entries.filter((entry) =>
+    [entry.term, entry.kind, entry.scope, entry.meaning, entry.example, ...(entry.aliases ?? [])]
+      .some((value) => value.toLowerCase().includes(needle)),
+  );
+  byId('lexicon-list').innerHTML = matches.length === 0
+    ? '<p class="lexicon-empty">No matching term. Try a broader word.</p>'
+    : matches.map((entry) => `
+      <article>
+        <div><code>${escapeHtml(entry.term)}</code><span data-kind="${entry.kind}">${entry.kind}</span></div>
+        <small>${escapeHtml(entry.scope)}</small>
+        <p>${escapeHtml(entry.meaning)}</p>
+        <pre>${escapeHtml(entry.example)}</pre>
+        ${entry.aliases ? `<em>Aliases: ${entry.aliases.map(escapeHtml).join(', ')}</em>` : ''}
+      </article>
+    `).join('');
+}
+
+renderLexicon(lexicon.entries);
+byId<HTMLInputElement>('lexicon-search').addEventListener('input', (event) => {
+  renderLexicon(lexicon.entries, (event.currentTarget as HTMLInputElement).value);
+});
+byId('keyword-lookup').addEventListener('click', () => {
+  const details = byId<HTMLDetailsElement>('config-lexicon');
+  const search = byId<HTMLInputElement>('lexicon-search');
+  details.open = true;
+  search.value = currentLesson.keywordExample.lookup;
+  renderLexicon(lexicon.entries, search.value);
+  search.focus();
+});
+
 const inlinedTerminalWasm = (globalThis as { __BTERM_WASM__?: BufferSource }).__BTERM_WASM__;
 terminal = await BrowserTerminal.create({
   mount: byId('terminal'),
   wasmBinary: inlinedTerminalWasm,
 });
 
+terminal.registerCommand(
+  { name: 'rtce lexicon', summary: 'List config schema, declared names, expression tools, and engine context' },
+  () => lexicon,
+);
 terminal.registerCommand(
   { name: 'lesson list', summary: 'List the seven config-building lessons' },
   () => lessons.map(({ number, eyebrow, title, command }) => ({ number, lesson: eyebrow, goal: title, command })),
@@ -476,7 +612,7 @@ terminal.registerCommand(
           ? client.simulateMonteCarlo(config, iterations, seed)
           : client.simulateExpected(config),
       );
-      await streamLines(ctx, simulationPlayback(result), 10);
+      await streamLines(ctx, simulationPlayback(result, config), 10);
       return result;
     } catch (error) { return showError(error); }
   },
