@@ -73,6 +73,10 @@ app.innerHTML = `
         <div><p id="eyebrow" class="eyebrow"></p><h1 id="lesson-title"></h1><p id="lesson-summary" class="lede"></p></div>
         <div class="step-stamp"><span id="step-number"></span><small>/ 07</small></div>
       </div>
+      <div class="run-row">
+        <div><span>CLI demo</span><code id="lesson-command"></code></div>
+        <button id="run-button" class="run-button" type="button"><span>Run CLI demo</span><b>⌘↵</b></button>
+      </div>
       <div id="gamer-guide" class="gamer-guide">
         <span id="lesson-mode" class="mode-chip"></span>
         <div><strong>What this means in-game</strong><p id="gamer-summary"></p></div>
@@ -98,10 +102,6 @@ app.innerHTML = `
         </div>
         <textarea id="config-editor" spellcheck="false" aria-label="JSON configuration editor"></textarea>
         <p id="config-hint" class="config-hint"></p>
-      </div>
-      <div class="run-row">
-        <div><span>Try in the terminal</span><code id="lesson-command"></code></div>
-        <button id="run-button" class="run-button" type="button"><span>Run current lesson</span><b>⌘↵</b></button>
       </div>
       <section class="result-card" aria-live="polite">
         <div class="result-head"><span id="result-label">Calculated sheet result</span><strong id="result-badge">Ready</strong></div>
