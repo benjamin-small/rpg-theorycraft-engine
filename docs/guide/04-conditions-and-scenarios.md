@@ -26,16 +26,21 @@ fire" window — plus an `enemy_armor` stat and a stage to spend it:
     "crit_damage": { "fold": "summed_group" }
   },
   "events": {
-    "crit": { "chance": "crit_chance / 100", "factor": "crit_damage" }
+    "crit": {
+      "_guide": "Chance selects the crit branch. Factor is shown in branch traces and powers optional event_multiplier; this lesson's hit formula reads crit_damage directly.",
+      "chance": "crit_chance / 100",
+      "factor": "crit_damage"
+    }
   },
   "pipeline": [
     { "name": "base_hit", "expr": "attack_power" },
     {
       "name": "hit",
-      "expr": "base_hit * (1 + additive / 100) * event_factors",
+      "_guide": "crit_damage is a declared bucket: x1.0 normally, then refolded from crit-tagged gear when crit fires.",
+      "expr": "base_hit * (1 + additive / 100) * crit_damage",
       "branched": true
     },
-    { "name": "hit_after_armor", "expr": "hit * (1 - enemy_armor / 100)" }
+    { "name": "hit_after_armor", "expr": "hit * max(0, 1 - enemy_armor / 100)" }
   ],
   "objectives": ["hit_after_armor", "hit"]
 }
@@ -57,21 +62,30 @@ Note `objectives` now lists two stages. You will usually want more than one
 number back — and stages you *don't* list still compute, they just aren't
 handed over.
 
+This chapter also introduces one small expression builtin: `max(a, b)`.
+Armor can reduce the multiplier toward zero, but `max(0, …)` prevents an
+extreme armor value from turning damage negative. Both `hit` and
+`enemy_armor` are still names declared by this config; only `max` comes from
+the expression language.
+
 ## Gating a modifier on a condition
 
 ```json title=04-build.json
 {
+  "_guide": "Gear labels are notes for players. Within each contribution, bucket, value, event, and condition drive the math.",
   "stats": { "attack_power": 120.0, "crit_chance": 30.0 },
   "contributions": [
-    { "bucket": "additive", "value": 30.0 },
-    { "bucket": "additive", "value": 25.0 },
-    { "bucket": "crit_damage", "value": 50.0 },
-    { "bucket": "crit_damage", "value": 50.0, "condition": "focused" }
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 },
+    { "_source": "Eagle Eye Amulet · Deadly Precision affix", "bucket": "crit_damage", "value": 50.0, "event": "crit" },
+    { "_source": "Hawkguard Ring · Focused Fury affix", "bucket": "crit_damage", "value": 50.0, "event": "crit", "condition": "focused" }
   ]
 }
 ```
 
-The archer has +50% crit damage always, and another +50% *while focused*.
+The archer has +50% damage whenever a hit crits, and another +50% on crits
+*while focused*. The first tag controls the per-hit event branch; the second
+also scales with the fight's focused uptime.
 
 Notice `enemy_armor` is declared in the `GameDef` but absent from the build.
 That is fine — an unsupplied stat is zero — and it is the right place for it
@@ -124,12 +138,12 @@ on the training dummy is often not the ring that wins on the boss.
 ## Where the numbers came from
 
 ```
-burst — focused = 1.0, both crit_damage members fully in:
+burst — focused = 1.0, both crit_damage members fully in on the crit branch:
   crit_damage      = 1 + (50 + 1.0 × 50)/100 = 2.0
   hit              = 120 × 1.55 × (0.7 × 1.0 + 0.3 × 2.0) = 186 × 1.3  = 241.8
   hit_after_armor  = 241.8 × (1 - 5/100)                               = 229.71
 
-sustained — focused = 0.2, the gated member counts for a fifth:
+sustained — focused = 0.2, the condition-gated member counts for a fifth on crit:
   crit_damage      = 1 + (50 + 0.2 × 50)/100 = 1.6
   hit              = 120 × 1.55 × (0.7 × 1.0 + 0.3 × 1.6) = 186 × 1.18 = 219.48
   hit_after_armor  = 219.48 × (1 - 20/100)                             = 175.584

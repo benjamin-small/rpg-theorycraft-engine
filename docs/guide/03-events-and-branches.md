@@ -20,13 +20,18 @@ not a +20% damage modifier that you can fold into the pool once and forget.
     "crit_damage": { "fold": "summed_group" }
   },
   "events": {
-    "crit": { "chance": "crit_chance / 100", "factor": "crit_damage" }
+    "crit": {
+      "_guide": "Chance selects the crit branch. Factor is shown in branch traces and powers optional event_multiplier; this lesson's hit formula reads crit_damage directly.",
+      "chance": "crit_chance / 100",
+      "factor": "crit_damage"
+    }
   },
   "pipeline": [
     { "name": "base_hit", "expr": "attack_power" },
     {
       "name": "hit",
-      "expr": "base_hit * (1 + additive / 100) * event_factors",
+      "_guide": "crit_damage is a declared bucket: x1.0 normally, x1.5 when crit-tagged gear turns on.",
+      "expr": "base_hit * (1 + additive / 100) * crit_damage",
       "branched": true
     }
   ],
@@ -46,15 +51,38 @@ are the classic same-type-stacks-additively case: +50% and +50% crit damage
 is +100%, not ×2.25. Note it uses a *different* fold from `additive`, in the
 same game. That is the point of buckets.
 
-**`"branched": true` on the `hit` stage.** This is the instruction that says
-"evaluate me once per combination of events fired/not-fired, and store the
-probability-weighted average." With one event that is two branches; with two
-events it would be four.
+The build tags that gear bonus with the declared `crit` event:
 
-**`event_factors` in the expression.** A name you did not declare — the
-engine provides it inside a branched stage. It is the product of the
-`factor` expressions of every event that fired in this branch, and `1.0` in
-the branch where nothing fired.
+```json title=03-build.json
+{
+  "_guide": "Gear labels are notes for players. Within each contribution, bucket, value, event, and condition drive the math.",
+  "stats": { "attack_power": 120.0, "crit_chance": 30.0 },
+  "contributions": [
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 },
+    { "_source": "Eagle Eye Amulet · Deadly Precision affix", "bucket": "crit_damage", "value": 50.0, "event": "crit" }
+  ]
+}
+```
+
+**`"branched": true` on the `hit` stage.** This says “evaluate me once per
+combination of events fired/not-fired, refolding event-tagged bucket members
+for each branch, then store the probability-weighted average.” With one event
+that is two branches; with two events it would be four.
+
+**There is no injected name in the formula.** `crit_damage` was declared in
+`buckets`, and the amulet contribution names the declared `crit` event. An
+empty `summed_group` is ×1.0, so the normal branch gets the identity. The crit
+branch turns on the amulet and refolds the bucket to ×1.5. The generic
+`event_multiplier` builtin remains available as an advanced shortcut for
+event factors that are not naturally represented by gated buckets; the
+tutorial does not need it.
+
+**The event's `factor` field is still explicit.** It points at the same
+declared `crit_damage` bucket, so the branch trace can report ×1.5 and the
+optional `event_multiplier` shortcut would produce the same multiplier. This
+lesson's stage expression does not consume that shortcut: the contribution's
+`"event": "crit"` gate and the raw `crit_damage` bucket do the actual math.
 
 **The pipeline also split in two.** `base_hit` is now just `attack_power`,
 and the bucket wrap moved *into* the branched stage. That reshuffle looks
@@ -68,15 +96,15 @@ check the engine's work — and it costs the hot path nothing, because
 
 ```
   branch table (stage `hit`):
-    fired      weight   event_factors      value
+    fired      weight      trace factor      value
     —           0.700           1.000    186.000
     crit        0.300           1.500    279.000
 ```
 
 Everything in chapter 3's answer is in that table:
 
-- `crit_damage` folds `summed_group` → `1 + 50/100` = **1.5**, which is the
-  crit branch's `event_factors`.
+- `crit_damage` is ×1.0 with its crit-tagged contribution off, then folds to
+  `1 + 50/100` = **1.5** in the crit branch.
 - The weights are `crit_chance / 100` = 0.3 and its complement 0.7.
 - `120 × 1.55 × 1.0` = 186 and `120 × 1.55 × 1.5` = 279.
 - Blended: `0.7 × 186 + 0.3 × 279` = **213.9**.
@@ -91,12 +119,13 @@ Now the contrast. Take the same gamedef and add one contribution:
 
 ```json title=03-build-oncrit.json
 {
+  "_guide": "Gear labels are notes for players. The event tag turns a contribution on only in that branch.",
   "stats": { "attack_power": 120.0, "crit_chance": 30.0 },
   "contributions": [
-    { "bucket": "additive", "value": 30.0 },
-    { "bucket": "additive", "value": 25.0 },
-    { "bucket": "crit_damage", "value": 50.0 },
-    { "bucket": "additive", "value": 20.0, "event": "crit" }
+    { "_source": "Stormstring Bow · Serrated Edge affix", "bucket": "additive", "value": 30.0 },
+    { "_source": "Trailseeker Gloves · Hunter's Tempo affix", "bucket": "additive", "value": 25.0 },
+    { "_source": "Eagle Eye Amulet · Deadly Precision affix", "bucket": "crit_damage", "value": 50.0, "event": "crit" },
+    { "_source": "Bullseye Quiver · Critical Ambush affix", "bucket": "additive", "value": 20.0, "event": "crit" }
   ]
 }
 ```

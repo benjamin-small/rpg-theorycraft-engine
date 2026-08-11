@@ -72,12 +72,12 @@ fn main() {
     //
     // Per-hit damage, now in two flavours. `focus_window` drives
     // `focused` to 1.0 while up, which opens the build's gated +50
-    // crit_damage:
-    //   focused ACTIVE   crit_damage = 1 + (50+50)/100 = 2.0
+    // crit_damage. The normal branch keeps its ×1 identity throughout:
+    //   focused ACTIVE   crit-branch crit_damage = 1 + (50+50)/100 = 2.0
     //     power_shot 120 × 1.55 × (0.7 + 0.3 × 2.0) = 186 × 1.3  = 241.8
     //                × 0.8 armor                                 = 193.44
     //     quick_shot (half attack power)                         =  96.72
-    //   focused INACTIVE crit_damage = 1 + 50/100 = 1.5 (chapter 5's)
+    //   focused INACTIVE crit-branch crit_damage = 1 + 50/100 = 1.5
     //     power_shot                                             = 171.12
     //     quick_shot                                             =  85.56
     //
@@ -198,7 +198,7 @@ fn main() {
     // And the practical consequence, which is why this is worth a
     // chapter: feeding the reported 0.25 back into chapter 4's calc tier
     // does NOT reproduce the sim's answer.
-    //   crit_damage = 1 + (50 + 0.25 × 50)/100 = 1.625
+    //   crit-branch crit_damage = 1 + (50 + 0.25 × 50)/100 = 1.625
     //   power_shot  = 120 × 1.55 × (0.7 + 0.3 × 1.625) × 0.8 = 176.7
     //   naive total = 31 × 176.7 + 29 × 88.35 = 5477.7 + 2562.15 = 8039.85
     // — 41.85 too high, because it credits the window for 2.5 completions

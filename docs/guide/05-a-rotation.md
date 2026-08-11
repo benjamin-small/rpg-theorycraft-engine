@@ -133,8 +133,9 @@ Guide chapter 5 — a rotation (60s training dummy, EV mode)
 ## Where the numbers came from
 
 Nothing drives `focused`, so it is 0 and the build's `focused`-gated +50
-crit damage contributes nothing — `crit_damage` folds to 1.5, exactly
-chapter 3's value.
+crit damage contributes nothing. On the crit branch, `crit_damage` folds to
+1.5, exactly chapter 3's value; on the normal branch its event-gated members
+stay out and the bucket keeps its ×1 identity.
 
 ```
 power_shot  120 × 1.55 × (0.7 × 1.0 + 0.3 × 1.5) = 186 × 1.15 = 213.9
@@ -178,8 +179,8 @@ config drives none, so the map is *empty* — not `focused: 0.0`, but no entry
 at all. The example asserts that emptiness, because it is the precise
 statement of what is still missing.
 
-`focused` does still fold as 0 in the math — that is why `crit_damage` came
-out 1.5. It simply has no driver for the sim to integrate.
+`focused` does still fold as 0 in the math — that is why the crit branch's
+`crit_damage` came out 1.5. It simply has no driver for the sim to integrate.
 
 ## What we can't do yet
 

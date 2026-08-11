@@ -1,6 +1,7 @@
 import initWasm, {
   evaluate as wasmEvaluate,
   explain as wasmExplain,
+  lexicon as wasmLexicon,
   simulate_expected as wasmSimulateExpected,
   simulate_monte_carlo as wasmSimulateMonteCarlo,
 } from './wasm/rtce_wasm.js';
@@ -65,6 +66,21 @@ export interface SimulationResult {
 
 export type RtceResult = EvaluationResult | ExplanationResult | SimulationResult;
 
+export interface LexiconEntry {
+  term: string;
+  kind: 'schema' | 'declared' | 'operator' | 'function' | 'engine' | 'convention' | 'annotation';
+  scope: string;
+  meaning: string;
+  example: string;
+  aliases?: string[];
+}
+
+export interface LexiconResult {
+  schema_version: 1;
+  kind: 'lexicon';
+  entries: LexiconEntry[];
+}
+
 let ready: Promise<void> | undefined;
 
 function initialize(): Promise<void> {
@@ -95,6 +111,10 @@ export class RtceClient {
 
   evaluate(config: ConfigSet): EvaluationResult {
     return parse(wasmEvaluate(config.gamedef, config.build, config.scenario));
+  }
+
+  lexicon(): LexiconResult {
+    return JSON.parse(wasmLexicon()) as LexiconResult;
   }
 
   explain(config: ConfigSet): ExplanationResult {

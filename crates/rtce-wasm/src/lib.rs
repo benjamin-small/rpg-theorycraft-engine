@@ -9,6 +9,13 @@ fn render(result: Result<Value, rtce_runner::RunnerError>) -> Result<String, JsV
     serde_json::to_string(&value).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
+/// Return the config and expression lexicon used by the CLI and tutorial.
+#[wasm_bindgen]
+pub fn lexicon() -> Result<String, JsValue> {
+    serde_json::to_string(&rtce_runner::lexicon())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 /// Evaluate a stat-sheet configuration and return a JSON response envelope.
 #[wasm_bindgen]
 pub fn evaluate(gamedef: &str, build: &str, scenario: &str) -> Result<String, JsValue> {

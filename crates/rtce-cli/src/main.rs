@@ -37,6 +37,8 @@ enum Command {
         #[arg(value_enum, default_value_t = DemoKind::Calc)]
         kind: DemoKind,
     },
+    /// List config schema, declared names, expression tools, and engine context.
+    Lexicon,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -146,6 +148,7 @@ fn run(cli: &Cli) -> Result<Value, String> {
             ),
         }
         .map_err(|error| error.to_string()),
+        Command::Lexicon => Ok(rtce_runner::lexicon()),
     }
 }
 

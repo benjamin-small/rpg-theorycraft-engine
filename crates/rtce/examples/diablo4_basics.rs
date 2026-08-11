@@ -88,7 +88,7 @@ fn main() {
             b.fired.join("+")
         };
         println!(
-            "    {:<12} weight {:>5.2}  event_factors {:>5.2}  hit {:>12.3}",
+            "    {:<12} weight {:>5.2}  event_multiplier {:>5.2}  hit {:>12.3}",
             fired, b.weight, b.event_factors, b.value
         );
     }

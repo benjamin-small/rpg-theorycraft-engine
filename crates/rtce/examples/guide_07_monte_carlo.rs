@@ -110,9 +110,10 @@ fn main() {
 
     // ══════════════ the hard bound: every fight lands in here ═══════════
     //
-    // Hand-worked, and much stronger than a tolerance band. In the
-    // NO-CRIT branch `event_factors` is 1, so `crit_damage` — and with it
-    // the whole `focused` buff — drops out entirely:
+    // Hand-worked, and much stronger than a tolerance band. In the NO-CRIT
+    // branch the event-gated `crit_damage` contributions —
+    // including the one gated by `focused` — stay out of the fold, so the
+    // declared `summed_group` bucket keeps its ×1 identity:
     //   no-crit  power_shot 120 × 1.55 × 1.0 × 0.8 = 148.8  (buff or not)
     //            quick_shot                        =  74.4
     // In the ALL-CRIT case the buff matters, at chapter 6's 7/24 and 5/24

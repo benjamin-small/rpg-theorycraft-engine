@@ -62,8 +62,9 @@ lots of subtly wrong models. So this chapter closes with a bound you can
 derive on paper and that no sample may ever escape.
 
 Start from an observation that is easy to miss: **in the no-crit branch,
-`event_factors` is 1, so `crit_damage` drops out — and with it the entire
-`focus_window` buff.** A hit that doesn't crit does not care whether the
+the event-tagged `crit_damage` contributions are absent, so that
+`summed_group` is its identity value of 1 — and the entire `focus_window`
+buff drops out with them.** A hit that doesn't crit does not care whether the
 archer was focused.
 
 ```

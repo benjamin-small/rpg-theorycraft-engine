@@ -29,6 +29,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `--scenario`, `--sim`, and `--rotation` arguments. Browser-terminal 0.2.0
   injects each live editor document as a real `$game`, `$build`, `$scenario`,
   `$sim`, or `$rotation` shell variable in place of a filesystem path.
+- A shared `rtce lexicon` dictionary now labels config schema, declared names,
+  expression functions and operators, engine-supplied context, conventions,
+  and annotation keys. The browser tutorial exposes the same dictionary with
+  searchable, lesson-specific examples.
+- The crit lesson now multiplies a declared, event-gated `crit_damage` bucket
+  directly. `event_multiplier` and its `event_factors` compatibility alias
+  remain available, but are presented honestly as advanced engine context.
 - A GitHub Pages workflow builds and publishes the split TypeScript/Wasm
   tutorial from `main` with project-path-safe relative assets.
 

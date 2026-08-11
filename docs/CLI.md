@@ -96,6 +96,19 @@ docker run --rm \
 Run `docker run --rm rtce --help` or append `--help` to a subcommand for the
 complete flag reference.
 
+To inspect the expression vocabulary without opening a config, run:
+
+```sh
+docker run --rm rtce lexicon
+```
+
+The structured dictionary separates config schema words, names declared by
+your config, expression functions/operators, engine-supplied runtime context,
+and special conventions. That distinction is intentional: `fold` is a schema
+key, `attack_power` and `stamina` come from your files, `max` and `clamp` are
+language functions, while names such as `time` and `cooldown.<action>` exist
+only during a simulation.
+
 ## Open the browser tutorial
 
 The tutorial grows one archer config through the seven guide chapters: one
@@ -114,6 +127,7 @@ lesson list
 lesson load 3
 config show gamedef
 config list
+rtce lexicon
 rtce evaluate --game $game --build $build --scenario $scenario
 rtce explain --game $game --build $build --scenario $scenario
 rtce simulate --game $game --build $build --scenario $scenario --sim $sim --rotation $rotation
