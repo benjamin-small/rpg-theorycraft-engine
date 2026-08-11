@@ -13,12 +13,42 @@ the proven patterns of `d4-theory-crafting` and `poe2-theory-crafting`.
 - **Guide: [`docs/guide/`](docs/guide/README.md)** — a seven-chapter
   walkthrough building one small RPG from a single stat to a Monte Carlo
   distribution, each chapter with a runnable example
+- **CLI + browser lab: [`docs/CLI.md`](docs/CLI.md)** — run calculations and
+  simulations from a Dockerized `rtce` command, or edit the same seven guide
+  configs in a TypeScript/Wasm tutorial powered by browser-terminal
 - **Releasing: [`docs/RELEASING.md`](docs/RELEASING.md)** — trusted
   publishing setup, release checklist, and recovery paths
 - Design: `docs/superpowers/specs/2026-07-21-rtce-design.md`
 - Test: `cargo test --workspace`
 
-Crates: `rtce` (engine), `rtce-testkit` (fixture harness, dev-dependency).
+Published crates: `rtce` (engine), `rtce-testkit` (fixture harness,
+dev-dependency). The workspace also contains private `rtce-runner`,
+`rtce-cli`, and `rtce-wasm` interface crates.
+
+## Run it from Docker
+
+The CLI image contains a bundled lesson, so the shortest complete run is:
+
+```sh
+docker build --target cli -t rtce .
+docker run --rm rtce
+```
+
+Use `demo sim` or `demo monte-carlo` for the timeline tiers. To work through
+the same model interactively in a browser:
+
+```sh
+docker compose up --build tutorial
+```
+
+Then open <http://localhost:8080>. File-based CLI examples, every subcommand,
+the local-development path, and a self-contained HTML build that works from a
+`file://` URL are documented in [`docs/CLI.md`](docs/CLI.md).
+
+The same interactive tutorial is published at
+[benjamin-small.github.io/rpg-theorycraft-engine](https://benjamin-small.github.io/rpg-theorycraft-engine/).
+A push to `main` builds the Rust/Wasm and TypeScript application and deploys it
+through the [GitHub Pages workflow](.github/workflows/pages.yml).
 
 ## A real game's damage model in config: a Diablo 4 slice
 

@@ -1,0 +1,14 @@
+services:
+  cli:
+    build:
+      context: .
+      target: cli
+    image: rtce-cli:local
+
+  tutorial:
+    build:
+      context: .
+      target: tutorial
+    image: rtce-tutorial:local
+    ports:
+      - "8080:80"

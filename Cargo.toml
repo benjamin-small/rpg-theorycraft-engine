@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/rtce", "crates/rtce-testkit"]
+members = [
+    "crates/rtce",
+    "crates/rtce-cli",
+    "crates/rtce-runner",
+    "crates/rtce-testkit",
+    "crates/rtce-wasm",
+]
 resolver = "2"
 
 [profile.release]

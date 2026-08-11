@@ -20,6 +20,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       - name: Cache cargo registry, index, and build artifacts
         uses: actions/cache@v6
@@ -61,6 +69,16 @@ jobs:
         run: cargo run -p rtce --example poe2_triggers
       - name: cargo run -p rtce --example poe2_ignite
         run: cargo run -p rtce --example poe2_ignite
+
+      - name: cargo run -p rtce-cli -- demo calc
+        run: cargo run -p rtce-cli -- demo calc
+
+      - name: Build browser tutorial
+        run: |
+          command -v wasm-bindgen >/dev/null || \
+            cargo install wasm-bindgen-cli --version 0.2.126 --locked
+          npm ci --prefix web --ignore-scripts --no-audit --no-fund
+          npm run build --prefix web
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings

@@ -1,0 +1,5 @@
+dist/
+dist-standalone/
+file-demo/
+node_modules/
+src/wasm/

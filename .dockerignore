@@ -1,0 +1,9 @@
+.git
+target
+web/dist
+web/dist-standalone
+web/file-demo
+web/node_modules
+web/src/wasm
+test-results
+*.log
