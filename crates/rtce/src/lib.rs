@@ -110,9 +110,9 @@
 //!    strategy on top.
 //!
 //! [`sim::run`]'s [`sim::SimReport`] reports COMPUTED
-//! buff/condition uptimes, per-buff `avg_stacks`, per-action
-//! casts/damage/share, per-resource starvation and cap time, and proc fire
-//! counts — with a `dps` [`sim::Distribution`] added in
+//! buff/condition uptimes, per-buff applications/`avg_stacks`/damage/DPS,
+//! per-action casts/damage/share, per-resource starvation and cap time, and
+//! proc fire counts — with a `dps` [`sim::Distribution`] added in
 //! [`sim::Mode::MonteCarlo`].
 //!
 //! # Counted and snapshotted state

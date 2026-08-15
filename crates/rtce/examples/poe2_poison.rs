@@ -131,7 +131,7 @@ fn main() {
 
     let report = run(&plan, &sim_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
     let hit_damage = report.actions["viper_strike"].damage;
-    let dot_damage = report.total.total_damage - hit_damage;
+    let dot_damage = report.buffs["poison"].damage;
 
     println!("PoE2 poison (P7e slice 2) — 20s dummy, EV mode");
     println!(
@@ -139,8 +139,12 @@ fn main() {
         report.actions["viper_strike"].casts, hit_damage
     );
     println!(
-        "  poison: uptime {:.4}, avg_stacks {:.4}, {:.4} DoT damage",
-        report.buffs["poison"].uptime, report.buffs["poison"].avg_stacks, dot_damage
+        "  poison: {} applications, uptime {:.4}, avg_stacks {:.4}, {:.4} DoT damage ({:.4} dps)",
+        report.buffs["poison"].applications,
+        report.buffs["poison"].uptime,
+        report.buffs["poison"].avg_stacks,
+        dot_damage,
+        report.buffs["poison"].dps
     );
     println!(
         "  total: {:.4} damage over {:.0}s = {:.4} dps",
@@ -224,6 +228,7 @@ fn main() {
     // non-empty on [1,20] — uptime 19/20 = 0.95, and it would read the
     // same for a one-instance buff. `avg_stacks` is the counted number.
     assert_eq!(report.actions["viper_strike"].casts, 20);
+    assert_eq!(report.buffs["poison"].applications, 20);
     assert!(close(hit_damage, 6000.0), "hit damage: got {hit_damage}");
     assert!(
         close(report.buffs["poison"].avg_stacks, 3.875),
@@ -382,7 +387,7 @@ fn main() {
     .expect("valid simdef");
     let proc_plan = sim_compile(&plan, &proc_simdef, &rotation).expect("simdef compiles");
     let via_proc = run(&plan, &proc_plan, &build, &dummy, Mode::Expected).expect("ev sim runs");
-    let proc_dot = via_proc.total.total_damage - via_proc.actions["viper_strike"].damage;
+    let proc_dot = via_proc.buffs["poison"].damage;
 
     println!(
         "\n  applied by a PROC instead: {:.4} DoT ({:.4} total, {:.4} dps), \
