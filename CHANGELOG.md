@@ -7,42 +7,117 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-### Added
+**CLI, browser lab, and applied-DoT observability.** The next release makes
+RTCE usable without writing a Rust integration first. The same JSON runner now
+powers a native command, a Docker-first demo, and a TypeScript/Wasm tutorial
+that walks a gamer from one stat-sheet number through bucket math, critical-hit
+branches, rotations, buffs, and Monte Carlo simulation. The library also gains
+the missing diagnostics for applied damage-over-time mechanics: a config-owned
+stat-sheet recipe and direct per-buff application, damage, and DPS reporting
+from the timeline.
 
-- Damaging buffs now report their application count, directly attributed
-  damage, and DPS alongside uptime and average stacks. A library-owned
-  applied-DoT fixture pins a complete poison-shaped stat-sheet breakdown,
-  including single ownership of target-side damage multipliers.
+### Highlights
+
+- **Run RTCE from a shell.** The private `rtce-cli` binary provides
+  `evaluate`, `explain`, `simulate`, `lexicon`, and bundled demo commands.
+  Native and browser clients share versioned JSON envelopes from
+  `rtce-runner`; neither interface reimplements engine math.
+- **Start with Docker.** The multi-target Dockerfile defaults to the CLI demo,
+  serves the interactive tutorial from a second target, and can export a
+  self-contained page that opens directly from a `file://` URL.
+- **Learn the engine interactively.** The seven-step field guide combines live
+  JSON editors, structured result cards, and a real browser terminal. Its Run
+  button enters the corresponding CLI-shaped command, streams report-derived
+  activity, and updates the GUI from the same result.
+- **Diagnose applied DoTs.** `BuffReport` now identifies how many times an
+  effect was applied and how much damage/DPS its tick objective contributed.
+  The library-owned applied-DoT fixture exposes chance, duration, expected
+  stacks, target multiplier, per-stack DPS, total DPS, and damage per
+  application while proving target damage-taken modifiers are owned once.
+- **Make config vocabulary explicit.** `rtce lexicon` and the browser
+  dictionary distinguish schema fields, user-declared names, expression
+  functions/operators, annotations, conventions, and engine-supplied context.
+
+### Added — interfaces and tutorial
 
 - A private `rtce-cli` workspace binary with `evaluate`, `explain`, and
   `simulate` commands, plus bundled `demo calc|sim|monte-carlo` runs. Outputs
   are versioned JSON envelopes shared with the browser interface.
-- A multi-target Dockerfile. The default `cli` target is the primary command
-  demo; the `tutorial` target serves a static TypeScript/Wasm walkthrough.
 - A private `rtce-runner` JSON adapter and `rtce-wasm` binding so native and
   browser interfaces compile and execute the same engine paths.
+- A multi-target Dockerfile. The default `cli` target is the primary command
+  demo; the `tutorial` target serves a static TypeScript/Wasm walkthrough.
 - A seven-step browser tutorial powered by
   `@benjamin-small/browser-terminal`, with live editors for the committed guide
   fixtures and structured, pipeable `rtce` commands.
 - A self-contained `rtce-field-guide.html` build that embeds both Wasm engines,
   JavaScript, and CSS so the tutorial also runs directly from a `file://` URL.
-- Terminal-driven lesson runs: the GUI Run button now enters the real command
-  at the browser-terminal prompt, streams compilation, branch, cast, hit, buff,
+- Terminal-driven lesson runs: the GUI Run button enters the real command at
+  the browser-terminal prompt, streams compilation, branch, cast, hit, buff,
   and distribution playback there, and updates the workbench from the same
   structured command result.
-- Browser tutorial commands now mirror the native CLI's `--game`, `--build`,
-  `--scenario`, `--sim`, and `--rotation` arguments. Browser-terminal 0.2.0
-  injects each live editor document as a real `$game`, `$build`, `$scenario`,
-  `$sim`, or `$rotation` shell variable in place of a filesystem path.
-- A shared `rtce lexicon` dictionary now labels config schema, declared names,
-  expression functions and operators, engine-supplied context, conventions,
-  and annotation keys. The browser tutorial exposes the same dictionary with
-  searchable, lesson-specific examples.
+- Browser tutorial commands mirror the native CLI's `--game`, `--build`,
+  `--scenario`, `--sim`, and `--rotation` arguments. Browser-terminal injects
+  each live editor document as `$game`, `$build`, `$scenario`, `$sim`, or
+  `$rotation` in place of a filesystem path.
+- A shared `rtce lexicon` dictionary with searchable, lesson-specific browser
+  examples.
+
+### Added — library and reports
+
+- Damaging buffs now report their application count, directly attributed
+  damage, and DPS alongside uptime and average stacks. A library-owned
+  applied-DoT fixture pins a complete poison-shaped stat-sheet breakdown,
+  including single ownership of target-side damage multipliers.
+- Monte Carlo `Distribution` reports now include `iterations`, `min`, and `max`
+  alongside mean, population standard deviation, and percentiles, making it
+  explicit how many fights ran and what the observed bounds were.
+- `event_multiplier` is a readable alias for the engine's branched-stage event
+  factor. The legacy `event_factors` spelling remains supported and retains its
+  serialized trace field; a user-declared `event_multiplier` keeps its original
+  meaning and shadows the alias.
+
+### Changed
+
 - The crit lesson now multiplies a declared, event-gated `crit_damage` bucket
   directly. `event_multiplier` and its `event_factors` compatibility alias
   remain available, but are presented honestly as advanced engine context.
+- Build examples use `_`-prefixed annotations to identify the gear or rule that
+  supplied a contribution without changing calculation semantics.
+- Tutorial callouts now explain the actual config and engine behavior they sit
+  beside, including buff conditions and simulation context, rather than using
+  disconnected placeholder expressions.
+- The lesson workspace keeps its header and tabs fixed while the config and
+  terminal panes scroll independently; CLI demo controls remain visible at the
+  top of each lesson without truncating the command or button label.
+
+### Documentation and project infrastructure
+
 - A GitHub Pages workflow builds and publishes the split TypeScript/Wasm
   tutorial from `main` with project-path-safe relative assets.
+- Added the canonical license, testing guide, configuration reference, fixture
+  guidance, repository metadata, CodeQL scanning, and protected-branch status
+  checks.
+- Added an applied damage-over-time guide covering the stat-sheet/timeline
+  boundary, source-versus-target modifier ownership, snapshot objectives,
+  stack policies, and the new report fields.
+
+### Upgrading from 0.4.0
+
+- Existing GameDef, BuildState, Scenario, SimDef, and Rotation JSON remains
+  valid. `event_multiplier` is additive syntax; `event_factors` continues to
+  work. A config that already declares `event_multiplier` retains that declared
+  value rather than being captured by the alias.
+- Serialized reports gain additive fields. `Distribution` adds `iterations`,
+  `min`, and `max`; each `BuffReport` adds `applications`, `damage`, and `dps`.
+  Consumers using strict external schemas should accept these fields before
+  upgrading. Rust consumers are unaffected because these engine-produced
+  report structs are `#[non_exhaustive]`.
+- The CLI, runner, and Wasm crates are private workspace interfaces; only
+  `rtce` and `rtce-testkit` remain part of the crates.io release path.
+- No release tag is created by these notes. Crate publication still begins only
+  when a version-matching `vX.Y.Z` tag is pushed and the release workflow
+  verifies the Cargo version and changelog heading.
 
 ## [0.4.0] — 2026-08-01
 
