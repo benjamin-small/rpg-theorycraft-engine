@@ -17,6 +17,10 @@ the proven patterns of `d4-theory-crafting` and `poe2-theory-crafting`.
   simulations from a Dockerized `rtce` command, or edit the same seven guide
   configs in a TypeScript/Wasm tutorial powered by browser-terminal; the
   searchable config lexicon is also available as `rtce lexicon`
+- **Configuration: [`docs/configuration.md`](docs/configuration.md)** — the five
+  JSON documents, expression names, annotations, and validation rules
+- **Testing: [`TESTING.md`](TESTING.md)** — validation commands, current
+  coverage baseline, and the boundaries exercised by the suite
 - **Releasing: [`docs/RELEASING.md`](docs/RELEASING.md)** — trusted
   publishing setup, release checklist, and recovery paths
 - Design: `docs/superpowers/specs/2026-07-21-rtce-design.md`
@@ -25,6 +29,17 @@ the proven patterns of `d4-theory-crafting` and `poe2-theory-crafting`.
 Published crates: `rtce` (engine), `rtce-testkit` (fixture harness,
 dev-dependency). The workspace also contains private `rtce-runner`,
 `rtce-cli`, and `rtce-wasm` interface crates.
+
+## Supported runtimes
+
+- Rust 1.88 or newer for native and Wasm builds. CI also tests the current
+  stable Rust toolchain.
+- Node.js 22.x for building or serving the TypeScript tutorial.
+- Docker with BuildKit support for the primary CLI and browser demo path.
+
+The browser build targets `wasm32-unknown-unknown` and uses
+`wasm-bindgen-cli` 0.2.126, matching the workspace dependency. Docker pins
+these versions in the reproducible build path.
 
 ## Run it from Docker
 
