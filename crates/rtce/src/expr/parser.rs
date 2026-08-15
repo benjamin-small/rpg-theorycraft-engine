@@ -1,8 +1,8 @@
 //! Recursive-descent parser. Precedence, loosest to tightest:
 //! comparison (`pred`, at most ONE per level — chaining is a positioned
 //! error) > + - > * / > unary minus. Functions are a closed set
-//! (min/max/clamp/floor/and/or/not) with arity checked at parse time — an
-//! unknown function name is an error, never a guess.
+//! (min/max/clamp/floor/sqrt/pow/and/or/not) with arity checked at parse time
+//! — an unknown function name is an error, never a guess.
 
 use super::lexer::{tokenize, Tok};
 use super::ExprError;
@@ -37,6 +37,8 @@ pub enum Func {
     Max,
     Clamp,
     Floor,
+    Sqrt,
+    Pow,
     And,
     Or,
     Not,
@@ -45,9 +47,9 @@ pub enum Func {
 impl Func {
     pub fn arity(self) -> usize {
         match self {
-            Func::Min | Func::Max | Func::And | Func::Or => 2,
+            Func::Min | Func::Max | Func::Pow | Func::And | Func::Or => 2,
             Func::Clamp => 3,
-            Func::Floor | Func::Not => 1,
+            Func::Floor | Func::Sqrt | Func::Not => 1,
         }
     }
 }
@@ -175,6 +177,8 @@ impl Parser {
                         "max" => Func::Max,
                         "clamp" => Func::Clamp,
                         "floor" => Func::Floor,
+                        "sqrt" => Func::Sqrt,
+                        "pow" => Func::Pow,
                         "and" => Func::And,
                         "or" => Func::Or,
                         "not" => Func::Not,
@@ -294,6 +298,18 @@ mod tests {
         );
         let e = parse("min(a)").unwrap_err();
         assert!(e.msg.contains("expects 2"), "got: {}", e.msg);
+        assert_eq!(
+            parse("sqrt(4)").unwrap(),
+            Ast::Call(Func::Sqrt, vec![Ast::Num(4.0)])
+        );
+        assert_eq!(
+            parse("pow(x, 2)").unwrap(),
+            Ast::Call(Func::Pow, vec![Ast::Ref("x".into(), 4), Ast::Num(2.0)])
+        );
+        let e = parse("sqrt(1, 2)").unwrap_err();
+        assert!(e.msg.contains("`sqrt` expects 1 argument(s), got 2"));
+        let e = parse("pow(2)").unwrap_err();
+        assert!(e.msg.contains("`pow` expects 2 argument(s), got 1"));
         let e = parse("shazam(1)").unwrap_err();
         assert!(e.msg.contains("unknown function"), "got: {}", e.msg);
     }

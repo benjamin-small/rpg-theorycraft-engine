@@ -7,6 +7,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+
+- The shared expression VM now supports `sqrt(x)` and fractional
+  `pow(base, exponent)` in every GameDef and SimDef expression location. Both
+  use IEEE `f64` semantics, retain compile-time arity and stack-depth checks,
+  and unblock config-owned strongest-roll and closed-form armour formulas.
+
 ## [0.5.0] — 2026-08-15
 
 **CLI, browser lab, and applied-DoT observability.** Version 0.5.0 makes

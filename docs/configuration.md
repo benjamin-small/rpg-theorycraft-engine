@@ -51,6 +51,22 @@ Run `rtce lexicon` for the authoritative, machine-readable dictionary of
 schema terms, declared names, functions, operators, engine context, and
 conventions. The interactive tutorial exposes the same dictionary.
 
+Numeric functions are `min(a, b)`, `max(a, b)`, `clamp(x, lo, hi)`,
+`floor(x)`, `sqrt(x)`, and `pow(base, exponent)`. `pow` accepts fractional
+exponents, so formulas such as the probability that at least one active stack
+came from a critical hit remain inside the GameDef:
+
+```text
+1 - pow(1 - crit_chance, max(stack_potential, 1))
+```
+
+`sqrt` and `pow` use Rust `f64`/IEEE semantics. Invalid domains produce NaN
+and overflow can produce infinity; they do not become expression compile
+errors. A closed-form `Plan` returns that derived value to its caller, while a
+simulation field that requires a finite quantity rejects it at runtime with the
+field and evaluation instant named. Input stats, contributions, phase values,
+and uptimes retain their existing fail-closed finite-value validation.
+
 Unknown JSON keys and unresolved expression names fail closed with contextual
 errors. Keys beginning with `_` are the one exception: they are ignored
 annotations for human guidance, such as `_source` and `_guide`.

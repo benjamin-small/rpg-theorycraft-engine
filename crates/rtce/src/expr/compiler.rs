@@ -54,6 +54,11 @@ pub enum Op {
     Clamp,
     /// Pop one, push its floor.
     Floor,
+    /// Pop one, push its square root using IEEE `f64::sqrt` semantics.
+    Sqrt,
+    /// Pop two (exponent, base), push `base.powf(exponent)` using IEEE
+    /// `f64` semantics.
+    Pow,
     /// Pop two (b, a), push `(a > b) as u8 as f64` — strictly 0.0/1.0.
     Gt,
     /// Pop two (b, a), push `(a < b) as u8 as f64`.
@@ -151,6 +156,8 @@ fn emit(ast: &Ast, syms: &dyn Symbols, out: &mut Vec<Op>) -> Result<(), ExprErro
                 Func::Max => Op::Max,
                 Func::Clamp => Op::Clamp,
                 Func::Floor => Op::Floor,
+                Func::Sqrt => Op::Sqrt,
+                Func::Pow => Op::Pow,
                 Func::And => Op::And,
                 Func::Or => Op::Or,
                 Func::Not => Op::Not,
@@ -166,8 +173,8 @@ fn simulate_depth(ops: &[Op]) -> Result<usize, ExprError> {
     for op in ops {
         let (pops, pushes) = match op {
             Op::Const(_) | Op::Load(_) => (0, 1),
-            Op::Neg | Op::Floor | Op::Not => (1, 1),
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => (2, 1),
+            Op::Neg | Op::Floor | Op::Sqrt | Op::Not => (1, 1),
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max | Op::Pow => (2, 1),
             Op::Gt | Op::Lt | Op::Ge | Op::Le | Op::Eq | Op::Ne | Op::And | Op::Or => (2, 1),
             Op::Clamp => (3, 1),
         };
@@ -191,8 +198,9 @@ impl Program {
         &self.ops
     }
 
-    /// Evaluate against the slot array. IEEE semantics throughout
-    /// (division by zero yields ±inf/NaN). `clamp` itself is total: it
+    /// Evaluate against the slot array. IEEE semantics throughout:
+    /// division by zero and invalid `sqrt`/`pow` domains yield ±inf/NaN
+    /// rather than an evaluation error. `clamp` itself is total: it
     /// never panics, even on inverted or NaN bounds — implemented as
     /// max-then-min, so `hi` wins when bounds invert (unlike `f64::clamp`,
     /// which panics on `lo > hi` or a NaN bound).
@@ -213,6 +221,7 @@ impl Program {
                 }
                 Op::Neg => stack[sp - 1] = -stack[sp - 1],
                 Op::Floor => stack[sp - 1] = stack[sp - 1].floor(),
+                Op::Sqrt => stack[sp - 1] = stack[sp - 1].sqrt(),
                 Op::Add => {
                     sp -= 1;
                     stack[sp - 1] += stack[sp];
@@ -236,6 +245,10 @@ impl Program {
                 Op::Max => {
                     sp -= 1;
                     stack[sp - 1] = stack[sp - 1].max(stack[sp]);
+                }
+                Op::Pow => {
+                    sp -= 1;
+                    stack[sp - 1] = stack[sp - 1].powf(stack[sp]);
                 }
                 Op::Clamp => {
                     sp -= 2;
@@ -321,7 +334,39 @@ mod tests {
             13.0
         );
         assert_eq!(compile("floor(x / 4)", &s).unwrap().eval(&[9.0]), 2.0);
+        assert_eq!(compile("sqrt(x)", &s).unwrap().eval(&[9.0]), 3.0);
+        assert_eq!(compile("pow(x, 0.5)", &s).unwrap().eval(&[9.0]), 3.0);
         assert_eq!(compile("-x * 2", &s).unwrap().eval(&[5.0]), -10.0);
+    }
+
+    #[test]
+    fn sqrt_and_pow_have_correct_postfix_depth_and_fractional_evaluation() {
+        let p = compile("pow(0.93, sqrt(1.1377777777778489))", &syms(&[])).unwrap();
+        assert_eq!(
+            p.ops(),
+            &[
+                Op::Const(0.93),
+                Op::Const(1.1377777777778489),
+                Op::Sqrt,
+                Op::Pow,
+            ]
+        );
+        assert_eq!(p.max_depth, 2);
+        let exponent = 1.1377777777778489_f64.sqrt();
+        assert!((p.eval(&[]) - 0.93_f64.powf(exponent)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn sqrt_and_pow_invalid_domains_follow_ieee_semantics() {
+        assert!(compile("sqrt(-1)", &syms(&[])).unwrap().eval(&[]).is_nan());
+        assert!(compile("pow(-1, 0.5)", &syms(&[]))
+            .unwrap()
+            .eval(&[])
+            .is_nan());
+        assert!(compile("pow(0, -1)", &syms(&[]))
+            .unwrap()
+            .eval(&[])
+            .is_infinite());
     }
 
     #[test]

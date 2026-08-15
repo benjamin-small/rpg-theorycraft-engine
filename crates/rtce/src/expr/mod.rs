@@ -26,6 +26,21 @@
 //! allow AT MOST ONE comparison per level — `1 < 2 < 3` is a positioned
 //! "chained comparison" error rather than silently meaning `(1 < 2) < 3`;
 //! write `and(1 < 2, 2 < 3)` instead.
+//!
+//! ## Numeric functions and non-finite results
+//!
+//! The numeric built-ins are `min(a, b)`, `max(a, b)`,
+//! `clamp(x, lo, hi)`, `floor(x)`, `sqrt(x)`, and `pow(base, exponent)`.
+//! `sqrt` delegates to [`f64::sqrt`] and `pow` to [`f64::powf`], including
+//! their IEEE behavior: a negative square root or a negative base raised to a
+//! fractional exponent produces NaN, while overflow or zero raised to a
+//! negative exponent can produce infinity. The expression VM does not turn
+//! those values into an [`ExprError`], just as division by zero has always
+//! produced an IEEE value. `Plan` rejects non-finite INPUT stats and
+//! contributions, but a non-finite derived pipeline/objective result is
+//! returned to the caller. Simulation fields that require finite quantities
+//! (duration, cost, cooldown, and similar fields) reject a non-finite result at
+//! their documented evaluation instant with field context.
 
 mod compiler;
 mod lexer;

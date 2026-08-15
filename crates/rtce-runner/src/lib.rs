@@ -38,6 +38,8 @@ pub fn lexicon() -> Value {
         json!({ "term": "max(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return the larger value.", "example": "max(0, 1 - enemy_armor / 100)" }),
         json!({ "term": "clamp(x, lo, hi)", "kind": "function", "scope": "all expressions", "meaning": "Limit a value to an inclusive range.", "example": "clamp(crit_chance / 100, 0, 1)" }),
         json!({ "term": "floor(x)", "kind": "function", "scope": "all expressions", "meaning": "Round a value down to the nearest integer.", "example": "floor(stacks.combo / 3)" }),
+        json!({ "term": "sqrt(x)", "kind": "function", "scope": "all expressions", "meaning": "Return the IEEE f64 square root. Negative inputs produce NaN.", "example": "sqrt(armour * pool)" }),
+        json!({ "term": "pow(base, exponent)", "kind": "function", "scope": "all expressions", "meaning": "Raise base to a possibly fractional exponent with IEEE f64 semantics.", "example": "1 - pow(1 - crit_chance, max(stack_potential, 1))" }),
         json!({ "term": "and(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when both values are nonzero; this does not short-circuit.", "example": "and(stamina >= 40, buff.focus == 1)" }),
         json!({ "term": "or(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when either value is nonzero; this does not short-circuit.", "example": "or(time < 5, buff.burst == 1)" }),
         json!({ "term": "not(a)", "kind": "function", "scope": "all expressions", "meaning": "Return 1 when a value is zero, otherwise 0.", "example": "not(buff.focus_window)" }),
@@ -229,5 +231,13 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| { entry["term"] == "contribution.event" && entry["kind"] == "schema" }));
+        for term in ["sqrt(x)", "pow(base, exponent)"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["term"] == term && entry["kind"] == "function"),
+                "missing expression function `{term}` from the shared lexicon"
+            );
+        }
     }
 }
