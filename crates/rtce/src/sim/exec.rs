@@ -522,6 +522,8 @@ fn run_monte_carlo(
     let mut action_damage_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut buff_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut buff_stacks_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut buff_applications_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut buff_damage_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut condition_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut resource_capped_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut resource_starved_sum: BTreeMap<String, f64> = BTreeMap::new();
@@ -555,6 +557,8 @@ fn run_monte_carlo(
         for (name, b) in &report.buffs {
             *buff_uptime_sum.entry(name.clone()).or_insert(0.0) += b.uptime;
             *buff_stacks_sum.entry(name.clone()).or_insert(0.0) += b.avg_stacks;
+            *buff_applications_sum.entry(name.clone()).or_insert(0.0) += b.applications as f64;
+            *buff_damage_sum.entry(name.clone()).or_insert(0.0) += b.damage;
         }
         for (name, v) in &report.condition_uptime {
             *condition_uptime_sum.entry(name.clone()).or_insert(0.0) += v;
@@ -619,6 +623,14 @@ fn run_monte_carlo(
         buffs.insert(
             name.clone(),
             BuffReport {
+                applications: (buff_applications_sum.get(name).copied().unwrap_or(0.0) / n).round()
+                    as u64,
+                damage: buff_damage_sum.get(name).copied().unwrap_or(0.0) / n,
+                dps: if duration > 0.0 {
+                    buff_damage_sum.get(name).copied().unwrap_or(0.0) / n / duration
+                } else {
+                    0.0
+                },
                 uptime: uptime_sum / n,
                 avg_stacks: buff_stacks_sum.get(name).copied().unwrap_or(0.0) / n,
             },
@@ -835,6 +847,12 @@ struct BuffInstance {
 /// non-empty; the instance list is the single source of truth for the
 /// `buff.<name>`/`buff_remaining.<name>` symbols and the effective fold.
 struct BuffRt {
+    /// Number of application events accepted by the executor. This is
+    /// deliberately distinct from the live instance count: refreshes and
+    /// at-cap replacements are applications too.
+    applications: u64,
+    /// Damage integrated from this buff's tick objective.
+    damage: f64,
     /// Every live application, in application order. Empty = inactive.
     instances: Vec<BuffInstance>,
     /// Bumped on every APPLICATION — which lets a `BuffExpire` scheduled
@@ -1074,6 +1092,8 @@ impl<'a> Sim<'a> {
             resource_regen: vec![0.0; n_resources],
             buffs: (0..n_buffs)
                 .map(|_| BuffRt {
+                    applications: 0,
+                    damage: 0.0,
                     instances: Vec::new(),
                     generation: 0,
                     activated_at: 0.0,
@@ -1293,6 +1313,7 @@ impl<'a> Sim<'a> {
                 let elapsed = now - b.tick_last_eval;
                 let dmg = elapsed * b.tick_rate;
                 b.tick_last_eval = now;
+                b.damage += dmg;
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
             }
@@ -1526,6 +1547,7 @@ impl<'a> Sim<'a> {
             Some(t) if t.snapshot => self.eval_objective(t.objective, world)?,
             _ => 0.0,
         };
+        self.buffs[bi].applications += 1;
 
         let policy = self.sim_plan.buffs[bi].on_reapply;
         let max_stacks = self.sim_plan.buffs[bi].max_stacks;
@@ -3242,7 +3264,20 @@ impl<'a> Sim<'a> {
             } else {
                 (0.0, 0.0)
             };
-            buffs.insert(b.name.clone(), BuffReport { uptime, avg_stacks });
+            buffs.insert(
+                b.name.clone(),
+                BuffReport {
+                    applications: rt.applications,
+                    damage: rt.damage,
+                    dps: if self.duration > 0.0 {
+                        rt.damage / self.duration
+                    } else {
+                        0.0
+                    },
+                    uptime,
+                    avg_stacks,
+                },
+            );
         }
 
         let mut condition_uptime = BTreeMap::new();
@@ -7537,6 +7572,12 @@ mod tests {
             .unwrap();
 
             assert_pure_dot(&report);
+            assert_eq!(
+                report.buffs["poison"].applications, 21,
+                "one opener plus one application at each t=1..20"
+            );
+            assert!(close(report.buffs["poison"].damage, 3700.0));
+            assert!(close(report.buffs["poison"].dps, 185.0));
             assert!(
                 close(report.buffs["poison"].avg_stacks, 3.7),
                 "avg_stacks: got {} — want 74/20 = 3.7",

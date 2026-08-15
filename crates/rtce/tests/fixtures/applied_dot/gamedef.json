@@ -1,0 +1,81 @@
+{
+  "_scope": "A library-owned applied-DoT stat-sheet fixture. Poison is the worked mechanic, but every number is declared as ordinary RTCE data rather than hard-coded in the evaluator.",
+  "_ownership": "Player-side source scaling ends at poison_source_avg. Enemy resistance and increased damage taken enter only poison_eff_mult, so a target modifier cannot be counted in both source and effect.",
+  "stats": [
+    "physical_source_min",
+    "physical_source_max",
+    "chaos_source_min",
+    "chaos_source_max",
+    "other_source_min",
+    "other_source_max",
+    "hit_chance_pct",
+    "poison_chance_on_hit_pct",
+    "applications_per_second",
+    "base_poison_duration",
+    "base_poison_magnitude_pct_per_second",
+    "enemy_chaos_resistance_pct",
+    "chaos_penetration_pct",
+    "enemy_damage_taken_pct",
+    "enemy_dot_taken_pct",
+    "enemy_chaos_taken_pct",
+    "enemy_chaos_dot_taken_pct",
+    "skill_dot_dps"
+  ],
+  "buckets": {
+    "additional_max_poisons": { "fold": "sum" },
+    "poison_duration_pct": { "fold": "sum" },
+    "poison_magnitude_pct": { "fold": "sum" }
+  },
+  "pipeline": [
+    {
+      "name": "poison_source_avg",
+      "expr": "(physical_source_min + physical_source_max + chaos_source_min + chaos_source_max) / 2"
+    },
+    {
+      "name": "poison_chance",
+      "expr": "clamp(hit_chance_pct, 0, 100) / 100 * clamp(poison_chance_on_hit_pct, 0, 100) / 100"
+    },
+    {
+      "name": "poison_duration",
+      "expr": "max(0, base_poison_duration * (1 + poison_duration_pct / 100))"
+    },
+    {
+      "name": "poison_max_stacks",
+      "expr": "max(1, 1 + floor(additional_max_poisons))"
+    },
+    {
+      "name": "poison_stacks",
+      "expr": "min(poison_max_stacks, max(0, applications_per_second) * poison_chance * poison_duration)"
+    },
+    {
+      "name": "poison_eff_mult",
+      "expr": "max(0, 1 - (enemy_chaos_resistance_pct - chaos_penetration_pct) / 100) * max(0, 1 + (enemy_damage_taken_pct + enemy_dot_taken_pct + enemy_chaos_taken_pct + enemy_chaos_dot_taken_pct) / 100)"
+    },
+    {
+      "name": "poison_dps_per_stack",
+      "expr": "poison_source_avg * base_poison_magnitude_pct_per_second / 100 * max(0, 1 + poison_magnitude_pct / 100) * poison_eff_mult"
+    },
+    {
+      "name": "poison_damage",
+      "expr": "poison_dps_per_stack * poison_duration"
+    },
+    {
+      "name": "poison_dps",
+      "expr": "poison_dps_per_stack * poison_stacks"
+    },
+    {
+      "name": "dot_dps",
+      "expr": "skill_dot_dps + poison_dps"
+    }
+  ],
+  "objectives": [
+    "poison_chance",
+    "poison_duration",
+    "poison_stacks",
+    "poison_eff_mult",
+    "poison_dps_per_stack",
+    "poison_dps",
+    "poison_damage",
+    "dot_dps"
+  ]
+}

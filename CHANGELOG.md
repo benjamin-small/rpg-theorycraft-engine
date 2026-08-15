@@ -9,6 +9,11 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ### Added
 
+- Damaging buffs now report their application count, directly attributed
+  damage, and DPS alongside uptime and average stacks. A library-owned
+  applied-DoT fixture pins a complete poison-shaped stat-sheet breakdown,
+  including single ownership of target-side damage multipliers.
+
 - A private `rtce-cli` workspace binary with `evaluate`, `explain`, and
   `simulate` commands, plus bundled `demo calc|sim|monte-carlo` runs. Outputs
   are versioned JSON envelopes shared with the browser interface.

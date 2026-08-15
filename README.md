@@ -332,7 +332,7 @@ as contrasts rather than merely asserted in prose:
 $ cargo run -p rtce --example poe2_poison
 PoE2 poison (P7e slice 2) — 20s dummy, EV mode
   viper_strike: 20 casts, 6000.0000 hit damage
-  poison: uptime 0.9500, avg_stacks 3.8750, 11625.0000 DoT damage
+  poison: 20 applications, uptime 0.9500, avg_stacks 3.8750, 11625.0000 DoT damage (581.2500 dps)
   total: 17625.0000 damage over 20s = 881.2500 dps
 
   EV pins hold: 6000 hit + 11625 DoT = 17625 / 881.25 dps / 3.875 stacks ✓
@@ -357,6 +357,28 @@ examples that actually sample are `diablo4_rotation` and the guide's
 `guide_07_monte_carlo`, which asserts the opposite direction — a
 non-zero spread, plus a hand-derived hard bound `[112.84, 181.04]` dps
 that no sampled fight may escape.
+
+### Applied-DoT stat sheets and timeline reports
+
+The stat-sheet and simulator answer different useful questions about an
+ailment. A `GameDef` pipeline exposes the closed-form breakdown — application
+chance, duration, expected active stacks, effective target multiplier, DPS,
+and damage per application. A `SimDef` then applies the same per-instance DPS
+objective on a timeline, where `SimReport::buffs[name]` exposes the observed
+application count, integrated damage, DPS, uptime, and average stacks.
+
+The library-owned
+[`applied_dot` fixture](crates/rtce/tests/fixtures/applied_dot/gamedef.json)
+is a complete poison-shaped stat-sheet recipe. Its source stage contains only
+the declared physical and chaos hit endpoints. Resistance, penetration, and
+the four increased-damage-taken inputs have one ownership point:
+`poison_eff_mult`. The regression tests prove that +10% chaos damage taken is
+exactly ×1.1, not ×1.21, and separately pin chance, duration, magnitude,
+application rate, the default one-stack cap, additive +N stacks, resistance,
+and combined DoT DPS. The executor remains mechanic-neutral: poison, bleed,
+ignite, or any other applied DoT is still ordinary configuration.
+See [Applied damage over time](docs/APPLIED_DOTS.md) for the complete
+stat-sheet/timeline recipe and CLI command.
 
 ## Configurable semantics: the `defaults` block
 

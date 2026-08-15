@@ -25,7 +25,8 @@ pub struct SimReport {
     pub total: Totals,
     /// Per-action cast/damage accounting, keyed by action name.
     pub actions: BTreeMap<String, ActionReport>,
-    /// Per-buff computed uptime and mean stack count, keyed by buff name
+    /// Per-buff application, damage, uptime, and mean-stack accounting,
+    /// keyed by buff name
     /// — one entry per buff in the `SimDef`, always present even for a
     /// buff that never went up.
     pub buffs: BTreeMap<String, BuffReport>,
@@ -173,7 +174,8 @@ pub struct ActionReport {
     pub share: f64,
 }
 
-/// One buff's computed presence over the whole sim: how much of the
+/// One buff's computed activity over the whole sim: how often it was
+/// applied, how much damage its tick objective dealt, how much of the
 /// fight it was up at all, and how many instances were up on average.
 ///
 /// The two answer different questions and a stacking buff separates them:
@@ -183,6 +185,18 @@ pub struct ActionReport {
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 #[non_exhaustive]
 pub struct BuffReport {
+    /// Number of times the buff was applied during the timeline. This
+    /// counts application events, including refreshes, capped-stack
+    /// replacement, and a weaker application rejected by `strongest`. In
+    /// Monte Carlo mode this is the rounded arithmetic mean across runs,
+    /// matching action cast and proc count reporting.
+    pub applications: u64,
+    /// Damage integrated from this buff's `tick_objective` over the whole
+    /// simulation. Zero for a buff without a tick objective.
+    pub damage: f64,
+    /// `damage / total simulation duration` (`0.0` for a zero-duration
+    /// simulation). This is the buff's direct DPS contribution.
+    pub dps: f64,
     /// Fraction of the sim's total duration this buff had AT LEAST ONE
     /// live instance (`active_seconds / total duration`). A 3-stack buff
     /// and a 1-stack buff both read `1.0` here — `avg_stacks` is where
