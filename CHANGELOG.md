@@ -7,7 +7,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
-**CLI, browser lab, and applied-DoT observability.** The next release makes
+## [0.5.0] — 2026-08-15
+
+**CLI, browser lab, and applied-DoT observability.** Version 0.5.0 makes
 RTCE usable without writing a Rust integration first. The same JSON runner now
 powers a native command, a Docker-first demo, and a TypeScript/Wasm tutorial
 that walks a gamer from one stat-sheet number through bucket math, critical-hit
@@ -115,9 +117,6 @@ from the timeline.
   report structs are `#[non_exhaustive]`.
 - The CLI, runner, and Wasm crates are private workspace interfaces; only
   `rtce` and `rtce-testkit` remain part of the crates.io release path.
-- No release tag is created by these notes. Crate publication still begins only
-  when a version-matching `vX.Y.Z` tag is pushed and the release workflow
-  verifies the Cargo version and changelog heading.
 
 ## [0.4.0] — 2026-08-01
 
@@ -1415,7 +1414,8 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
-[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.4.0
 [0.3.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.3.0
 [0.2.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.2.0

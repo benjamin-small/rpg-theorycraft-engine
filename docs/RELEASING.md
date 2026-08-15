@@ -53,9 +53,9 @@ secret is required.
    git push origin vX.Y.Z
    ```
 
-5. Watch the `Release` workflow. The first OIDC-backed release will be
-   `v0.4.0`: `rtce-testkit@0.1.0` is already present and will be skipped;
-   `rtce@0.4.0` will exercise trusted publishing.
+5. Watch the `Release` workflow through completion. The workflow queries
+   crates.io first, skips any workspace crate version that is already present,
+   and publishes only missing versions through trusted publishing.
 
 ## Retry and recovery
 
