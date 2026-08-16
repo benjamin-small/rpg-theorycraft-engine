@@ -37,8 +37,8 @@
 //!
 //! 1. [`gamedef::GameDef`] — the ALGORITHM. Stat names, bucket fold rules
 //!    ([`gamedef::FoldKind`]: sum / summed-group / product), event chance
-//!    and factor expressions, and the ordered pipeline of named expression or
-//!    deterministic bounded-solve stages.
+//!    and factor expressions, and the ordered pipeline of named expression,
+//!    deterministic bounded-solve, or bounded state-recurrence stages.
 //!    Written once per game, changes rarely. Turned into a [`plan::Plan`]
 //!    by [`plan::compile`] — this is the "compile once" half of the
 //!    contract, and it's the only place a `GameDef`'s expressions are

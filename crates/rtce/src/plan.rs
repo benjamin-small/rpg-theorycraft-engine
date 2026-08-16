@@ -16,6 +16,12 @@ pub const MAX_EVENTS: usize = 8;
 /// The configured `max_iterations` remains the tighter per-stage bound.
 pub const MAX_SOLVE_ITERATIONS: u32 = 4096;
 
+/// Hard safety ceiling for one recurrence stage's transition budget.
+pub const MAX_RECURRENCE_ITERATIONS: u32 = 100_000;
+
+/// Hard ceiling for one recurrence stage's local state width.
+pub const MAX_RECURRENCE_STATE_SLOTS: usize = 256;
+
 /// A `plan::compile` or `Plan::evaluate`/`explain` failure: bad GameDef
 /// config (unknown/duplicate names, too many events, reserved names) or a
 /// bad runtime input (unknown stat/bucket/event/condition reference,
@@ -67,6 +73,7 @@ pub struct Plan {
     n_conditions: usize,
     n_buckets: usize,
     n_stages: usize,
+    max_recurrence_states: usize,
 }
 
 #[derive(Debug)]
@@ -85,6 +92,7 @@ struct CompiledStage {
 enum CompiledStageKind {
     Expression { program: Program, branched: bool },
     Solve(CompiledSolve),
+    Recurrence(CompiledRecurrence),
 }
 
 #[derive(Debug)]
@@ -95,6 +103,17 @@ struct CompiledSolve {
     variable_slot: usize,
     absolute_tolerance: f64,
     relative_tolerance: f64,
+    max_iterations: u32,
+}
+
+#[derive(Debug)]
+struct CompiledRecurrence {
+    state_names: Vec<String>,
+    initial: Vec<Program>,
+    next: Vec<Program>,
+    until: Program,
+    result: Program,
+    state_slot_base: usize,
     max_iterations: u32,
 }
 
@@ -172,6 +191,26 @@ impl Symbols for WithSolveVariable<'_> {
         } else {
             self.inner.slot(name)
         }
+    }
+}
+
+/// Recurrence expression symbol table: normal stage symbols plus every local
+/// state slot. Local names are compile-time collision-checked first.
+struct WithRecurrenceState<'a> {
+    inner: StageSymbols<'a>,
+    names: &'a [String],
+    slot_base: usize,
+}
+
+impl Symbols for WithRecurrenceState<'_> {
+    fn slot(&self, name: &str) -> Option<u16> {
+        if let Some(slot) = self.inner.slot(name) {
+            return Some(slot);
+        }
+        self.names
+            .iter()
+            .position(|candidate| candidate == name)
+            .map(|index| (self.slot_base + index) as u16)
     }
 }
 
@@ -307,7 +346,36 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     let n_conditions = def.conditions.len();
     let n_buckets = bucket_names.len();
     let n_stages = stage_names.len();
-    let event_factors_slot = (n_stats + n_conditions + n_buckets + n_stages) as u16;
+    let own_slot_width = n_stats + n_conditions + n_buckets + n_stages + 1;
+    if own_slot_width > u16::MAX as usize + 1 {
+        return Err(PlanError {
+            what: "plan exceeds the expression slot limit".into(),
+        });
+    }
+    let event_factors_slot = (own_slot_width - 1) as u16;
+    let recurrence_state_slot_base = own_slot_width;
+    let max_recurrence_states = def
+        .pipeline
+        .iter()
+        .filter_map(StageDef::as_recurrence)
+        .map(|stage| stage.recurrence.state.len())
+        .max()
+        .unwrap_or(0);
+    if max_recurrence_states > MAX_RECURRENCE_STATE_SLOTS {
+        return Err(PlanError {
+            what: format!(
+                "{max_recurrence_states} recurrence state slots > max {MAX_RECURRENCE_STATE_SLOTS}"
+            ),
+        });
+    }
+    if recurrence_state_slot_base
+        .checked_add(max_recurrence_states)
+        .is_none_or(|width| width > u16::MAX as usize + 1)
+    {
+        return Err(PlanError {
+            what: "plan and recurrence state exceed the expression slot limit".into(),
+        });
+    }
 
     let event_syms = StageSymbols {
         stats: &def.stats,
@@ -434,6 +502,116 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
                     }),
                 )
             }
+            StageDef::Recurrence(s) => {
+                let recurrence = &s.recurrence;
+                if recurrence.state.is_empty() {
+                    return Err(PlanError {
+                        what: format!(
+                            "recurrence stage `{}` must declare at least one state slot",
+                            s.name
+                        ),
+                    });
+                }
+                if recurrence.max_iterations == 0
+                    || recurrence.max_iterations > MAX_RECURRENCE_ITERATIONS
+                {
+                    return Err(PlanError {
+                        what: format!(
+                            "recurrence stage `{}` max_iterations must be in 1..={MAX_RECURRENCE_ITERATIONS}, got {}",
+                            s.name, recurrence.max_iterations
+                        ),
+                    });
+                }
+
+                let mut local_names = Vec::with_capacity(recurrence.state.len());
+                let mut local_seen = std::collections::BTreeSet::new();
+                for state in &recurrence.state {
+                    if !is_plain_identifier(&state.name) {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` state `{}` must be a plain ASCII identifier",
+                                s.name, state.name
+                            ),
+                        });
+                    }
+                    if !local_seen.insert(state.name.clone()) {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` has duplicate state `{}`",
+                                s.name, state.name
+                            ),
+                        });
+                    }
+                    if def
+                        .stats
+                        .iter()
+                        .chain(&def.conditions)
+                        .chain(&bucket_names)
+                        .chain(&stage_names)
+                        .any(|name| name == &state.name)
+                        || matches!(state.name.as_str(), "event_factors" | "event_multiplier")
+                    {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` state `{}` collides with a declared or engine name",
+                                s.name, state.name
+                            ),
+                        });
+                    }
+                    local_names.push(state.name.clone());
+                }
+
+                // Initializers are deliberately simultaneous too: they read
+                // ordinary symbols only, never another local initializer.
+                let mut initial = Vec::with_capacity(recurrence.state.len());
+                for state in &recurrence.state {
+                    initial.push(compile_expr(&state.initial, &base_syms).map_err(|e| {
+                        PlanError {
+                            what: format!(
+                                "recurrence stage `{}` state `{}` initial: {e}",
+                                s.name, state.name
+                            ),
+                        }
+                    })?);
+                }
+
+                let recurrence_syms = WithRecurrenceState {
+                    inner: base_syms,
+                    names: &local_names,
+                    slot_base: recurrence_state_slot_base,
+                };
+                let mut next = Vec::with_capacity(recurrence.state.len());
+                for state in &recurrence.state {
+                    next.push(compile_expr(&state.next, &recurrence_syms).map_err(|e| {
+                        PlanError {
+                            what: format!(
+                                "recurrence stage `{}` state `{}` next: {e}",
+                                s.name, state.name
+                            ),
+                        }
+                    })?);
+                }
+                let until =
+                    compile_expr(&recurrence.until, &recurrence_syms).map_err(|e| PlanError {
+                        what: format!("recurrence stage `{}` until: {e}", s.name),
+                    })?;
+                let result =
+                    compile_expr(&recurrence.result, &recurrence_syms).map_err(|e| PlanError {
+                        what: format!("recurrence stage `{}` result: {e}", s.name),
+                    })?;
+                (
+                    s.name.clone(),
+                    CompiledStageKind::Recurrence(CompiledRecurrence {
+                        state_names: local_names,
+                        initial,
+                        next,
+                        until,
+                        result,
+                        state_slot_base: recurrence_state_slot_base,
+                        max_iterations: recurrence.max_iterations,
+                    }),
+                )
+            }
         };
         stages.push(CompiledStage { name, kind });
     }
@@ -467,6 +645,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         n_conditions,
         n_buckets,
         n_stages,
+        max_recurrence_states,
     })
 }
 
@@ -580,6 +759,7 @@ impl Plan {
 pub struct EvalScratch {
     slots: Vec<f64>,
     branch_slots: Vec<f64>,
+    recurrence_next: Vec<f64>,
     base_bucket_raw: Vec<f64>,
     branch_bucket_raw: Vec<f64>,
     objectives: Vec<f64>,
@@ -610,10 +790,11 @@ impl Plan {
     /// result must only be passed to `evaluate` on this same `Plan` —
     /// `evaluate` debug-asserts the buffer lengths match.
     pub fn scratch(&self) -> EvalScratch {
-        let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
+        let n = self.own_slot_width() + self.max_recurrence_states;
         EvalScratch {
             slots: vec![0.0; n],
             branch_slots: vec![0.0; n],
+            recurrence_next: vec![0.0; self.max_recurrence_states],
             base_bucket_raw: vec![0.0; self.n_buckets],
             branch_bucket_raw: vec![0.0; self.n_buckets],
             objectives: vec![0.0; self.objective_stages.len()],
@@ -663,11 +844,16 @@ impl Plan {
         scratch: &mut EvalScratch,
         mut trace: Option<&mut Explanation>,
     ) -> Result<(), PlanError> {
-        let n = self.n_stats + self.n_conditions + self.n_buckets + self.n_stages + 1;
+        let n = self.own_slot_width() + self.max_recurrence_states;
         debug_assert_eq!(scratch.slots.len(), n, "scratch must come from this plan");
         debug_assert_eq!(
             scratch.branch_slots.len(),
             n,
+            "scratch must come from this plan"
+        );
+        debug_assert_eq!(
+            scratch.recurrence_next.len(),
+            self.max_recurrence_states,
             "scratch must come from this plan"
         );
         debug_assert_eq!(
@@ -849,6 +1035,15 @@ impl Plan {
                 CompiledStageKind::Solve(solve) => {
                     scratch.slots[out_slot] =
                         Self::eval_solve(&stage.name, solve, &mut scratch.slots)?;
+                    continue;
+                }
+                CompiledStageKind::Recurrence(recurrence) => {
+                    scratch.slots[out_slot] = Self::eval_recurrence(
+                        &stage.name,
+                        recurrence,
+                        &mut scratch.slots,
+                        &mut scratch.recurrence_next,
+                    )?;
                     continue;
                 }
             };
@@ -1113,6 +1308,79 @@ impl Plan {
                 ),
             })
         }
+    }
+
+    /// Evaluate one configured bounded state recurrence. Initializers and all
+    /// `next` programs are compiled once. Every transition is simultaneous:
+    /// all next values read the same previous state, land in `next_state`,
+    /// and are copied into the local slots only after every value is finite.
+    fn eval_recurrence(
+        stage_name: &str,
+        recurrence: &CompiledRecurrence,
+        slots: &mut [f64],
+        next_state: &mut [f64],
+    ) -> Result<f64, PlanError> {
+        let state_len = recurrence.state_names.len();
+        debug_assert!(next_state.len() >= state_len);
+        let state_range = recurrence.state_slot_base..recurrence.state_slot_base + state_len;
+
+        for (index, ((name, initial), slot)) in recurrence
+            .state_names
+            .iter()
+            .zip(&recurrence.initial)
+            .zip(state_range.clone())
+            .enumerate()
+        {
+            let value = initial.eval_finite(slots).map_err(|value| PlanError {
+                    what: format!(
+                        "recurrence stage `{stage_name}` state `{name}` is non-finite at iteration 0: {value}"
+                    ),
+                })?;
+            slots[slot] = value;
+            debug_assert_eq!(index, slot - recurrence.state_slot_base);
+        }
+
+        for iteration in 0..=recurrence.max_iterations {
+            let terminal = recurrence.until.eval_finite(slots).map_err(|terminal| PlanError {
+                    what: format!(
+                        "recurrence stage `{stage_name}` terminal predicate is non-finite at iteration {iteration}: {terminal}"
+                    ),
+                })?;
+            if terminal != 0.0 {
+                let result = recurrence.result.eval_finite(slots).map_err(|result| PlanError {
+                        what: format!(
+                            "recurrence stage `{stage_name}` result is non-finite at iteration {iteration}: {result}"
+                        ),
+                    })?;
+                return Ok(result);
+            }
+            if iteration == recurrence.max_iterations {
+                return Err(PlanError {
+                    what: format!(
+                        "recurrence stage `{stage_name}` did not terminate within {} iterations",
+                        recurrence.max_iterations
+                    ),
+                });
+            }
+
+            let next_iteration = iteration + 1;
+            for (index, (name, next)) in recurrence
+                .state_names
+                .iter()
+                .zip(&recurrence.next)
+                .enumerate()
+            {
+                let value = next.eval_finite(slots).map_err(|value| PlanError {
+                        what: format!(
+                            "recurrence stage `{stage_name}` state `{name}` is non-finite at iteration {next_iteration}: {value}"
+                        ),
+                    })?;
+                next_state[index] = value;
+            }
+            slots[state_range.clone()].copy_from_slice(&next_state[..state_len]);
+        }
+
+        unreachable!("bounded recurrence loop always returns")
     }
 
     /// Shared by [`Plan::evaluate_phase`]/[`Plan::evaluate_phase_sampled`]/

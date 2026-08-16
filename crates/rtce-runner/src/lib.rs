@@ -38,6 +38,11 @@ pub fn lexicon() -> Value {
         json!({ "term": "solve.lower / solve.upper", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Compiled bound expressions over stats, conditions, buckets, and earlier stages; they must bracket the root at evaluation time.", "example": "0 / max_hit_search_upper" }),
         json!({ "term": "solve.absolute_tolerance / solve.relative_tolerance", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Finite non-negative bracket-width tolerances; at least one must be positive.", "example": "1e-7 / 1e-9" }),
         json!({ "term": "solve.max_iterations", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Explicit per-evaluation bisection budget, from 1 through 4096.", "example": "128" }),
+        json!({ "term": "pipeline[].recurrence", "kind": "schema", "scope": "GameDef recurrence stages", "meaning": "Run a deterministic bounded state machine and store its terminal result as this pipeline stage's value.", "example": "{ \"name\": \"ehp\", \"recurrence\": { ... } }" }),
+        json!({ "term": "recurrence.state[]", "kind": "schema", "scope": "GameDef recurrence stages", "meaning": "A collision-checked local state slot with an initializer and a next expression. Every next expression reads the same previous state.", "example": "{ \"name\": \"life\", \"initial\": \"max_life\", \"next\": \"max(life - hit, 0)\" }" }),
+        json!({ "term": "recurrence.until", "kind": "schema", "scope": "GameDef recurrence stages", "meaning": "Terminal predicate checked at iteration zero and after every simultaneous state transition. Zero continues; non-zero terminates.", "example": "life <= 0" }),
+        json!({ "term": "recurrence.result", "kind": "schema", "scope": "GameDef recurrence stages", "meaning": "Expression over the terminal state that becomes the stage value.", "example": "hits - overkill / hit" }),
+        json!({ "term": "recurrence.max_iterations", "kind": "schema", "scope": "GameDef recurrence stages", "meaning": "Explicit per-evaluation transition budget, from 1 through 100000.", "example": "1000" }),
         json!({ "term": "+ - * /", "kind": "operator", "scope": "all expressions", "meaning": "Arithmetic operators; parentheses control grouping.", "example": "base_hit * (1 + additive / 100)" }),
         json!({ "term": "> < >= <= == !=", "kind": "operator", "scope": "all expressions", "meaning": "Comparisons returning exactly 1 for true or 0 for false.", "example": "stamina >= 40" }),
         json!({ "term": "min(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return the smaller value.", "example": "min(attack_speed, 2)" }),
@@ -240,6 +245,30 @@ mod tests {
     }
 
     #[test]
+    fn bounded_recurrence_runs_through_the_shared_cli_and_wasm_json_path() {
+        let gamedef = r#"{
+          "stats": [],
+          "pipeline": [{
+            "name": "fractional_hits",
+            "recurrence": {
+              "state": [
+                { "name": "pool", "initial": "10", "next": "max(pool - 3, 0)" },
+                { "name": "hits", "initial": "0", "next": "hits + 1" },
+                { "name": "overkill", "initial": "0", "next": "max(3 - pool, 0)" }
+              ],
+              "until": "pool <= 0",
+              "result": "hits - overkill / 3",
+              "max_iterations": 10
+            }
+          }],
+          "objectives": ["fractional_hits"]
+        }"#;
+        let output = evaluate(gamedef, "{}", SCENARIO).unwrap();
+        let hits = output["objectives"]["fractional_hits"].as_f64().unwrap();
+        assert!((hits - 10.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn errors_name_the_document_that_failed() {
         let error = evaluate("{}", BUILD, SCENARIO).unwrap_err().to_string();
         assert!(error.starts_with("invalid gamedef JSON:"), "got: {error}");
@@ -262,6 +291,9 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| { entry["term"] == "pipeline[].solve" && entry["kind"] == "schema" }));
+        assert!(entries.iter().any(|entry| {
+            entry["term"] == "pipeline[].recurrence" && entry["kind"] == "schema"
+        }));
         for term in ["sqrt(x)", "pow(base, exponent)"] {
             assert!(
                 entries

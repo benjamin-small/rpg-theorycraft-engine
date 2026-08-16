@@ -94,7 +94,8 @@ impl EventDef {
 
 /// One named stage of the pipeline. The untagged representation preserves the
 /// original expression-stage JSON (`{ "name", "expr", "branched"? }`) and
-/// adds a dedicated solver shape (`{ "name", "solve": { ... } }`).
+/// adds dedicated solver (`{ "name", "solve": { ... } }`) and recurrence
+/// (`{ "name", "recurrence": { ... } }`) shapes.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum StageDef {
@@ -102,6 +103,8 @@ pub enum StageDef {
     Expression(ExpressionStageDef),
     /// A deterministic bounded scalar-solve stage.
     Solve(SolveStageDef),
+    /// A deterministic bounded state-recurrence stage.
+    Recurrence(RecurrenceStageDef),
 }
 
 impl StageDef {
@@ -110,40 +113,55 @@ impl StageDef {
         match self {
             Self::Expression(stage) => &stage.name,
             Self::Solve(stage) => &stage.name,
+            Self::Recurrence(stage) => &stage.name,
         }
     }
 
-    /// Borrow this stage as an expression stage, or `None` for a solve stage.
+    /// Borrow this stage as an expression stage, or `None` otherwise.
     pub fn as_expression(&self) -> Option<&ExpressionStageDef> {
         match self {
             Self::Expression(stage) => Some(stage),
-            Self::Solve(_) => None,
+            Self::Solve(_) | Self::Recurrence(_) => None,
         }
     }
 
-    /// Mutably borrow this stage as an expression stage, or `None` for a
-    /// solve stage.
+    /// Mutably borrow this stage as an expression stage, or `None` otherwise.
     pub fn as_expression_mut(&mut self) -> Option<&mut ExpressionStageDef> {
         match self {
             Self::Expression(stage) => Some(stage),
-            Self::Solve(_) => None,
+            Self::Solve(_) | Self::Recurrence(_) => None,
         }
     }
 
-    /// Borrow this stage as a solve stage, or `None` for an expression stage.
+    /// Borrow this stage as a solve stage, or `None` otherwise.
     pub fn as_solve(&self) -> Option<&SolveStageDef> {
         match self {
-            Self::Expression(_) => None,
+            Self::Expression(_) | Self::Recurrence(_) => None,
             Self::Solve(stage) => Some(stage),
         }
     }
 
-    /// Mutably borrow this stage as a solve stage, or `None` for an
-    /// expression stage.
+    /// Mutably borrow this stage as a solve stage, or `None` otherwise.
     pub fn as_solve_mut(&mut self) -> Option<&mut SolveStageDef> {
         match self {
-            Self::Expression(_) => None,
+            Self::Expression(_) | Self::Recurrence(_) => None,
             Self::Solve(stage) => Some(stage),
+        }
+    }
+
+    /// Borrow this stage as a recurrence stage, or `None` otherwise.
+    pub fn as_recurrence(&self) -> Option<&RecurrenceStageDef> {
+        match self {
+            Self::Recurrence(stage) => Some(stage),
+            Self::Expression(_) | Self::Solve(_) => None,
+        }
+    }
+
+    /// Mutably borrow this stage as a recurrence stage, or `None` otherwise.
+    pub fn as_recurrence_mut(&mut self) -> Option<&mut RecurrenceStageDef> {
+        match self {
+            Self::Recurrence(stage) => Some(stage),
+            Self::Expression(_) | Self::Solve(_) => None,
         }
     }
 }
@@ -191,6 +209,40 @@ pub struct SolveDef {
     pub relative_tolerance: f64,
     /// Hard per-evaluation iteration budget.
     pub max_iterations: u32,
+}
+
+/// A named stage whose value is produced by a bounded state recurrence.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecurrenceStageDef {
+    /// This stage's name; later stages and `objectives` refer to it by name.
+    pub name: String,
+    /// The deterministic recurrence configuration.
+    pub recurrence: RecurrenceDef,
+}
+
+/// Configuration for a small, bounded state machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecurrenceDef {
+    /// Named local state slots. Initializers read ordinary stage symbols;
+    /// every `next` expression reads the complete previous state.
+    pub state: Vec<RecurrenceStateDef>,
+    /// Numeric terminal predicate. Zero continues; non-zero terminates.
+    pub until: String,
+    /// Value returned by the stage once `until` is non-zero.
+    pub result: String,
+    /// Hard transition budget for one evaluation.
+    pub max_iterations: u32,
+}
+
+/// One local state slot in a recurrence stage.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecurrenceStateDef {
+    /// Recurrence-local plain identifier.
+    pub name: String,
+    /// Initial value, evaluated once before iteration zero.
+    pub initial: String,
+    /// Next value, evaluated from the previous iteration's complete state.
+    pub next: String,
 }
 
 // ── P8a: hand-written `Deserialize` for the public config structs and stage
@@ -273,36 +325,42 @@ impl<'de> Deserialize<'de> for StageDef {
             branched: Option<bool>,
             #[serde(default)]
             solve: Option<SolveDef>,
+            #[serde(default)]
+            recurrence: Option<RecurrenceDef>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
         let r = Repr::deserialize(d)?;
         crate::config_keys::reject_unknown(
             &format!("stage `{}`", r.name),
-            &["name", "expr", "branched", "solve"],
+            &["name", "expr", "branched", "solve", "recurrence"],
             &r.extra,
         )
         .map_err(serde::de::Error::custom)?;
-        match (r.expr, r.solve) {
-            (Some(expr), None) => Ok(StageDef::Expression(ExpressionStageDef {
+        match (r.expr, r.solve, r.recurrence, r.branched) {
+            (Some(expr), None, None, branched) => Ok(StageDef::Expression(ExpressionStageDef {
                 name: r.name,
                 expr,
-                branched: r.branched.unwrap_or(false),
+                branched: branched.unwrap_or(false),
             })),
-            (None, Some(solve)) if r.branched.is_none() => Ok(StageDef::Solve(SolveStageDef {
+            (None, Some(solve), None, None) => Ok(StageDef::Solve(SolveStageDef {
                 name: r.name,
                 solve,
             })),
-            (Some(_), Some(_)) => Err(serde::de::Error::custom(format!(
-                "stage `{}` must declare exactly one of `expr` or `solve`",
-                r.name
-            ))),
-            (None, Some(_)) => Err(serde::de::Error::custom(format!(
+            (None, None, Some(recurrence), None) => Ok(StageDef::Recurrence(RecurrenceStageDef {
+                name: r.name,
+                recurrence,
+            })),
+            (None, Some(_), None, Some(_)) => Err(serde::de::Error::custom(format!(
                 "solve stage `{}` cannot declare `branched`",
                 r.name
             ))),
-            (None, None) => Err(serde::de::Error::custom(format!(
-                "stage `{}` must declare exactly one of `expr` or `solve`",
+            (None, None, Some(_), Some(_)) => Err(serde::de::Error::custom(format!(
+                "recurrence stage `{}` cannot declare `branched`",
+                r.name
+            ))),
+            _ => Err(serde::de::Error::custom(format!(
+                "stage `{}` must declare exactly one of `expr`, `solve`, or `recurrence`",
                 r.name
             ))),
         }
@@ -346,6 +404,82 @@ impl<'de> Deserialize<'de> for SolveDef {
             absolute_tolerance: r.absolute_tolerance,
             relative_tolerance: r.relative_tolerance,
             max_iterations: r.max_iterations,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RecurrenceDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            state: Option<Vec<RecurrenceStateDef>>,
+            #[serde(default)]
+            until: Option<String>,
+            #[serde(default)]
+            result: Option<String>,
+            #[serde(default)]
+            max_iterations: Option<u32>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            "a recurrence definition",
+            &["state", "until", "result", "max_iterations"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(RecurrenceDef {
+            state: r
+                .state
+                .ok_or_else(|| serde::de::Error::missing_field("state"))?,
+            until: r
+                .until
+                .ok_or_else(|| serde::de::Error::missing_field("until"))?,
+            result: r
+                .result
+                .ok_or_else(|| serde::de::Error::missing_field("result"))?,
+            max_iterations: r
+                .max_iterations
+                .ok_or_else(|| serde::de::Error::missing_field("max_iterations"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RecurrenceStateDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            initial: Option<String>,
+            #[serde(default)]
+            next: Option<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            &format!(
+                "recurrence state `{}`",
+                r.name.as_deref().unwrap_or("<unnamed>")
+            ),
+            &["name", "initial", "next"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(RecurrenceStateDef {
+            name: r
+                .name
+                .ok_or_else(|| serde::de::Error::missing_field("name"))?,
+            initial: r
+                .initial
+                .ok_or_else(|| serde::de::Error::missing_field("initial"))?,
+            next: r
+                .next
+                .ok_or_else(|| serde::de::Error::missing_field("next"))?,
         })
     }
 }
@@ -409,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn solve_stage_shape_and_nested_keys_fail_closed() {
+    fn specialized_stage_shapes_and_nested_keys_fail_closed() {
         let both = serde_json::from_value::<StageDef>(serde_json::json!({
             "name": "ambiguous",
             "expr": "1",
@@ -422,7 +556,7 @@ mod tests {
         .unwrap_err();
         assert!(
             both.to_string()
-                .contains("exactly one of `expr` or `solve`"),
+                .contains("exactly one of `expr`, `solve`, or `recurrence`"),
             "got: {both}"
         );
 

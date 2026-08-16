@@ -1,0 +1,11 @@
+{
+  "_source": "Pinned values for the unblocked upstream PoB delayed-life-loss oracle",
+  "stats": {
+    "life_pool": 4000,
+    "incoming_damage": 2000,
+    "taken_hit": 1820,
+    "prevented_fraction": 0.75,
+    "block_chance": 0,
+    "block_effect": 0.75
+  }
+}

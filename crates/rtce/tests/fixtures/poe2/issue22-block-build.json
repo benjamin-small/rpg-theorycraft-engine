@@ -1,0 +1,11 @@
+{
+  "_source": "The upstream +10% block case; PoE2 block prevents 75% of a blocked hit",
+  "stats": {
+    "life_pool": 4000,
+    "incoming_damage": 2000,
+    "taken_hit": 1820,
+    "prevented_fraction": 0.75,
+    "block_chance": 0.10,
+    "block_effect": 0.75
+  }
+}

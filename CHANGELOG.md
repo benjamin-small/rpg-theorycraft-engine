@@ -13,13 +13,19 @@ until then, per semver's "anything goes" pre-1.0 clause).
   Bounds and residuals compile once, bisection returns the greatest known
   feasible lower bound, configuration fixes both tolerances and an iteration
   budget, and invalid brackets or non-finite samples fail with `PlanError`.
+- GameDef pipelines now support deterministic bounded state-recurrence
+  stages. Configuration declares collision-checked local state, simultaneous
+  next-state expressions, a terminal predicate, a result expression, and a
+  hard transition budget. Expressions compile once, reusable scratch keeps
+  evaluation allocation-free, and non-finite or non-terminating runs fail
+  with stage-and-iteration context on native and Wasm.
 
 ### Changed
 
 - The public Rust `StageDef` struct is now an untagged enum over
-  `ExpressionStageDef` and `SolveStageDef`. Existing expression-stage JSON is
-  unchanged; Rust callers constructing stages directly must wrap the new
-  expression variant.
+  `ExpressionStageDef`, `SolveStageDef`, and `RecurrenceStageDef`. Existing
+  expression-stage JSON is unchanged; Rust callers constructing stages
+  directly must wrap the new expression variant.
 
 ## [0.5.1] — 2026-08-15
 
