@@ -32,6 +32,12 @@ pub fn lexicon() -> Value {
         json!({ "term": "contribution.event", "kind": "schema", "scope": "BuildState.contributions[]", "meaning": "Gate this contribution behind a declared event. It is absent normally and folded in only when that event fires.", "example": "\"event\": \"crit\"" }),
         json!({ "term": "events.<name>.chance", "kind": "schema", "scope": "GameDef.events", "meaning": "Expression that sets an event's probability. The engine clamps its result to the 0-to-1 range.", "example": "\"chance\": \"crit_chance / 100\"" }),
         json!({ "term": "events.<name>.factor", "kind": "schema", "scope": "GameDef.events", "meaning": "Expression recorded for a fired branch and multiplied into event_multiplier when that optional shortcut is used.", "example": "\"factor\": \"crit_damage\"" }),
+        json!({ "term": "pipeline[].solve", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Run deterministic bounded bisection and store its conservative feasible lower bound as this pipeline stage's value.", "example": "{ \"name\": \"root\", \"solve\": { ... } }" }),
+        json!({ "term": "solve.variable", "kind": "schema", "scope": "solve residual", "meaning": "A collision-checked local identifier available only inside the solve residual expression.", "example": "incoming_hit" }),
+        json!({ "term": "solve.residual", "kind": "schema", "scope": "GameDef solve stages", "meaning": "A monotone expression where values <= 0 are feasible and values > 0 exceed the constraint.", "example": "incoming_hit * incoming_hit - pool" }),
+        json!({ "term": "solve.lower / solve.upper", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Compiled bound expressions over stats, conditions, buckets, and earlier stages; they must bracket the root at evaluation time.", "example": "0 / max_hit_search_upper" }),
+        json!({ "term": "solve.absolute_tolerance / solve.relative_tolerance", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Finite non-negative bracket-width tolerances; at least one must be positive.", "example": "1e-7 / 1e-9" }),
+        json!({ "term": "solve.max_iterations", "kind": "schema", "scope": "GameDef solve stages", "meaning": "Explicit per-evaluation bisection budget, from 1 through 4096.", "example": "128" }),
         json!({ "term": "+ - * /", "kind": "operator", "scope": "all expressions", "meaning": "Arithmetic operators; parentheses control grouping.", "example": "base_hit * (1 + additive / 100)" }),
         json!({ "term": "> < >= <= == !=", "kind": "operator", "scope": "all expressions", "meaning": "Comparisons returning exactly 1 for true or 0 for false.", "example": "stamina >= 40" }),
         json!({ "term": "min(a, b)", "kind": "function", "scope": "all expressions", "meaning": "Return the smaller value.", "example": "min(attack_speed, 2)" }),
@@ -212,6 +218,28 @@ mod tests {
     }
 
     #[test]
+    fn bounded_solve_runs_through_the_shared_cli_and_wasm_json_path() {
+        let gamedef = r#"{
+          "stats": [],
+          "pipeline": [{
+            "name": "root",
+            "solve": {
+              "variable": "x", "residual": "x * x - 2",
+              "lower": "0", "upper": "2",
+              "absolute_tolerance": 1e-12,
+              "relative_tolerance": 1e-12,
+              "max_iterations": 128
+            }
+          }],
+          "objectives": ["root"]
+        }"#;
+        let output = evaluate(gamedef, "{}", SCENARIO).unwrap();
+        let root = output["objectives"]["root"].as_f64().unwrap();
+        assert!(root * root <= 2.0);
+        assert!((root - 2.0_f64.sqrt()).abs() <= 3e-12);
+    }
+
+    #[test]
     fn errors_name_the_document_that_failed() {
         let error = evaluate("{}", BUILD, SCENARIO).unwrap_err().to_string();
         assert!(error.starts_with("invalid gamedef JSON:"), "got: {error}");
@@ -231,6 +259,9 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| { entry["term"] == "contribution.event" && entry["kind"] == "schema" }));
+        assert!(entries
+            .iter()
+            .any(|entry| { entry["term"] == "pipeline[].solve" && entry["kind"] == "schema" }));
         for term in ["sqrt(x)", "pow(base, exponent)"] {
             assert!(
                 entries

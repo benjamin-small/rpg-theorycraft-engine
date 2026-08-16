@@ -7,6 +7,20 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+
+- GameDef pipelines now support deterministic bounded scalar-solve stages.
+  Bounds and residuals compile once, bisection returns the greatest known
+  feasible lower bound, configuration fixes both tolerances and an iteration
+  budget, and invalid brackets or non-finite samples fail with `PlanError`.
+
+### Changed
+
+- The public Rust `StageDef` struct is now an untagged enum over
+  `ExpressionStageDef` and `SolveStageDef`. Existing expression-stage JSON is
+  unchanged; Rust callers constructing stages directly must wrap the new
+  expression variant.
+
 ## [0.5.1] — 2026-08-15
 
 **Self-contained nonlinear expression math.** Version 0.5.1 lets GameDef and

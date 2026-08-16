@@ -15,16 +15,17 @@
 //!   name is in hand, so the error can say "on buff `poison`". These are
 //!   the `SimDef`-side structs plus [`crate::gamedef::EventDef`]. The
 //!   `_`-prefixed keys survive serde round-trips through that field.
-//! - Structs both consumers construct in Rust with EXHAUSTIVE struct
-//!   literals ([`crate::gamedef::GameDef`]/`BucketDef`/`StageDef`,
-//!   [`crate::build::BuildState`]/`Contribution`,
-//!   [`crate::scenario::Scenario`]/`Phase`) cannot grow a field without
-//!   breaking those consumers, so they use the spec's "hand-written
-//!   equivalent": a manual `Deserialize` collects leftovers into a
-//!   parse-local map and calls [`reject_unknown`] right there, with the
-//!   context the struct itself carries (`phase `boss``). Annotations are
-//!   accepted and DROPPED on parse — the same fate they had under the
-//!   0.3.0 derived `Deserialize`, so nothing regresses.
+//! - Public structs consumers may construct with exhaustive literals
+//!   ([`crate::gamedef::GameDef`]/`BucketDef`,
+//!   [`crate::build::BuildState`]/`Contribution`, and
+//!   [`crate::scenario::Scenario`]/`Phase`) cannot grow a field silently.
+//!   They use the spec's hand-written equivalent: a manual `Deserialize`
+//!   collects leftovers into a parse-local map and calls [`reject_unknown`]
+//!   there, with the context the struct itself carries (`phase `boss``).
+//!   The untagged variants behind [`crate::gamedef::StageDef`] use the same
+//!   mechanism so stage-shape discrimination and nested solve keys fail
+//!   closed. Annotations are accepted and DROPPED on parse — the same fate
+//!   they had under the 0.3.0 derived `Deserialize`, so nothing regresses.
 //!
 //! A new config struct should take the FIRST shape unless a consumer
 //! already constructs it in Rust — as P8c's `defaults` block
