@@ -7,6 +7,20 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-16
+
+**Config-owned bounded algorithms.** Version 0.6.0 lets a GameDef express
+calculations that need either a deterministic scalar search or repeated,
+simultaneous state transitions. Downstream integrations can now keep nonlinear
+maximum-hit and repeated-hit EHP mechanics in portable RTCE configuration
+instead of maintaining parallel calculator code.
+
+### Upgrade notes
+
+- Existing expression-stage and solve-stage JSON remains valid.
+- Rust callers that construct or exhaustively match `StageDef` must account for
+  its `Expression`, `Solve`, and `Recurrence` variants.
+
 ### Added
 
 - GameDef pipelines now support deterministic bounded scalar-solve stages.
@@ -1448,7 +1462,8 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
-[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.4.0
