@@ -207,9 +207,27 @@ impl Program {
     /// `slots` must cover every slot the compile-time `Symbols` table
     /// resolved.
     pub fn eval(&self, slots: &[f64]) -> f64 {
+        match self.eval_impl(slots, false) {
+            Ok(value) | Err(value) => value,
+        }
+    }
+
+    /// Evaluate while rejecting a non-finite loaded value or intermediate
+    /// before a later comparison/boolean operation can collapse it back to a
+    /// finite 0/1. Used by bounded recurrence stages' fail-closed contract.
+    pub(crate) fn eval_finite(&self, slots: &[f64]) -> Result<f64, f64> {
+        self.eval_impl(slots, true)
+    }
+
+    fn eval_impl(&self, slots: &[f64], check_finite: bool) -> Result<f64, f64> {
         let mut stack = [0.0f64; MAX_STACK];
         let mut sp = 0usize;
         for op in &self.ops {
+            if check_finite {
+                if let Some(value) = stack[..sp].iter().find(|value| !value.is_finite()) {
+                    return Err(*value);
+                }
+            }
             match op {
                 Op::Const(n) => {
                     stack[sp] = *n;
@@ -292,7 +310,12 @@ impl Program {
                 }
             }
         }
-        stack[sp - 1]
+        let result = stack[sp - 1];
+        if check_finite && !result.is_finite() {
+            Err(result)
+        } else {
+            Ok(result)
+        }
     }
 }
 

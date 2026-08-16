@@ -125,6 +125,71 @@ or residual samples, inverted bounds, an unbracketed root, a non-finite
 effective tolerance, or exhausted iterations. Solve stages are scalar rather
 than event-branched; ordinary expression-stage JSON remains unchanged.
 
+## Bounded state recurrence stages
+
+Some answers depend on repeatedly evolving several pools rather than solving
+one scalar equation: repeated hits spilling through shields into life,
+deferred damage accumulating beside immediate loss, recovery between attacks,
+or a fractional final hit. A pipeline entry may declare `recurrence` instead
+of `expr` or `solve`:
+
+```json
+{
+  "stats": ["life_pool", "hit"],
+  "pipeline": [
+    {
+      "name": "fractional_hits_survived",
+      "recurrence": {
+        "state": [
+          { "name": "life", "initial": "life_pool", "next": "max(life - hit, 0)" },
+          { "name": "hits", "initial": "0", "next": "hits + 1" },
+          { "name": "overkill", "initial": "0", "next": "max(hit - life, 0)" }
+        ],
+        "until": "life <= 0",
+        "result": "hits - overkill / hit",
+        "max_iterations": 1000
+      }
+    }
+  ],
+  "objectives": ["fractional_hits_survived"]
+}
+```
+
+Every state entry declares a collision-checked local `name`, an `initial`
+expression, and a `next` expression. Initializers are evaluated once from
+stats, conditions, buckets, and earlier pipeline stages; they cannot read
+other local state. After initialization, `until` is checked at iteration zero.
+Zero means continue and any other finite value means terminate. On
+termination, `result` is evaluated over the terminal state and becomes the
+ordinary named stage value, available to later stages and objectives.
+
+Updates are **simultaneous**. Every `next` expression reads the complete state
+from the previous iteration. The engine evaluates all next values into a
+preallocated second buffer, verifies that every value is finite, and only then
+replaces the state. Declaration order therefore never changes the math. For
+example, if `a.next` is `a + 1` and `b.next` is `b + a`, `b` reads the old
+`a`, not the just-computed one.
+
+All expressions compile once in `plan::compile`; none are reparsed in the
+loop. Evaluation follows the same fixed expression order and IEEE `f64`
+operations on native and Wasm, so the same inputs are deterministic on both
+targets. The reusable `EvalScratch` owns both state buffers, so recurrence
+evaluation performs no heap allocation.
+
+A recurrence must declare 1 through 256 state slots and a `max_iterations`
+from 1 through 100000. Reaching the budget without a true `until` predicate is
+a `PlanError`, never a partial answer. Compilation rejects duplicate, invalid,
+or colliding local identifiers and all forward references. Evaluation rejects
+a non-finite initializer, next value, predicate, or terminal result; each
+error names the stage, state when applicable, and iteration. Recurrence stages
+are not event-branched, while existing expression and solve JSON remains
+unchanged.
+
+The complete delayed-life-loss EHP reproduction from issue #22 lives in
+[`issue22-recurrence-gamedef.json`](../crates/rtce/tests/fixtures/poe2/issue22-recurrence-gamedef.json).
+It keeps the pool names and rules in configuration and uses the normal native,
+runner, and Wasm objective path.
+
 Unknown JSON keys and unresolved expression names fail closed with contextual
 errors. Keys beginning with `_` are the one exception: they are ignored
 annotations for human guidance, such as `_source` and `_guide`.

@@ -7,19 +7,39 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-16
+
+**Config-owned bounded algorithms.** Version 0.6.0 lets a GameDef express
+calculations that need either a deterministic scalar search or repeated,
+simultaneous state transitions. Downstream integrations can now keep nonlinear
+maximum-hit and repeated-hit EHP mechanics in portable RTCE configuration
+instead of maintaining parallel calculator code.
+
+### Upgrade notes
+
+- Existing expression-stage and solve-stage JSON remains valid.
+- Rust callers that construct or exhaustively match `StageDef` must account for
+  its `Expression`, `Solve`, and `Recurrence` variants.
+
 ### Added
 
 - GameDef pipelines now support deterministic bounded scalar-solve stages.
   Bounds and residuals compile once, bisection returns the greatest known
   feasible lower bound, configuration fixes both tolerances and an iteration
   budget, and invalid brackets or non-finite samples fail with `PlanError`.
+- GameDef pipelines now support deterministic bounded state-recurrence
+  stages. Configuration declares collision-checked local state, simultaneous
+  next-state expressions, a terminal predicate, a result expression, and a
+  hard transition budget. Expressions compile once, reusable scratch keeps
+  evaluation allocation-free, and non-finite or non-terminating runs fail
+  with stage-and-iteration context on native and Wasm.
 
 ### Changed
 
 - The public Rust `StageDef` struct is now an untagged enum over
-  `ExpressionStageDef` and `SolveStageDef`. Existing expression-stage JSON is
-  unchanged; Rust callers constructing stages directly must wrap the new
-  expression variant.
+  `ExpressionStageDef`, `SolveStageDef`, and `RecurrenceStageDef`. Existing
+  expression-stage JSON is unchanged; Rust callers constructing stages
+  directly must wrap the new expression variant.
 
 ## [0.5.1] — 2026-08-15
 
@@ -1442,7 +1462,8 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
-[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.4.0

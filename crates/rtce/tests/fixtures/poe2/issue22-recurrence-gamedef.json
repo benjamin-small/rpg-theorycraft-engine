@@ -1,0 +1,61 @@
+{
+  "_source": "Path of Building PoE2 commit a82a33b4fbdb7306ed93159664f7abe2c6819413, TestDefence_spec.lua: limits EHP speedup when hit damage is delayed",
+  "_guide": "The game-specific adapter has already reduced the configured damage components to taken_hit. RTCE owns the generic repeated-hit state evolution, deferred-loss accumulation, expected-block scaling, and fractional final-hit accounting.",
+  "stats": [
+    "life_pool",
+    "incoming_damage",
+    "taken_hit",
+    "prevented_fraction",
+    "block_chance",
+    "block_effect"
+  ],
+  "pipeline": [
+    {
+      "name": "expected_taken_hit",
+      "expr": "taken_hit * (1 - block_chance * block_effect)"
+    },
+    {
+      "name": "immediate_life_loss",
+      "expr": "expected_taken_hit * (1 - prevented_fraction)"
+    },
+    {
+      "name": "deferred_life_loss",
+      "expr": "expected_taken_hit * prevented_fraction"
+    },
+    {
+      "name": "total_ehp",
+      "recurrence": {
+        "state": [
+          {
+            "name": "life_remaining",
+            "initial": "life_pool",
+            "next": "max(life_remaining - immediate_life_loss, 0)"
+          },
+          {
+            "name": "deferred_accumulated",
+            "initial": "0",
+            "next": "deferred_accumulated + deferred_life_loss"
+          },
+          {
+            "name": "hits_taken",
+            "initial": "0",
+            "next": "hits_taken + 1"
+          },
+          {
+            "name": "final_overkill",
+            "initial": "0",
+            "next": "max(immediate_life_loss - life_remaining, 0)"
+          }
+        ],
+        "until": "life_remaining <= 0",
+        "result": "(hits_taken - final_overkill / immediate_life_loss) * incoming_damage",
+        "max_iterations": 128
+      }
+    },
+    {
+      "name": "effective_block_chance",
+      "expr": "block_chance * 100"
+    }
+  ],
+  "objectives": ["total_ehp", "effective_block_chance"]
+}

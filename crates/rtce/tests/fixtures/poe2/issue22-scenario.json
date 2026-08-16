@@ -1,0 +1,5 @@
+{
+  "phases": [
+    { "name": "repeated_hits", "weight": 1 }
+  ]
+}

@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "rtce"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "rtce-testkit",
  "serde",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "rtce-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "clap",
  "rtce-runner",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "rtce-runner"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "rtce",
  "serde",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "rtce-wasm"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "rtce-runner",
  "serde_json",
