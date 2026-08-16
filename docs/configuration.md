@@ -67,6 +67,64 @@ simulation field that requires a finite quantity rejects it at runtime with the
 field and evaluation instant named. Input stats, contributions, phase values,
 and uptimes retain their existing fail-closed finite-value validation.
 
+## Bounded solve stages
+
+When the unknown appears in several denominators or piecewise routing paths,
+a closed-form expression stops being practical. A pipeline entry may therefore
+declare `solve` instead of `expr`. This complete GameDef solves the greatest
+incoming hit whose two armour-mitigated components consume at most `pool`:
+
+```json
+{
+  "stats": ["armour", "pool", "max_hit_search_upper"],
+  "pipeline": [
+    {
+      "name": "max_hit",
+      "solve": {
+        "variable": "incoming_hit",
+        "residual": "0.2 * incoming_hit * (1 - armour / (armour + 2 * incoming_hit)) + 0.8 * incoming_hit * (1 - armour / (armour + 8 * incoming_hit)) - pool",
+        "lower": "0",
+        "upper": "max_hit_search_upper",
+        "absolute_tolerance": 1e-7,
+        "relative_tolerance": 1e-9,
+        "max_iterations": 128
+      }
+    },
+    { "name": "max_whole_hit", "expr": "floor(max_hit)" }
+  ],
+  "objectives": ["max_hit", "max_whole_hit"]
+}
+```
+
+The residual must be monotone non-decreasing over the configured interval.
+Values `<= 0` mean feasible; values `> 0` mean the modeled pool or constraint
+has been exceeded. The local `variable` is visible only in `residual` and may
+not collide with a declared or engine name. `lower` and `upper` are compiled
+once against stats, conditions, buckets, and earlier stages; forward
+references and use of the local variable in a bound fail at plan compilation.
+
+Evaluation uses deterministic bisection and maintains
+`residual(lower) <= 0 <= residual(upper)`. It stops when the bracket width is
+at most:
+
+```text
+absolute_tolerance + relative_tolerance * max(abs(lower), abs(upper))
+```
+
+The stage returns the greatest known feasible lower bound, so a later
+`floor(max_hit)` remains conservative. If floating-point precision leaves no
+representable midpoint, that same lower bound is returned. Otherwise, using
+the complete `max_iterations` budget without meeting tolerance is an error;
+the engine never silently returns an under-converged result. One stage may run
+at most 4096 iterations, and it allocates no hidden state.
+
+Compilation rejects invalid identifiers, name collisions, non-finite or
+negative tolerances, two zero tolerances, and iteration budgets outside
+`1..=4096`. Evaluation returns a contextual `PlanError` for non-finite bounds
+or residual samples, inverted bounds, an unbracketed root, a non-finite
+effective tolerance, or exhausted iterations. Solve stages are scalar rather
+than event-branched; ordinary expression-stage JSON remains unchanged.
+
 Unknown JSON keys and unresolved expression names fail closed with contextual
 errors. Keys beginning with `_` are the one exception: they are ignored
 annotations for human guidance, such as `_source` and `_guide`.

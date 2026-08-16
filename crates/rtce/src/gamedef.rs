@@ -19,8 +19,9 @@ use std::collections::BTreeMap;
 /// `Deserialize` always dropped them. The same applies to
 /// [`BucketDef`]/[`StageDef`]; an [`EventDef`] instead collects unknowns
 /// into [`EventDef::extra`] so `plan::compile` can name the event in the
-/// error. These structs deliberately gain NO new field: both consumers
-/// construct them in Rust with exhaustive struct literals.
+/// error. `GameDef` and `BucketDef` retain exhaustive public fields for Rust
+/// consumers; `StageDef` is an untagged enum so each stage shape remains
+/// explicit.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GameDef {
     /// Stat registry: names become slot offsets, in this order.
@@ -91,14 +92,67 @@ impl EventDef {
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["chance", "factor"];
 }
 
-/// One named stage of the pipeline: an expression evaluated over every
-/// slot defined so far (stats, conditions, buckets, earlier stages).
-/// Unknown non-`_` keys are rejected at parse (see [`GameDef`]'s
-/// "Unknown keys" section).
+/// One named stage of the pipeline. The untagged representation preserves the
+/// original expression-stage JSON (`{ "name", "expr", "branched"? }`) and
+/// adds a dedicated solver shape (`{ "name", "solve": { ... } }`).
 #[derive(Debug, Clone, Serialize)]
-pub struct StageDef {
-    /// This stage's name; later stages and `objectives` refer to it by
-    /// this name.
+#[serde(untagged)]
+pub enum StageDef {
+    /// An ordinary expression stage.
+    Expression(ExpressionStageDef),
+    /// A deterministic bounded scalar-solve stage.
+    Solve(SolveStageDef),
+}
+
+impl StageDef {
+    /// This stage's declared name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Expression(stage) => &stage.name,
+            Self::Solve(stage) => &stage.name,
+        }
+    }
+
+    /// Borrow this stage as an expression stage, or `None` for a solve stage.
+    pub fn as_expression(&self) -> Option<&ExpressionStageDef> {
+        match self {
+            Self::Expression(stage) => Some(stage),
+            Self::Solve(_) => None,
+        }
+    }
+
+    /// Mutably borrow this stage as an expression stage, or `None` for a
+    /// solve stage.
+    pub fn as_expression_mut(&mut self) -> Option<&mut ExpressionStageDef> {
+        match self {
+            Self::Expression(stage) => Some(stage),
+            Self::Solve(_) => None,
+        }
+    }
+
+    /// Borrow this stage as a solve stage, or `None` for an expression stage.
+    pub fn as_solve(&self) -> Option<&SolveStageDef> {
+        match self {
+            Self::Expression(_) => None,
+            Self::Solve(stage) => Some(stage),
+        }
+    }
+
+    /// Mutably borrow this stage as a solve stage, or `None` for an
+    /// expression stage.
+    pub fn as_solve_mut(&mut self) -> Option<&mut SolveStageDef> {
+        match self {
+            Self::Expression(_) => None,
+            Self::Solve(stage) => Some(stage),
+        }
+    }
+}
+
+/// An expression evaluated over stats, conditions, buckets, and earlier
+/// pipeline stages.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExpressionStageDef {
+    /// This stage's name; later stages and `objectives` refer to it by name.
     pub name: String,
     /// The stage's expression, evaluated over the unified slot layout.
     pub expr: String,
@@ -110,9 +164,37 @@ pub struct StageDef {
     pub branched: bool,
 }
 
-// ── P8a: hand-written `Deserialize` for the consumer-constructed structs
-// (see `config_keys`'s module docs for why these three cannot simply grow
-// an `extra` field): a parse-side mirror with `#[serde(flatten)]` collects
+/// A named stage whose value is produced by a bounded scalar solve.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolveStageDef {
+    /// This stage's name; later stages and `objectives` refer to it by name.
+    pub name: String,
+    /// The deterministic bisection configuration.
+    pub solve: SolveDef,
+}
+
+/// Configuration for deterministic conservative bisection.
+#[derive(Debug, Clone, Serialize)]
+pub struct SolveDef {
+    /// Solver-local identifier available only inside `residual`.
+    pub variable: String,
+    /// Monotone residual expression. Values `<= 0` are feasible; values
+    /// `> 0` exceed the modeled pool or constraint.
+    pub residual: String,
+    /// Inclusive lower-bound expression over normal stage symbols.
+    pub lower: String,
+    /// Inclusive upper-bound expression over normal stage symbols.
+    pub upper: String,
+    /// Absolute bracket-width tolerance; finite and non-negative.
+    pub absolute_tolerance: f64,
+    /// Relative bracket-width tolerance; finite and non-negative.
+    pub relative_tolerance: f64,
+    /// Hard per-evaluation iteration budget.
+    pub max_iterations: u32,
+}
+
+// ── P8a: hand-written `Deserialize` for the public config structs and stage
+// variants. A parse-side mirror with `#[serde(flatten)]` collects
 // leftover keys, and `config_keys::reject_unknown` fails closed on any
 // non-`_` one right there, with the context the struct itself carries.
 //
@@ -185,23 +267,85 @@ impl<'de> Deserialize<'de> for StageDef {
         #[derive(Deserialize)]
         struct Repr {
             name: String,
-            expr: String,
             #[serde(default)]
-            branched: bool,
+            expr: Option<String>,
+            #[serde(default)]
+            branched: Option<bool>,
+            #[serde(default)]
+            solve: Option<SolveDef>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
         let r = Repr::deserialize(d)?;
         crate::config_keys::reject_unknown(
             &format!("stage `{}`", r.name),
-            &["name", "expr", "branched"],
+            &["name", "expr", "branched", "solve"],
             &r.extra,
         )
         .map_err(serde::de::Error::custom)?;
-        Ok(StageDef {
-            name: r.name,
-            expr: r.expr,
-            branched: r.branched,
+        match (r.expr, r.solve) {
+            (Some(expr), None) => Ok(StageDef::Expression(ExpressionStageDef {
+                name: r.name,
+                expr,
+                branched: r.branched.unwrap_or(false),
+            })),
+            (None, Some(solve)) if r.branched.is_none() => Ok(StageDef::Solve(SolveStageDef {
+                name: r.name,
+                solve,
+            })),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(format!(
+                "stage `{}` must declare exactly one of `expr` or `solve`",
+                r.name
+            ))),
+            (None, Some(_)) => Err(serde::de::Error::custom(format!(
+                "solve stage `{}` cannot declare `branched`",
+                r.name
+            ))),
+            (None, None) => Err(serde::de::Error::custom(format!(
+                "stage `{}` must declare exactly one of `expr` or `solve`",
+                r.name
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SolveDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            variable: String,
+            residual: String,
+            lower: String,
+            upper: String,
+            absolute_tolerance: f64,
+            relative_tolerance: f64,
+            max_iterations: u32,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            "a solve definition",
+            &[
+                "variable",
+                "residual",
+                "lower",
+                "upper",
+                "absolute_tolerance",
+                "relative_tolerance",
+                "max_iterations",
+            ],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(SolveDef {
+            variable: r.variable,
+            residual: r.residual,
+            lower: r.lower,
+            upper: r.upper,
+            absolute_tolerance: r.absolute_tolerance,
+            relative_tolerance: r.relative_tolerance,
+            max_iterations: r.max_iterations,
         })
     }
 }
@@ -231,7 +375,73 @@ mod tests {
         .unwrap();
         assert_eq!(g.stats, vec!["weapon", "crit_chance"]);
         assert_eq!(g.buckets["crit_group"].fold, FoldKind::SummedGroup);
-        assert!(g.pipeline[1].branched && !g.pipeline[0].branched);
+        assert!(g.pipeline[1].as_expression().unwrap().branched);
+        assert!(!g.pipeline[0].as_expression().unwrap().branched);
         assert_eq!(g.objectives, vec!["hit"]);
+    }
+
+    #[test]
+    fn solve_stage_parses_and_round_trips_without_tagging_expression_stages() {
+        let expression_json = serde_json::json!({
+            "name": "base",
+            "expr": "weapon",
+            "branched": false
+        });
+        let expression: StageDef = serde_json::from_value(expression_json.clone()).unwrap();
+        assert!(matches!(expression, StageDef::Expression(_)));
+        assert_eq!(serde_json::to_value(&expression).unwrap(), expression_json);
+
+        let solve_json = serde_json::json!({
+            "name": "root",
+            "solve": {
+                "variable": "x",
+                "residual": "x * x - 2",
+                "lower": "0",
+                "upper": "2",
+                "absolute_tolerance": 1e-7,
+                "relative_tolerance": 1e-9,
+                "max_iterations": 128
+            }
+        });
+        let solve: StageDef = serde_json::from_value(solve_json.clone()).unwrap();
+        assert!(matches!(solve, StageDef::Solve(_)));
+        assert_eq!(serde_json::to_value(&solve).unwrap(), solve_json);
+    }
+
+    #[test]
+    fn solve_stage_shape_and_nested_keys_fail_closed() {
+        let both = serde_json::from_value::<StageDef>(serde_json::json!({
+            "name": "ambiguous",
+            "expr": "1",
+            "solve": {
+                "variable": "x", "residual": "x", "lower": "0", "upper": "1",
+                "absolute_tolerance": 1e-7, "relative_tolerance": 1e-9,
+                "max_iterations": 128
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            both.to_string()
+                .contains("exactly one of `expr` or `solve`"),
+            "got: {both}"
+        );
+
+        let typo = serde_json::from_value::<StageDef>(serde_json::json!({
+            "name": "root",
+            "solve": {
+                "variable": "x", "residual": "x", "lower": "0", "upper": "1",
+                "absolute_tolerence": 1e-7, "absolute_tolerance": 1e-7,
+                "relative_tolerance": 1e-9, "max_iterations": 128
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            typo.to_string()
+                .contains("unknown field `absolute_tolerence`")
+                && typo
+                    .to_string()
+                    .contains("did you mean `absolute_tolerance`"),
+            "got: {typo}"
+        );
     }
 }

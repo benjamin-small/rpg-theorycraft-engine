@@ -5,12 +5,16 @@
 
 use crate::build::BuildState;
 use crate::expr::{compile as compile_expr, ExprError, Program, Symbols};
-use crate::gamedef::{FoldKind, GameDef};
+use crate::gamedef::{FoldKind, GameDef, StageDef};
 use crate::rng::Pcg32;
 use crate::scenario::{Phase, Scenario};
 
 /// Hard cap on events: 2^8 = 256 branches per branched stage.
 pub const MAX_EVENTS: usize = 8;
+
+/// Hard safety ceiling for one solve stage's configured bisection budget.
+/// The configured `max_iterations` remains the tighter per-stage bound.
+pub const MAX_SOLVE_ITERATIONS: u32 = 4096;
 
 /// A `plan::compile` or `Plan::evaluate`/`explain` failure: bad GameDef
 /// config (unknown/duplicate names, too many events, reserved names) or a
@@ -74,8 +78,24 @@ struct CompiledEvent {
 #[derive(Debug)]
 struct CompiledStage {
     name: String,
-    program: Program,
-    branched: bool,
+    kind: CompiledStageKind,
+}
+
+#[derive(Debug)]
+enum CompiledStageKind {
+    Expression { program: Program, branched: bool },
+    Solve(CompiledSolve),
+}
+
+#[derive(Debug)]
+struct CompiledSolve {
+    lower: Program,
+    upper: Program,
+    residual: Program,
+    variable_slot: usize,
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+    max_iterations: u32,
 }
 
 /// Compile-time symbol table over the unified slot layout. The engine's
@@ -135,6 +155,33 @@ impl Symbols for WithEventFactors<'_> {
         }
         None
     }
+}
+
+/// Solver residual symbol table: normal stage symbols plus exactly one local
+/// variable in the otherwise engine-private slot after all pipeline stages.
+struct WithSolveVariable<'a> {
+    inner: StageSymbols<'a>,
+    variable: &'a str,
+    slot: u16,
+}
+
+impl Symbols for WithSolveVariable<'_> {
+    fn slot(&self, name: &str) -> Option<u16> {
+        if name == self.variable {
+            Some(self.slot)
+        } else {
+            self.inner.slot(name)
+        }
+    }
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// The ONE source of truth for build finiteness: every `BuildState` stat
@@ -213,7 +260,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
     // a compatibility break; in that uncommon case only the legacy spelling
     // exposes the engine slot.
     let bucket_names: Vec<String> = def.buckets.keys().cloned().collect();
-    let stage_names: Vec<String> = def.pipeline.iter().map(|s| s.name.clone()).collect();
+    let stage_names: Vec<String> = def.pipeline.iter().map(|s| s.name().to_owned()).collect();
     let readable_alias_available = !def
         .stats
         .iter()
@@ -284,25 +331,111 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
 
     let mut stages: Vec<CompiledStage> = Vec::new();
     for (i, s) in def.pipeline.iter().enumerate() {
-        let syms = WithEventFactors {
-            inner: StageSymbols {
-                stats: &def.stats,
-                conditions: &def.conditions,
-                buckets: &bucket_names,
-                prior_stages: &stage_names[..i],
-            },
-            slot: event_factors_slot,
-            branched: s.branched,
-            readable_alias_available,
+        let base_syms = StageSymbols {
+            stats: &def.stats,
+            conditions: &def.conditions,
+            buckets: &bucket_names,
+            prior_stages: &stage_names[..i],
         };
-        let program = compile_expr(&s.expr, &syms).map_err(|e| PlanError {
-            what: format!("stage `{}`: {e}", s.name),
-        })?;
-        stages.push(CompiledStage {
-            name: s.name.clone(),
-            program,
-            branched: s.branched,
-        });
+        let (name, kind) = match s {
+            StageDef::Expression(s) => {
+                let syms = WithEventFactors {
+                    inner: base_syms,
+                    slot: event_factors_slot,
+                    branched: s.branched,
+                    readable_alias_available,
+                };
+                let program = compile_expr(&s.expr, &syms).map_err(|e| PlanError {
+                    what: format!("stage `{}`: {e}", s.name),
+                })?;
+                (
+                    s.name.clone(),
+                    CompiledStageKind::Expression {
+                        program,
+                        branched: s.branched,
+                    },
+                )
+            }
+            StageDef::Solve(s) => {
+                let solve = &s.solve;
+                if !is_plain_identifier(&solve.variable) {
+                    return Err(PlanError {
+                        what: format!(
+                            "solve stage `{}` variable `{}` must be a plain ASCII identifier",
+                            s.name, solve.variable
+                        ),
+                    });
+                }
+                if def
+                    .stats
+                    .iter()
+                    .chain(&def.conditions)
+                    .chain(&bucket_names)
+                    .chain(&stage_names)
+                    .any(|name| name == &solve.variable)
+                    || matches!(
+                        solve.variable.as_str(),
+                        "event_factors" | "event_multiplier"
+                    )
+                {
+                    return Err(PlanError {
+                        what: format!(
+                            "solve stage `{}` variable `{}` collides with a declared or engine name",
+                            s.name, solve.variable
+                        ),
+                    });
+                }
+                if !solve.absolute_tolerance.is_finite()
+                    || solve.absolute_tolerance < 0.0
+                    || !solve.relative_tolerance.is_finite()
+                    || solve.relative_tolerance < 0.0
+                    || (solve.absolute_tolerance == 0.0 && solve.relative_tolerance == 0.0)
+                {
+                    return Err(PlanError {
+                        what: format!(
+                            "solve stage `{}` tolerances must be finite and non-negative, with at least one greater than zero",
+                            s.name
+                        ),
+                    });
+                }
+                if solve.max_iterations == 0 || solve.max_iterations > MAX_SOLVE_ITERATIONS {
+                    return Err(PlanError {
+                        what: format!(
+                            "solve stage `{}` max_iterations must be in 1..={MAX_SOLVE_ITERATIONS}, got {}",
+                            s.name, solve.max_iterations
+                        ),
+                    });
+                }
+                let lower = compile_expr(&solve.lower, &base_syms).map_err(|e| PlanError {
+                    what: format!("solve stage `{}` lower: {e}", s.name),
+                })?;
+                let upper = compile_expr(&solve.upper, &base_syms).map_err(|e| PlanError {
+                    what: format!("solve stage `{}` upper: {e}", s.name),
+                })?;
+                let residual_syms = WithSolveVariable {
+                    inner: base_syms,
+                    variable: &solve.variable,
+                    slot: event_factors_slot,
+                };
+                let residual =
+                    compile_expr(&solve.residual, &residual_syms).map_err(|e| PlanError {
+                        what: format!("solve stage `{}` residual: {e}", s.name),
+                    })?;
+                (
+                    s.name.clone(),
+                    CompiledStageKind::Solve(CompiledSolve {
+                        lower,
+                        upper,
+                        residual,
+                        variable_slot: event_factors_slot as usize,
+                        absolute_tolerance: solve.absolute_tolerance,
+                        relative_tolerance: solve.relative_tolerance,
+                        max_iterations: solve.max_iterations,
+                    }),
+                )
+            }
+        };
+        stages.push(CompiledStage { name, kind });
     }
 
     if def.objectives.is_empty() {
@@ -711,8 +844,16 @@ impl Plan {
         // Stages in order.
         for (si, stage) in self.stages.iter().enumerate() {
             let out_slot = bucket_base + self.n_buckets + si;
-            if !stage.branched {
-                scratch.slots[out_slot] = stage.program.eval(&scratch.slots);
+            let (program, branched) = match &stage.kind {
+                CompiledStageKind::Expression { program, branched } => (program, *branched),
+                CompiledStageKind::Solve(solve) => {
+                    scratch.slots[out_slot] =
+                        Self::eval_solve(&stage.name, solve, &mut scratch.slots)?;
+                    continue;
+                }
+            };
+            if !branched {
+                scratch.slots[out_slot] = program.eval(&scratch.slots);
                 continue;
             }
             // Chances depend only on PHASE slots (not on the branch), so
@@ -736,7 +877,7 @@ impl Plan {
                         }
                     }
                     let (value, _factors) =
-                        self.eval_branch(build, phase, mask, bucket_base, stage, scratch)?;
+                        self.eval_branch(build, phase, mask, bucket_base, program, scratch)?;
                     scratch.slots[out_slot] = value;
                     fired_mask_union |= mask;
                 }
@@ -753,7 +894,7 @@ impl Plan {
                             continue;
                         }
                         let (branch_value, factors) =
-                            self.eval_branch(build, phase, mask, bucket_base, stage, scratch)?;
+                            self.eval_branch(build, phase, mask, bucket_base, program, scratch)?;
                         ev_acc += weight * branch_value;
                         if let Some(pt) = phase_trace.as_mut() {
                             let fired: Vec<String> = (0..n_ev)
@@ -839,7 +980,7 @@ impl Plan {
         phase: &Phase,
         mask: u32,
         bucket_base: usize,
-        stage: &CompiledStage,
+        program: &Program,
         scratch: &mut EvalScratch,
     ) -> Result<(f64, f64), PlanError> {
         scratch.branch_slots.copy_from_slice(&scratch.slots);
@@ -857,8 +998,121 @@ impl Plan {
         }
         let ef_slot = bucket_base + self.n_buckets + self.n_stages;
         scratch.branch_slots[ef_slot] = factors;
-        let value = stage.program.eval(&scratch.branch_slots);
+        let value = program.eval(&scratch.branch_slots);
         Ok((value, factors))
+    }
+
+    /// Evaluate one configured scalar solve. The invariant is always
+    /// `residual(lo) <= 0 <= residual(hi)`; returning `lo` is therefore a
+    /// deterministic conservative answer even when the iteration budget is
+    /// exactly exhausted at the tolerance boundary.
+    fn eval_solve(
+        stage_name: &str,
+        solve: &CompiledSolve,
+        slots: &mut [f64],
+    ) -> Result<f64, PlanError> {
+        let mut lo = solve.lower.eval(slots);
+        if !lo.is_finite() {
+            return Err(PlanError {
+                what: format!("solve stage `{stage_name}` lower bound must be finite, got {lo}"),
+            });
+        }
+        let mut hi = solve.upper.eval(slots);
+        if !hi.is_finite() {
+            return Err(PlanError {
+                what: format!("solve stage `{stage_name}` upper bound must be finite, got {hi}"),
+            });
+        }
+        if lo > hi {
+            return Err(PlanError {
+                what: format!(
+                    "solve stage `{stage_name}` bounds are inverted: lower {lo} > upper {hi}"
+                ),
+            });
+        }
+
+        let eval_residual = |x: f64, slots: &mut [f64]| -> Result<f64, PlanError> {
+            slots[solve.variable_slot] = x;
+            let residual = solve.residual.eval(slots);
+            if residual.is_finite() {
+                Ok(residual)
+            } else {
+                Err(PlanError {
+                    what: format!(
+                        "solve stage `{stage_name}` residual is non-finite at {x}: {residual}"
+                    ),
+                })
+            }
+        };
+
+        let lo_residual = eval_residual(lo, slots)?;
+        if lo_residual > 0.0 {
+            return Err(PlanError {
+                what: format!(
+                    "solve stage `{stage_name}` root is unbracketed: residual(lower={lo}) = {lo_residual} > 0"
+                ),
+            });
+        }
+        let hi_residual = eval_residual(hi, slots)?;
+        if hi_residual < 0.0 {
+            return Err(PlanError {
+                what: format!(
+                    "solve stage `{stage_name}` root is unbracketed: residual(upper={hi}) = {hi_residual} < 0"
+                ),
+            });
+        }
+        if hi_residual == 0.0 {
+            return Ok(hi);
+        }
+
+        let converged = |lo: f64, hi: f64| -> Result<bool, PlanError> {
+            let width = hi - lo;
+            let tolerance =
+                solve.absolute_tolerance + solve.relative_tolerance * lo.abs().max(hi.abs());
+            if !tolerance.is_finite() {
+                return Err(PlanError {
+                    what: format!(
+                        "solve stage `{stage_name}` effective tolerance is non-finite for [{lo}, {hi}]"
+                    ),
+                });
+            }
+            // Two finite opposite-sign extremes can have an infinite
+            // representable width. They are simply not converged yet; the
+            // overflow-safe midpoint below narrows them normally.
+            Ok(width.is_finite() && width <= tolerance)
+        };
+
+        for _ in 0..solve.max_iterations {
+            if converged(lo, hi)? {
+                slots[solve.variable_slot] = lo;
+                return Ok(lo);
+            }
+            // Halving before addition avoids overflowing `hi - lo` while
+            // retaining deterministic IEEE arithmetic on native and Wasm.
+            let mid = lo * 0.5 + hi * 0.5;
+            if mid == lo || mid == hi {
+                slots[solve.variable_slot] = lo;
+                return Ok(lo);
+            }
+            let residual = eval_residual(mid, slots)?;
+            if residual <= 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+
+        if converged(lo, hi)? {
+            slots[solve.variable_slot] = lo;
+            Ok(lo)
+        } else {
+            Err(PlanError {
+                what: format!(
+                    "solve stage `{stage_name}` did not converge within {} iterations; final bracket [{lo}, {hi}]",
+                    solve.max_iterations
+                ),
+            })
+        }
     }
 
     /// Shared by [`Plan::evaluate_phase`]/[`Plan::evaluate_phase_sampled`]/
@@ -1167,7 +1421,8 @@ mod tests {
     fn event_multiplier_is_a_gamer_readable_alias_for_event_factors() {
         let legacy = compile(&toy_def()).unwrap();
         let mut readable_def = toy_def();
-        readable_def.pipeline[1].expr = readable_def.pipeline[1]
+        let readable_stage = readable_def.pipeline[1].as_expression_mut().unwrap();
+        readable_stage.expr = readable_stage
             .expr
             .replace("event_factors", "event_multiplier");
         let readable = compile(&readable_def).unwrap();
@@ -1187,12 +1442,12 @@ mod tests {
     #[test]
     fn event_factors_is_illegal_outside_branched_stages() {
         let mut def = toy_def();
-        def.pipeline[0].expr = "weapon * event_factors".into();
+        def.pipeline[0].as_expression_mut().unwrap().expr = "weapon * event_factors".into();
         let e = compile(&def).unwrap_err();
         assert!(e.what.contains("event_factors"), "got: {}", e.what);
 
         let mut def = toy_def();
-        def.pipeline[0].expr = "weapon * event_multiplier".into();
+        def.pipeline[0].as_expression_mut().unwrap().expr = "weapon * event_multiplier".into();
         let e = compile(&def).unwrap_err();
         assert!(e.what.contains("event_multiplier"), "got: {}", e.what);
     }
@@ -1200,7 +1455,7 @@ mod tests {
     #[test]
     fn unknown_names_and_duplicates_are_compile_errors() {
         let mut def = toy_def();
-        def.pipeline[2].expr = "hit * mystery".into();
+        def.pipeline[2].as_expression_mut().unwrap().expr = "hit * mystery".into();
         assert!(compile(&def).unwrap_err().what.contains("mystery"));
 
         let mut def = toy_def();
@@ -1215,7 +1470,7 @@ mod tests {
     #[test]
     fn later_stages_see_earlier_ones_but_not_vice_versa() {
         let mut def = toy_def();
-        def.pipeline[0].expr = "dps + 1".into(); // forward reference
+        def.pipeline[0].as_expression_mut().unwrap().expr = "dps + 1".into(); // forward reference
         assert!(compile(&def).unwrap_err().what.contains("dps"));
     }
 
@@ -1238,7 +1493,7 @@ mod tests {
                 fold: FoldKind::Sum,
             },
         );
-        def.pipeline[1].expr = "event_multiplier".into();
+        def.pipeline[1].as_expression_mut().unwrap().expr = "event_multiplier".into();
         def.objectives = vec!["hit".into()];
 
         let plan = compile(&def).unwrap();
