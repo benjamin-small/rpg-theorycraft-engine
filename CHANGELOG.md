@@ -7,6 +7,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-08-15
+
+**Self-contained nonlinear expression math.** Version 0.5.1 lets GameDef and
+SimDef configuration own formulas that require roots or fractional powers,
+removing the need for downstream adapters to precompute poison-selection and
+closed-form armour values.
+
 ### Added
 
 - The shared expression VM now supports `sqrt(x)` and fractional
@@ -1421,7 +1428,8 @@ WASM.
   with crates.io-ready package metadata; GitHub Actions CI (test +
   clippy + fmt).
 
-[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.4.0
 [0.3.0]: https://github.com/benjamin-small/rpg-theorycraft-engine/releases/tag/v0.3.0
