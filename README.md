@@ -5,6 +5,8 @@
 [![docs.rs](https://docs.rs/rtce/badge.svg)](https://docs.rs/rtce)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+**[Open the interactive tutorial](https://benjamin-small.github.io/rpg-theorycraft-engine/)**
+
 A generic, config-driven theorycrafting engine. The game's algorithm —
 stats, fold rules, probabilistic events, damage pipeline — is
 configuration, compiled once into a fast evaluation plan. Extracted from
