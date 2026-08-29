@@ -100,23 +100,37 @@
 
   The three PoE2 slices KEEP their half-integer buff durations, but for
   the OTHER reason: measurement showed the rationale was the mid-fight
-  `seq` ordering (see the 0.4.0 question below), not this bug. Integer
+  `seq` ordering (see the configurable event-order decision below), not
+  this bug. Integer
   durations would reshape `poe2_charges`' cycle and cost `poe2_triggers`
   15.5% of bolt damage — three lessons in event ordering instead of three
   lessons in charges/poison/triggers.
 
-## Next
+## Current status and deferred work
+
+- **P8 — configurable semantics, DONE (0.4.0).** Cast measurement,
+  same-instant event order, and multi-hit proc rolls are configuration;
+  ordered effect lists, fail-closed config validation, one-world snapshots,
+  and the progressive seven-chapter guide shipped with them.
+- **CLI, browser tutorial, and applied-DoT reporting, DONE (0.5.0).** The
+  native CLI, Docker demo, TypeScript/Wasm field guide, shared lexicon, and
+  damaging-buff observability all execute the same library-owned engine paths.
+- **Config-owned nonlinear and bounded calculations, DONE (0.5.1–0.6.0).**
+  `sqrt`/fractional `pow`, deterministic scalar solves, and bounded state
+  recurrences keep nonlinear maximum-hit and repeated-hit EHP mechanics in
+  portable GameDef configuration.
+
 - [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
       the registry (`cargo search` confirms), alongside `rtce-testkit`
       0.1.0. The mechanics recorded here carry forward to every release:
       rtce's dev-dependency pins testkit by `version` alongside its
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
-      actually touches `crates/rtce-testkit/` (none since before P7 —
-      it stays 0.1.0 for 0.4.0 too).
-- [ ] **Publish 0.4.0** (staged by P8f: version bumped, CHANGELOG cut,
-      `cargo publish -p rtce --dry-run` clean). Publishes after the
-      whole-phase P8 review round — the coordinator's step, not a task's.
+      actually touches `crates/rtce-testkit/`.
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, and 0.6.0 are
+      also live; the tag-driven trusted-publishing workflow verifies the tag,
+      changelog, formatting, clippy, tests, and package contents before it
+      publishes missing crate versions.
 - [ ] Sim per-cast allocation trims (P6 review, non-functional). An
       overlay-build cache for actions whose `damage.stats` is empty (no
       overlay to build — `overlay_build_for_action` still clones the full
@@ -152,9 +166,12 @@
       is no bench harness in this repo yet, so the first step is a
       `benches/` entry, not an optimization.
 
-## Open for 0.4.0
-These accumulated during P7 and its release review, and were deliberately
-NOT decided in 0.3.0. Three groups:
+## Deferred design backlog
+
+These items accumulated during P7 and its release review. Completed entries
+retain the reasoning behind the 0.4.0 decisions; unchecked entries remain
+deliberately deferred until a real consumer config or benchmark justifies
+their shape. Three groups:
 
 - **Config-compatibility changes** (the `apply_buff` arity, the
   `ProcDef::actions` shape, the `deny_unknown_fields` sweep) — they
@@ -201,8 +218,8 @@ NOT decided in 0.3.0. Three groups:
       deprecation is a JSON-config-surface concern rustc cannot warn a
       config author about anyway; the rustdoc DEPRECATED notes plus the
       CHANGELOG are the advertised channel.
-- [ ] `ProcDef::actions` expressiveness (P7d review) — 0.4.0 candidate,
-      and only if a real config asks. Today the filter is an inclusive
+- [ ] `ProcDef::actions` expressiveness (P7d review) — only if a real
+      config asks. Today the filter is an inclusive
       list of CASTING actions: no negation, no "every action except"
       (which has to be spelled as the complementary list and kept in step
       by hand), and no way to say "on_hit, but only hits of actions other
@@ -283,8 +300,8 @@ NOT decided in 0.3.0. Three groups:
       alone and needs a second ordering key on the queue, the same
       machinery the P6 design notes declined for `End`. (That is the
       slice P8d became; the default DID NOT change, so no number moved.)
-- [ ] **A per-stack `product` fold mode** (P7c-T1/P7e) — 0.4.0 candidate,
-      and only if a real config asks. Today a stacked contribution scales
+- [ ] **A per-stack `product` fold mode** (P7c-T1/P7e) — only if a real
+      config asks. Today a stacked contribution scales
       its VALUE by the count, so 3 stacks of `+10` in a `product` bucket
       fold as `×1.30`, not `×1.10³`. That is CORRECT for "increased damage
       per charge" and it is documented on `BuffDef` and pinned by
@@ -409,7 +426,7 @@ NOT decided in 0.3.0. Three groups:
       naming the private constant, and the exact boundary is pinned:
       63 levels compile with `max_depth == 64`, 64 levels fail closed
       (`depth_guard_boundary_is_exactly_max_stack`).
-- [ ] 0.5.0: `search::Candidate`/`search::Move` still silently IGNORE
+- [ ] `search::Candidate`/`search::Move` still silently IGNORE
       unknown keys (P8a spec review). Outside P8a's 16-struct config
       sweep — today every driver constructs them in-process, where Rust's
       field checking already applies — but the same silent-typo class the
