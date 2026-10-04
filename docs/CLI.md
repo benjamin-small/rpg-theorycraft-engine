@@ -139,8 +139,8 @@ Results are structured values, so browser-terminal pipelines work directly:
 
 ```text
 rtce evaluate --game $game --build $build --scenario $scenario | get objectives
-rtce simulate --game $game --build $build --scenario $scenario --sim $sim --rotation $rotation | get report.actions
-lesson list | select number lesson command
+rtce simulate --game $game --build $build --scenario $scenario --sim $sim --rotation $rotation | get report | get actions
+lesson list | map command
 ```
 
 The browser commands deliberately match the native CLI's argument names. Since

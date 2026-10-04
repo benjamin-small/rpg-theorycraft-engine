@@ -544,6 +544,9 @@ const inlinedTerminalWasm = (globalThis as { __BTERM_WASM__?: BufferSource }).__
 terminal = await BrowserTerminal.create({
   mount: byId('terminal'),
   wasmBinary: inlinedTerminalWasm,
+  // The console is app-specific: editor JSON reaches commands as $game etc.,
+  // so skip 0.5.0's default OPFS /scratch mount and its file commands.
+  filesystem: false,
 });
 
 terminal.registerCommand(

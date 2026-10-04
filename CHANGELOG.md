@@ -7,6 +7,17 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Changed
+- The browser tutorial uses `@benjamin-small/browser-terminal` 0.5.0. It
+  opts out of 0.5.0's default OPFS `/scratch` filesystem
+  (`filesystem: false`), so the console keeps its app-only command set and
+  plain prompt; editor JSON still reaches commands as `$game`, `$build`, ….
+
+### Fixed
+- Two `docs/CLI.md` pipeline examples that never ran in the browser
+  terminal: `get` takes one column (`get report | get actions`, not
+  `get report.actions`), and there is no `select` (use `map command`).
+
 ## [0.6.0] — 2026-08-16
 
 **Config-owned bounded algorithms.** Version 0.6.0 lets a GameDef express
