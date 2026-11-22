@@ -119,7 +119,7 @@
   `sqrt`/fractional `pow`, deterministic scalar solves, and bounded state
   recurrences keep nonlinear maximum-hit and repeated-hit EHP mechanics in
   portable GameDef configuration.
-- **Sequential and long-running recurrences, DONE (Unreleased).** Ordered
+- **Sequential and long-running recurrences, DONE (0.7.0).** Ordered
   step locals (#29) express per-transition cascades directly, and batched
   galloping transitions (#30) reach long uniform runs in about
   2·log2(N) transitions (333,334 steps in 37), bit-identical to single
@@ -132,7 +132,7 @@
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
       actually touches `crates/rtce-testkit/`.
-- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, and 0.6.0 are
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, and 0.7.0 are
       also live; the tag-driven trusted-publishing workflow verifies the tag,
       changelog, formatting, clippy, tests, and package contents before it
       publishes missing crate versions.
