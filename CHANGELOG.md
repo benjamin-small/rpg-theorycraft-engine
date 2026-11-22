@@ -7,6 +7,14 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-21
+
+**Sequential and long-running recurrences.** Version 0.7.0 adds ordered
+step locals and batched galloping transitions to recurrence stages, so a
+per-transition cascade reads directly and a recurrence that runs for
+hundreds of thousands of logical steps finishes in a few dozen
+transitions.
+
 ### Upgrade notes
 - Recurrence JSON without `locals` or `batch` is unchanged and still
   serializes byte-identically (both are omitted when absent).
