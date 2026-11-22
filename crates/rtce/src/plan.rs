@@ -22,6 +22,12 @@ pub const MAX_RECURRENCE_ITERATIONS: u32 = 100_000;
 /// Hard ceiling for one recurrence stage's local state width.
 pub const MAX_RECURRENCE_STATE_SLOTS: usize = 256;
 
+/// Hard ceiling for one recurrence stage's ordered per-transition locals.
+pub const MAX_RECURRENCE_LOCALS: usize = 256;
+
+/// Hard ceiling for a recurrence stage's `batch.max_size` (2^30).
+pub const MAX_RECURRENCE_BATCH_SIZE: u32 = 1 << 30;
+
 /// A `plan::compile` or `Plan::evaluate`/`explain` failure: bad GameDef
 /// config (unknown/duplicate names, too many events, reserved names) or a
 /// bad runtime input (unknown stat/bucket/event/condition reference,
@@ -73,7 +79,10 @@ pub struct Plan {
     n_conditions: usize,
     n_buckets: usize,
     n_stages: usize,
+    /// Widest recurrence STATE (sizes the next/rollback buffers).
     max_recurrence_states: usize,
+    /// Widest recurrence slot region: state + batch symbol + locals.
+    max_recurrence_slots: usize,
 }
 
 #[derive(Debug)]
@@ -110,6 +119,12 @@ struct CompiledSolve {
 struct CompiledRecurrence {
     state_names: Vec<String>,
     initial: Vec<Program>,
+    /// Ordered per-transition locals and their slots.
+    local_names: Vec<String>,
+    locals: Vec<Program>,
+    local_slot_base: usize,
+    /// `(slot, max_size)` of the batch symbol, when batching is declared.
+    batch: Option<(usize, u32)>,
     next: Vec<Program>,
     until: Program,
     result: Program,
@@ -122,6 +137,7 @@ struct CompiledRecurrence {
 /// `event_factors` name and the clearer `event_multiplier` alias. The alias is
 /// a fallback: an existing config declaration with that name keeps its
 /// original meaning. Engine context resolves only when `branched` is set.
+#[derive(Clone, Copy)]
 struct StageSymbols<'a> {
     stats: &'a [String],
     conditions: &'a [String],
@@ -361,6 +377,18 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         .map(|stage| stage.recurrence.state.len())
         .max()
         .unwrap_or(0);
+    // Every recurrence stage's region is state, then the batch symbol, then
+    // locals; regions overlap across stages (stages run one at a time).
+    let max_recurrence_slots = def
+        .pipeline
+        .iter()
+        .filter_map(StageDef::as_recurrence)
+        .map(|stage| {
+            let r = &stage.recurrence;
+            r.state.len() + usize::from(r.batch.is_some()) + r.locals.len()
+        })
+        .max()
+        .unwrap_or(0);
     if max_recurrence_states > MAX_RECURRENCE_STATE_SLOTS {
         return Err(PlanError {
             what: format!(
@@ -369,7 +397,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         });
     }
     if recurrence_state_slot_base
-        .checked_add(max_recurrence_states)
+        .checked_add(max_recurrence_slots)
         .is_none_or(|width| width > u16::MAX as usize + 1)
     {
         return Err(PlanError {
@@ -560,6 +588,97 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
                     }
                     local_names.push(state.name.clone());
                 }
+                let state_len = local_names.len();
+                let is_declared_or_engine = |name: &str| {
+                    def.stats
+                        .iter()
+                        .chain(&def.conditions)
+                        .chain(&bucket_names)
+                        .chain(&stage_names)
+                        .any(|declared| declared == name)
+                        || matches!(name, "event_factors" | "event_multiplier")
+                };
+
+                if recurrence.locals.len() > MAX_RECURRENCE_LOCALS {
+                    return Err(PlanError {
+                        what: format!(
+                            "recurrence stage `{}` declares {} recurrence locals > max {MAX_RECURRENCE_LOCALS}",
+                            s.name,
+                            recurrence.locals.len()
+                        ),
+                    });
+                }
+                for local in &recurrence.locals {
+                    if !is_plain_identifier(&local.name) {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` local `{}` must be a plain ASCII identifier",
+                                s.name, local.name
+                            ),
+                        });
+                    }
+                    if recurrence
+                        .locals
+                        .iter()
+                        .filter(|l| l.name == local.name)
+                        .count()
+                        > 1
+                    {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` has duplicate local `{}`",
+                                s.name, local.name
+                            ),
+                        });
+                    }
+                    if local_seen.contains(&local.name) || is_declared_or_engine(&local.name) {
+                        return Err(PlanError {
+                            what: format!(
+                                "recurrence stage `{}` local `{}` collides with a state slot or a declared or engine name",
+                                s.name, local.name
+                            ),
+                        });
+                    }
+                }
+                let batch = match &recurrence.batch {
+                    None => None,
+                    Some(batch) => {
+                        if !is_plain_identifier(&batch.symbol) {
+                            return Err(PlanError {
+                                what: format!(
+                                    "recurrence stage `{}` batch symbol `{}` must be a plain ASCII identifier",
+                                    s.name, batch.symbol
+                                ),
+                            });
+                        }
+                        if local_seen.contains(&batch.symbol)
+                            || recurrence.locals.iter().any(|l| l.name == batch.symbol)
+                            || is_declared_or_engine(&batch.symbol)
+                        {
+                            return Err(PlanError {
+                                what: format!(
+                                    "recurrence stage `{}` batch symbol `{}` collides with a state slot, a local, or a declared or engine name",
+                                    s.name, batch.symbol
+                                ),
+                            });
+                        }
+                        if batch.max_size == 0 || batch.max_size > MAX_RECURRENCE_BATCH_SIZE {
+                            return Err(PlanError {
+                                what: format!(
+                                    "recurrence stage `{}` batch max_size must be in 1..={MAX_RECURRENCE_BATCH_SIZE}, got {}",
+                                    s.name, batch.max_size
+                                ),
+                            });
+                        }
+                        local_names.push(batch.symbol.clone());
+                        Some((recurrence_state_slot_base + state_len, batch.max_size))
+                    }
+                };
+                let local_slot_base = recurrence_state_slot_base + local_names.len();
+                let scoped_before_locals = local_names.len();
+                for local in &recurrence.locals {
+                    local_names.push(local.name.clone());
+                }
 
                 // Initializers are deliberately simultaneous too: they read
                 // ordinary symbols only, never another local initializer.
@@ -575,6 +694,34 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
                     })?);
                 }
 
+                // Each local sees state, the batch symbol, and EARLIER locals:
+                // a prefix of the region's name list, so forward and self
+                // references are unknown identifiers by construction.
+                let mut locals = Vec::with_capacity(recurrence.locals.len());
+                for (index, local) in recurrence.locals.iter().enumerate() {
+                    let syms = WithRecurrenceState {
+                        inner: base_syms,
+                        names: &local_names[..scoped_before_locals + index],
+                        slot_base: recurrence_state_slot_base,
+                    };
+                    locals.push(compile_expr(&local.expr, &syms).map_err(|e| PlanError {
+                        what: format!("recurrence stage `{}` local `{}`: {e}", s.name, local.name),
+                    })?);
+                }
+                // `until` and `result` see state only.
+                let terminal_syms = WithRecurrenceState {
+                    inner: base_syms,
+                    names: &local_names[..state_len],
+                    slot_base: recurrence_state_slot_base,
+                };
+                let until =
+                    compile_expr(&recurrence.until, &terminal_syms).map_err(|e| PlanError {
+                        what: format!("recurrence stage `{}` until: {e}", s.name),
+                    })?;
+                let result =
+                    compile_expr(&recurrence.result, &terminal_syms).map_err(|e| PlanError {
+                        what: format!("recurrence stage `{}` result: {e}", s.name),
+                    })?;
                 let recurrence_syms = WithRecurrenceState {
                     inner: base_syms,
                     names: &local_names,
@@ -591,19 +738,18 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
                         }
                     })?);
                 }
-                let until =
-                    compile_expr(&recurrence.until, &recurrence_syms).map_err(|e| PlanError {
-                        what: format!("recurrence stage `{}` until: {e}", s.name),
-                    })?;
-                let result =
-                    compile_expr(&recurrence.result, &recurrence_syms).map_err(|e| PlanError {
-                        what: format!("recurrence stage `{}` result: {e}", s.name),
-                    })?;
+                let state_names = local_names[..state_len].to_vec();
+                let local_names =
+                    local_names[local_slot_base - recurrence_state_slot_base..].to_vec();
                 (
                     s.name.clone(),
                     CompiledStageKind::Recurrence(CompiledRecurrence {
-                        state_names: local_names,
+                        state_names,
                         initial,
+                        local_names,
+                        locals,
+                        local_slot_base,
+                        batch,
                         next,
                         until,
                         result,
@@ -646,6 +792,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         n_buckets,
         n_stages,
         max_recurrence_states,
+        max_recurrence_slots,
     })
 }
 
@@ -760,6 +907,8 @@ pub struct EvalScratch {
     slots: Vec<f64>,
     branch_slots: Vec<f64>,
     recurrence_next: Vec<f64>,
+    /// Rollback copy of the state for rejected batched candidates.
+    recurrence_saved: Vec<f64>,
     base_bucket_raw: Vec<f64>,
     branch_bucket_raw: Vec<f64>,
     objectives: Vec<f64>,
@@ -790,11 +939,12 @@ impl Plan {
     /// result must only be passed to `evaluate` on this same `Plan` —
     /// `evaluate` debug-asserts the buffer lengths match.
     pub fn scratch(&self) -> EvalScratch {
-        let n = self.own_slot_width() + self.max_recurrence_states;
+        let n = self.own_slot_width() + self.max_recurrence_slots;
         EvalScratch {
             slots: vec![0.0; n],
             branch_slots: vec![0.0; n],
             recurrence_next: vec![0.0; self.max_recurrence_states],
+            recurrence_saved: vec![0.0; self.max_recurrence_states],
             base_bucket_raw: vec![0.0; self.n_buckets],
             branch_bucket_raw: vec![0.0; self.n_buckets],
             objectives: vec![0.0; self.objective_stages.len()],
@@ -844,7 +994,7 @@ impl Plan {
         scratch: &mut EvalScratch,
         mut trace: Option<&mut Explanation>,
     ) -> Result<(), PlanError> {
-        let n = self.own_slot_width() + self.max_recurrence_states;
+        let n = self.own_slot_width() + self.max_recurrence_slots;
         debug_assert_eq!(scratch.slots.len(), n, "scratch must come from this plan");
         debug_assert_eq!(
             scratch.branch_slots.len(),
@@ -853,6 +1003,11 @@ impl Plan {
         );
         debug_assert_eq!(
             scratch.recurrence_next.len(),
+            self.max_recurrence_states,
+            "scratch must come from this plan"
+        );
+        debug_assert_eq!(
+            scratch.recurrence_saved.len(),
             self.max_recurrence_states,
             "scratch must come from this plan"
         );
@@ -1043,6 +1198,7 @@ impl Plan {
                         recurrence,
                         &mut scratch.slots,
                         &mut scratch.recurrence_next,
+                        &mut scratch.recurrence_saved,
                     )?;
                     continue;
                 }
@@ -1310,18 +1466,25 @@ impl Plan {
         }
     }
 
-    /// Evaluate one configured bounded state recurrence. Initializers and all
-    /// `next` programs are compiled once. Every transition is simultaneous:
-    /// all next values read the same previous state, land in `next_state`,
-    /// and are copied into the local slots only after every value is finite.
+    /// Evaluate one configured bounded state recurrence. Initializers, locals,
+    /// and all `next` programs are compiled once. Each transition evaluates
+    /// the ordered locals into their slots, then every next value into
+    /// `next_state` against the same previous state; the state is replaced
+    /// only after every value is finite.
+    ///
+    /// With a batch symbol, transitions follow the galloping schedule
+    /// documented on [`crate::gamedef::RecurrenceBatchDef`]: a candidate
+    /// whose state is terminal is rolled back from `saved` unless its batch
+    /// size is 1. Every candidate counts against `max_iterations`.
     fn eval_recurrence(
         stage_name: &str,
         recurrence: &CompiledRecurrence,
         slots: &mut [f64],
         next_state: &mut [f64],
+        saved: &mut [f64],
     ) -> Result<f64, PlanError> {
         let state_len = recurrence.state_names.len();
-        debug_assert!(next_state.len() >= state_len);
+        debug_assert!(next_state.len() >= state_len && saved.len() >= state_len);
         let state_range = recurrence.state_slot_base..recurrence.state_slot_base + state_len;
 
         for (index, ((name, initial), slot)) in recurrence
@@ -1340,6 +1503,9 @@ impl Plan {
             debug_assert_eq!(index, slot - recurrence.state_slot_base);
         }
 
+        // Galloping schedule; inert (size stays 1) without a batch symbol.
+        let mut size: u32 = 1;
+        let mut growing = true;
         for iteration in 0..=recurrence.max_iterations {
             let terminal = recurrence.until.eval_finite(slots).map_err(|terminal| PlanError {
                     what: format!(
@@ -1364,6 +1530,22 @@ impl Plan {
             }
 
             let next_iteration = iteration + 1;
+            if let Some((batch_slot, _)) = recurrence.batch {
+                slots[batch_slot] = f64::from(size);
+            }
+            for (index, (name, local)) in recurrence
+                .local_names
+                .iter()
+                .zip(&recurrence.locals)
+                .enumerate()
+            {
+                let value = local.eval_finite(slots).map_err(|value| PlanError {
+                        what: format!(
+                            "recurrence stage `{stage_name}` local `{name}` is non-finite at iteration {next_iteration}: {value}"
+                        ),
+                    })?;
+                slots[recurrence.local_slot_base + index] = value;
+            }
             for (index, (name, next)) in recurrence
                 .state_names
                 .iter()
@@ -1377,7 +1559,32 @@ impl Plan {
                     })?;
                 next_state[index] = value;
             }
+
+            let Some((_, max_size)) = recurrence.batch else {
+                slots[state_range.clone()].copy_from_slice(&next_state[..state_len]);
+                continue;
+            };
+            saved[..state_len].copy_from_slice(&slots[state_range.clone()]);
             slots[state_range.clone()].copy_from_slice(&next_state[..state_len]);
+            let accepted = size == 1
+                || {
+                    let candidate_terminal =
+                    recurrence.until.eval_finite(slots).map_err(|terminal| PlanError {
+                        what: format!(
+                            "recurrence stage `{stage_name}` terminal predicate is non-finite at iteration {next_iteration}: {terminal}"
+                        ),
+                    })?;
+                    candidate_terminal == 0.0
+                };
+            if !accepted {
+                slots[state_range.clone()].copy_from_slice(&saved[..state_len]);
+            }
+            if growing && accepted {
+                size = size.saturating_mul(2).min(max_size);
+            } else {
+                growing = false;
+                size = (size / 2).max(1);
+            }
         }
 
         unreachable!("bounded recurrence loop always returns")

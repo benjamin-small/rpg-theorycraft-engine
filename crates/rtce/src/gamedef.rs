@@ -224,15 +224,79 @@ pub struct RecurrenceStageDef {
 #[derive(Debug, Clone, Serialize)]
 pub struct RecurrenceDef {
     /// Named local state slots. Initializers read ordinary stage symbols;
-    /// every `next` expression reads the complete previous state.
+    /// every `next` expression reads the complete previous state, every
+    /// [`locals`](Self::locals) value of the same transition, and the
+    /// [`batch`](Self::batch) symbol when one is declared.
     pub state: Vec<RecurrenceStateDef>,
+    /// Ordered per-transition intermediate values. **Default: empty** (and
+    /// omitted on serialization, so existing JSON round-trips unchanged).
+    /// **Evaluation instant:** once per transition, in declaration order,
+    /// after `until` has been checked false and before any `next`.
+    /// **Interactions:** a local reads stage symbols, the previous state, the
+    /// batch symbol, and locals declared EARLIER; `next` reads all of them;
+    /// `until` and `result` never read locals. Locals do not persist across
+    /// transitions — state slots do that.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locals: Vec<RecurrenceLocalDef>,
+    /// Engine-driven batched transitions. **Default: `None`** (omitted on
+    /// serialization): every transition is one logical step and the batch
+    /// symbol is not in scope. See [`RecurrenceBatchDef`] for the galloping
+    /// schedule and the contract a batched `next` must meet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<RecurrenceBatchDef>,
     /// Numeric terminal predicate. Zero continues; non-zero terminates.
+    /// Reads state and stage symbols only. **With `batch`:** must be
+    /// monotone — once a logical step is terminal, every later one is too.
     pub until: String,
-    /// Value returned by the stage once `until` is non-zero.
+    /// Value returned by the stage once `until` is non-zero. Reads state and
+    /// stage symbols only.
     pub result: String,
-    /// Hard transition budget for one evaluation.
+    /// Hard transition budget for one evaluation. **With `batch`:** every
+    /// candidate transition counts, accepted or rolled back.
     pub max_iterations: u32,
 }
+
+/// One ordered per-transition local in a recurrence stage.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecurrenceLocalDef {
+    /// Recurrence-local plain identifier, collision-checked against state,
+    /// the batch symbol, other locals, and every declared or engine name.
+    pub name: String,
+    /// Expression over stage symbols, the previous state, the batch symbol,
+    /// and earlier locals. Evaluated once per transition.
+    pub expr: String,
+}
+
+/// Batched (galloping) transitions for a recurrence stage.
+///
+/// The config writes each transition as `n` logical steps, reading `n`
+/// through [`symbol`](Self::symbol); the engine chooses `n`:
+///
+/// 1. **Growth:** starting at 1, a candidate whose state is still
+///    non-terminal is accepted and `n` doubles (capped at `max_size`); the
+///    first terminal candidate is rolled back and growth ends.
+/// 2. **Descent:** `n` halves after every candidate. A candidate is accepted
+///    only if its state is non-terminal, except at `n = 1`, which is always
+///    accepted — so the terminal state is reached by a single logical step,
+///    exactly as unbatched stepping reaches it.
+///
+/// The batched result equals unbatched stepping when (a) a transition with
+/// `n = k` produces the state `k` single steps would and (b) `until` is
+/// monotone. Neither is checked; an approximate batched `next` gives a
+/// correspondingly approximate result.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecurrenceBatchDef {
+    /// Plain identifier bound to the current transition's logical step
+    /// count. Visible to locals and `next`; never to initializers, `until`,
+    /// or `result`. Collision-checked like a local.
+    pub symbol: String,
+    /// Largest batch the engine will try. **Default: 1,048,576** (2^20);
+    /// must be in `1..=2^30`. `1` is plain single stepping.
+    pub max_size: u32,
+}
+
+/// Default [`RecurrenceBatchDef::max_size`].
+pub const DEFAULT_RECURRENCE_BATCH_MAX_SIZE: u32 = 1 << 20;
 
 /// One local state slot in a recurrence stage.
 #[derive(Debug, Clone, Serialize)]
@@ -420,13 +484,24 @@ impl<'de> Deserialize<'de> for RecurrenceDef {
             result: Option<String>,
             #[serde(default)]
             max_iterations: Option<u32>,
+            #[serde(default)]
+            locals: Vec<RecurrenceLocalDef>,
+            #[serde(default)]
+            batch: Option<RecurrenceBatchDef>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
         let r = Repr::deserialize(d)?;
         crate::config_keys::reject_unknown(
             "a recurrence definition",
-            &["state", "until", "result", "max_iterations"],
+            &[
+                "state",
+                "locals",
+                "batch",
+                "until",
+                "result",
+                "max_iterations",
+            ],
             &r.extra,
         )
         .map_err(serde::de::Error::custom)?;
@@ -434,6 +509,8 @@ impl<'de> Deserialize<'de> for RecurrenceDef {
             state: r
                 .state
                 .ok_or_else(|| serde::de::Error::missing_field("state"))?,
+            locals: r.locals,
+            batch: r.batch,
             until: r
                 .until
                 .ok_or_else(|| serde::de::Error::missing_field("until"))?,
@@ -443,6 +520,61 @@ impl<'de> Deserialize<'de> for RecurrenceDef {
             max_iterations: r
                 .max_iterations
                 .ok_or_else(|| serde::de::Error::missing_field("max_iterations"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RecurrenceLocalDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            expr: Option<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown(
+            &format!(
+                "recurrence local `{}`",
+                r.name.as_deref().unwrap_or("<unnamed>")
+            ),
+            &["name", "expr"],
+            &r.extra,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(RecurrenceLocalDef {
+            name: r
+                .name
+                .ok_or_else(|| serde::de::Error::missing_field("name"))?,
+            expr: r
+                .expr
+                .ok_or_else(|| serde::de::Error::missing_field("expr"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RecurrenceBatchDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            symbol: Option<String>,
+            #[serde(default)]
+            max_size: Option<u32>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let r = Repr::deserialize(d)?;
+        crate::config_keys::reject_unknown("a recurrence batch", &["symbol", "max_size"], &r.extra)
+            .map_err(serde::de::Error::custom)?;
+        Ok(RecurrenceBatchDef {
+            symbol: r
+                .symbol
+                .ok_or_else(|| serde::de::Error::missing_field("symbol"))?,
+            max_size: r.max_size.unwrap_or(DEFAULT_RECURRENCE_BATCH_MAX_SIZE),
         })
     }
 }
