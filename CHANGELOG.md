@@ -7,6 +7,34 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Upgrade notes
+- Recurrence JSON without `locals` or `batch` is unchanged and still
+  serializes byte-identically (both are omitted when absent).
+- Rust callers that build `RecurrenceDef` with a struct literal must add
+  `locals: Vec::new(), batch: None`.
+
+### Added
+- **Ordered step locals for recurrence stages** (#29). An optional
+  `locals` list of `{ name, expr }` is evaluated once per transition, in
+  declaration order, after `until` and before any `next`. A local reads
+  stage symbols, the previous state, the batch symbol and earlier locals;
+  `next` reads all of them. `until` and `result` never do. A sequential
+  per-transition cascade (take from one pool, pass the remainder to the
+  next) now needs no phase counter or inlined duplication. Forward and self
+  references, collisions and non-finite values fail with positioned
+  errors; at most `plan::MAX_RECURRENCE_LOCALS` (256) per stage.
+- **Batched galloping transitions for recurrence stages** (#30). An
+  optional `batch: { symbol, max_size }` binds `symbol` to the number of
+  logical steps the current transition represents. The engine chooses it:
+  sizes double while candidates stay non-terminal (up to `max_size`,
+  default 2^20, at most 2^30), then halve, and a terminal candidate is
+  rolled back unless its size is 1. The terminal state is therefore reached
+  by a single step, as it would be without batching. Every candidate counts
+  against `max_iterations`. Draining a pool of 1,000,000 by 3 per step
+  (333,334 logical steps) takes exactly 37 transitions, and results are
+  bit-identical to single stepping whenever the batched `next` is exact
+  and `until` is monotone.
+
 ### Changed
 - The browser tutorial uses `@benjamin-small/browser-terminal` 0.5.0. It
   opts out of 0.5.0's default OPFS `/scratch` filesystem

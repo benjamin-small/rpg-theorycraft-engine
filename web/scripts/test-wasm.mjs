@@ -30,8 +30,40 @@ const gamedef = JSON.stringify({
       result: "hits - overkill / 3",
       max_iterations: 10,
     },
+  }, {
+    name: "cascade",
+    recurrence: {
+      state: [
+        { name: "a", initial: "12", next: "a - take_a" },
+        { name: "b", initial: "7", next: "b - take_b" },
+        { name: "steps", initial: "0", next: "steps + 1" },
+        { name: "overkill", initial: "0", next: "rest - take_b" },
+      ],
+      locals: [
+        { name: "take_a", expr: "min(5, a)" },
+        { name: "rest", expr: "5 - take_a" },
+        { name: "take_b", expr: "min(rest, b)" },
+      ],
+      until: "b <= 0",
+      result: "steps - overkill / 5",
+      max_iterations: 10,
+    },
+  }, {
+    name: "batched_drain",
+    recurrence: {
+      state: [
+        { name: "remaining", initial: "1000000", next: "max(remaining - spent, 0)" },
+        { name: "steps", initial: "0", next: "steps + n" },
+        { name: "overkill", initial: "0", next: "max(spent - remaining, 0)" },
+      ],
+      locals: [{ name: "spent", expr: "3 * n" }],
+      batch: { symbol: "n" },
+      until: "remaining <= 0",
+      result: "steps - overkill / 3",
+      max_iterations: 37,
+    },
   }],
-  objectives: ["root", "fractional_hits"],
+  objectives: ["root", "fractional_hits", "cascade", "batched_drain"],
 });
 const scenario = JSON.stringify({ phases: [{ name: "dummy", weight: 1 }] });
 
@@ -46,6 +78,13 @@ const fractionalHits = JSON.parse(first).objectives.fractional_hits;
 assert.ok(
   Math.abs(fractionalHits - 10 / 3) <= 1e-12,
   `Wasm recurrence missed fractional final hit: ${fractionalHits}`,
+);
+
+const { cascade, batched_drain: batchedDrain } = JSON.parse(first).objectives;
+assert.ok(Math.abs(cascade - 3.8) <= 1e-12, `Wasm recurrence locals mismatch: ${cascade}`);
+assert.ok(
+  Math.abs(batchedDrain - 1_000_000 / 3) <= 1e-6,
+  `Wasm batched recurrence mismatch: ${batchedDrain}`,
 );
 
 const fixture = (name) => readFileSync(
@@ -67,4 +106,4 @@ for (const [build, expectedEhp, expectedBlock] of pobCases) {
   );
 }
 
-console.log(`Wasm bounded solve passed: ${root}; recurrence passed: ${fractionalHits}`);
+console.log(`Wasm bounded solve passed: ${root}; recurrence passed: ${fractionalHits}; locals: ${cascade}; batched: ${batchedDrain}`);

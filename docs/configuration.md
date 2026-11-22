@@ -185,6 +185,81 @@ error names the stage, state when applicable, and iteration. Recurrence stages
 are not event-branched, while existing expression and solve JSON remains
 unchanged.
 
+### Ordered step locals
+
+A transition that is naturally a *sequence* (take an amount from one pool,
+then hand the remainder to the next) declares `locals`:
+
+```json
+"recurrence": {
+  "state": [
+    { "name": "a", "initial": "12", "next": "a - take_a" },
+    { "name": "b", "initial": "7", "next": "b - take_b" },
+    { "name": "steps", "initial": "0", "next": "steps + 1" },
+    { "name": "overkill", "initial": "0", "next": "rest - take_b" }
+  ],
+  "locals": [
+    { "name": "take_a", "expr": "min(5, a)" },
+    { "name": "rest", "expr": "5 - take_a" },
+    { "name": "take_b", "expr": "min(rest, b)" }
+  ],
+  "until": "b <= 0",
+  "result": "steps - overkill / 5",
+  "max_iterations": 10
+}
+```
+
+The result is `3.8`. Each transition evaluates the locals **in declaration
+order**, after `until` has been checked false and before any `next`. A local
+reads stage symbols, the previous state, and locals declared earlier; every
+`next` reads all of them. State updates remain simultaneous. `until` and
+`result` read state only, so a reference to a local there, or to a later
+local or itself inside a local, is a compile error. Locals do not persist
+across transitions, and a stage may declare at most 256. `locals` defaults
+to empty and is omitted on serialization.
+
+### Batched (galloping) transitions
+
+When a long run of uniform steps can be written as `n` steps at once,
+declare `batch` and let the engine choose `n`:
+
+```json
+"recurrence": {
+  "state": [
+    { "name": "remaining", "initial": "1000000", "next": "max(remaining - spent, 0)" },
+    { "name": "steps", "initial": "0", "next": "steps + n" },
+    { "name": "overkill", "initial": "0", "next": "max(spent - remaining, 0)" }
+  ],
+  "locals": [{ "name": "spent", "expr": "3 * n" }],
+  "batch": { "symbol": "n" },
+  "until": "remaining <= 0",
+  "result": "steps - overkill / 3",
+  "max_iterations": 37
+}
+```
+
+`symbol` names the current transition's logical step count. Locals and
+`next` can read it; initializers, `until` and `result` cannot. The schedule:
+
+1. **Growth.** Start at 1. A candidate whose state is still non-terminal is
+   accepted, and the size doubles, capped at `max_size` (default 1,048,576,
+   allowed `1..=2^30`). The first terminal candidate is rolled back, and
+   growth ends.
+2. **Descent.** The size halves after every candidate. A candidate is
+   accepted only if it is non-terminal, except at size 1, which is always
+   accepted. The terminal state is therefore reached by one logical step,
+   exactly as without batching.
+
+Every candidate, accepted or rolled back, counts against `max_iterations`.
+The example takes 333,334 logical steps in exactly 37 transitions; 36 is
+not enough. The result equals single stepping bit for bit when:
+- (a) a transition with `n = k` produces the state `k` single steps would;
+- (b) `until` is monotone: once a step is terminal, all later ones are too.
+
+Neither condition is checked, and an approximate batched `next` gives a
+correspondingly approximate answer. `max_size: 1` is plain single stepping.
+Without `batch`, every transition is one step and `n` is not in scope.
+
 The complete delayed-life-loss EHP reproduction from issue #22 lives in
 [`issue22-recurrence-gamedef.json`](../crates/rtce/tests/fixtures/poe2/issue22-recurrence-gamedef.json).
 It keeps the pool names and rules in configuration and uses the normal native,

@@ -119,6 +119,11 @@
   `sqrt`/fractional `pow`, deterministic scalar solves, and bounded state
   recurrences keep nonlinear maximum-hit and repeated-hit EHP mechanics in
   portable GameDef configuration.
+- **Sequential and long-running recurrences, DONE (Unreleased).** Ordered
+  step locals (#29) express per-transition cascades directly, and batched
+  galloping transitions (#30) reach long uniform runs in about
+  2·log2(N) transitions (333,334 steps in 37), bit-identical to single
+  stepping under the documented exactness and monotonicity contract.
 
 - [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
       the registry (`cargo search` confirms), alongside `rtce-testkit`
