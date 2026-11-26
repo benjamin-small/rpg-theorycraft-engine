@@ -452,14 +452,15 @@ pub enum ProcRolls {
 ///
 /// | Field | World |
 /// |---|---|
-/// | [`ActionDef::cast_time`], [`ActionDef::cooldown`], [`ActionDef::cost`], [`ActionDef::gain`], [`SegmentDef::duration`] | the effective build WITH the action's (segment's) `damage.stats` overlay, built at THAT field's instant |
-/// | the same fields on a utility action (no `damage`), and a segmented action's action-level fields | the plain effective build |
+/// | [`ActionDef::cast_time`], [`ActionDef::cooldown`], [`ActionDef::cost`], [`ActionDef::gain`], [`SegmentDef::duration`] | the effective build WITH the action's (segment's) `damage.stats` overlay, built at THAT field's instant (`gain`, `cost`, `cooldown`, `cast_time` here mean an UNSEGMENTED damaging action; a segmented action's are action-level, see the next row) |
+/// | the same fields on a utility action (no `damage`), and ALL of a segmented action's action-level fields (`cooldown`, `cost`, `gain`) | the plain effective build |
 /// | [`BuffDef::duration`], proc `chance`, rule `when` | the plain effective build |
 ///
 /// The overlay is built at the field's instant, NOT at the measure
 /// instant: `gain`'s overlay (cast complete) sees `casts.<self>` one lower
-/// than the measured overlay did; the `cost`/`cooldown`/`cast_time`
-/// overlay sees pre-payment resources; and a non-finite `damage.stats`
+/// than the measured overlay did; the `cost`/`cooldown` overlay sees
+/// pre-payment resources, while `cast_time`'s overlay sees post-payment
+/// ones (cost paid, cooldown armed); and a non-finite `damage.stats`
 /// value can therefore fail closed "at a rotation decision" or "at cast
 /// start". Every world includes the effective phase. A buff applied later
 /// changes the NEXT read. Pinned: an objective-driven `cast_time` casts 10

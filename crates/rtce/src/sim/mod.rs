@@ -49,8 +49,9 @@
 //!   `damage.stats` overlay, built AT THE READING FIELD'S INSTANT and not
 //!   at the action's measure instant (so `gain`'s overlay, built at cast
 //!   complete, sees `casts.<self>` one lower than the measured overlay
-//!   did; a `cost`/`cooldown`/`cast_time` overlay is built at cast start
-//!   or the decision, on pre-payment resources; and a non-finite
+//!   did; a `cost`/`cooldown` overlay is built at cast start or the
+//!   decision, on pre-payment resources, while `cast_time`'s overlay is
+//!   built after payment (cost paid, cooldown armed); and a non-finite
 //!   `damage.stats` value can fail closed "at a rotation decision" or "at
 //!   cast start", not only at the measure instant). A utility action
 //!   (no `damage`) and a segmented action's action-level fields use the
@@ -323,8 +324,9 @@
 //! marks where the sim segment begins, [`compile::SimPlan::slot_width`]
 //! its total width (ending with the objective region, which starts at
 //! [`compile::SimPlan::objective_base`]). The sim segment itself is laid
-//! out in EXACTLY this order, each named sub-range sorted by name (`SimDef`'s registries are
-//! `BTreeMap`s, which already iterate sorted):
+//! out in EXACTLY this order, each named sub-range sorted by name
+//! (`SimDef`'s registries are `BTreeMap`s, which already iterate
+//! sorted):
 //!
 //! ```text
 //! [ time, duration, resources…, cooldown.<action>…, buff.<buff>…,

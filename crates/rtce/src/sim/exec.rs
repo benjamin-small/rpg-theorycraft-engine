@@ -2356,7 +2356,8 @@ impl<'a> Sim<'a> {
     ///   fill, plus the overlay map's per-stat key clones), evaluated at
     ///   THIS field's instant, not the measure instant (so `gain` sees
     ///   `casts.<self>` one lower than the measured overlay, and a
-    ///   cost/cooldown overlay sees pre-payment resources);
+    ///   cost/cooldown overlay sees pre-payment resources, `cast_time`'s
+    ///   post-payment ones);
     ///   a part with no `damage` (a utility action, a segmented action's
     ///   action-level fields, a wind-up segment) falls back to the plain
     ///   build. `instant` names the position for that overlay's
