@@ -14,6 +14,14 @@
 //!
 //! - `time`, `duration` — reserved words; the current sim clock and the
 //!   scenario's total duration in seconds.
+//! - `segments_done`, `segments_remain` — reserved words describing the
+//!   in-flight ROTATION cast: while a SEGMENTED cast
+//!   ([`crate::simdef::ActionDef::segments`]) is in flight, the segments
+//!   landed so far (counting the landing being measured) and the
+//!   segments still to land; `0` when none is in flight (so for an
+//!   unsegmented rotation cast and at every rotation decision). A
+//!   proc-fired free cast at one of a segmented cast's landings reads
+//!   that cast's values.
 //! - each resource, by its bare name — the resource's current amount.
 //! - `cooldown.<action>` — seconds remaining before `<action>` is off
 //!   cooldown (`0` = ready).
@@ -65,23 +73,37 @@
 //! compile error, the same as any other unresolved name. Resource/action/
 //! buff names join the SAME flat namespace as stats/conditions: a name
 //! colliding with an existing stat or condition, or reusing the reserved
-//! `time`/`duration` words, is a compile error rather than a silent
-//! shadow.
+//! `time`/`duration`/`segments_done`/`segments_remain` words, is a
+//! compile error rather than a silent shadow.
 //!
 //! # The cast-complete order
 //!
-//! A completing cast resolves several effects at ONE instant, and their
-//! order is observable — a `damage.stats` expression, a proc `chance`,
-//! and a snapshot capture can each read state an earlier step wrote. It
-//! is therefore fixed, and this is the canonical statement of it (every
+//! A landing — an unsegmented cast's completion, or one segment of a
+//! segmented cast ([`crate::simdef::ActionDef::segments`]) — resolves
+//! several effects at ONE instant, and their order is observable — a
+//! `damage.stats` expression, a proc `chance`, and a snapshot capture
+//! can each read state an earlier step wrote. It is therefore fixed, and this is the canonical statement of it (every
 //! other mention in this crate links here):
 //!
 //! ```text
-//! apply `gain`  →  casts.<action> += 1
-//!   →  measure the cast's WORLD*, evaluate its damage, credit the hit
-//!   →  the action's effects (apply_buff entries), in list order
-//!   →  proc rolls: on_cast, then on_hit, then on_crit, then on_non_crit
+//! [last landing]   apply `gain`
+//! [first landing]  casts.<action> += 1
+//! [segmented]      segments_done += 1
+//!   →  measure the landing's WORLD*, evaluate its damage, credit the hit
+//!   →  [last landing] end the cast (mid_cast = false)
+//!   →  this segment's effects (apply_buff entries), in list order
+//!   →  [last landing, segmented] the action's effects, in list order
+//!   →  proc rolls: [first landing] on_cast, then this landing's on_hit,
+//!      on_crit, on_non_crit
+//!   →  [last landing] segments_done and segments_remain reset to 0
+//!   →  [non-last segment] start the NEXT segment: evaluate its duration,
+//!      capture its cast_start snapshot if it measures there, schedule
+//!      its landing
 //! ```
+//!
+//! An unsegmented action is the one-landing case (first == last, no
+//! `segments_done` step), and its order is exactly the pre-segments one:
+//! `gain` → `casts` → measure and credit → `effects` → proc rolls.
 //!
 //! *Under the default `measure: "cast_complete"`. An action measured at
 //! `cast_start` ([`crate::simdef::Measure`], P8c) captured its world —
@@ -271,7 +293,8 @@
 //!
 //! ```text
 //! [ time, duration, resources…, cooldown.<action>…, buff.<buff>…,
-//!   buff_remaining.<buff>…, casts.<action>…, stacks.<buff>… ]
+//!   buff_remaining.<buff>…, casts.<action>…, stacks.<buff>…,
+//!   segments_done, segments_remain ]
 //! ```
 
 mod compile;
@@ -279,7 +302,7 @@ mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
-    CompiledRule, CompiledTick, CompiledValue, SimPlan,
+    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan,
 };
 pub use exec::{run, Mode};
 pub use report::{

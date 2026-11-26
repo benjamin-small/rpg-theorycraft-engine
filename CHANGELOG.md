@@ -8,6 +8,17 @@ until then, per semver's "anything goes" pre-1.0 clause).
 ## [Unreleased]
 
 ### Upgrade notes
+- **`ActionDef::cast_time` is now `Option<String>`** (#33 slice 4).
+  JSON is unchanged for every config that names it; Rust struct literals
+  change `cast_time: "1".into()` to `cast_time: Some("1".into())`. An
+  action naming neither `cast_time` nor `segments` is a compile error.
+  `CompiledAction::cast_time` is `Option<Program>` (`None` when
+  segmented).
+- **New reserved words `segments_done` and `segments_remain`.** A
+  stat, condition, resource, action or buff already using either name now
+  fails to compile ("reserved"); rename it.
+- `Trigger::OnCast` rolls at the cast's first landing (completion for an
+  unsegmented action), as it always did; the rustdoc said "cast begun".
 - `Trigger` gained a variant (`OnNonCrit`): an exhaustive downstream
   `match` on it needs an arm. JSON and every existing config are
   unchanged.
@@ -29,6 +40,21 @@ until then, per semver's "anything goes" pre-1.0 clause).
   pipeline once per hit (up to 10 000 per cast), allocation-free.
 
 ### Added
+- **Segmented actions** (`ActionDef::segments`, `SegmentDef`) — a
+  multi-landing cast (channel, combo string, wind-up then slam) with a
+  per-segment `duration`, `damage`, `effects` and `measure`
+  (`segment ?? action ?? defaults`) (#33 slice 4). Action `gain` and
+  `effects` run at the last landing; `on_cast` rolls at the first;
+  hit-trigger procs roll per damaging segment; `crit_rolls` applies to
+  each segment's own hits; an instant segment lands synchronously
+  (and an all-instant action hits the livelock guard). Cost: one overlay
+  world per damaging or effect-bearing landing instead of per cast (a
+  wind-up last segment builds one when the action has effects).
+- **`segments_done` / `segments_remain`** sim symbols — they describe the
+  in-flight ROTATION cast: segments landed (counting the one being
+  measured) and still to land during a segmented cast, `0` when none is
+  in flight (so at every rotation decision). A proc-fired free cast at
+  one of its landings reads that cast's values.
 - **`ActionDef::crit_rolls`** (`per_cast` | `per_hit`, default inherits
   `defaults.proc_rolls`) — how an action's hits are sampled for crit; a
   `per_cast` `on_crit` proc gates on any hit, EV weight `1 - (1 - p)^n`

@@ -179,6 +179,15 @@ impl SimDefaults {
 ///   [`EventOrder`]'s question — its zero-weight-phase flip moves both
 ///   measurement and attribution together, because it reorders the
 ///   events themselves.)
+/// - **Segments** ([`ActionDef::segments`]): the instant is read PER
+///   SEGMENT, resolved `segment.measure ?? action.measure ??
+///   defaults.measure`. `cast_complete` measures at THAT segment's
+///   landing (post-`casts` increment, post-`segments_done` increment);
+///   `cast_start` at THAT segment's start — the previous landing's
+///   instant (cast start for segment 0), after the previous landing's
+///   effects and proc rolls, so a buff the previous segment applied is
+///   in its world. An instant segment (`duration` `0`) follows the
+///   instant-cast rule below.
 /// - **Instant casts** (`cast_time` `0`): an instant cast is ALWAYS
 ///   measured at the completion position, whatever `measure` says. Cast
 ///   start and cast complete share the wall-clock instant, but the
@@ -282,9 +291,10 @@ pub enum EventOrder {
     /// scheduled, first processed. The 0.3.0 behavior, and the default.
     #[default]
     Scheduled,
-    /// Every `CastComplete` outranks every coincident buff expiry,
-    /// phase boundary, and rotation wake; within a class, scheduling
-    /// order still decides.
+    /// Every `CastComplete` — and every segment landing of a segmented
+    /// cast ([`ActionDef::segments`]), which ranks with it — outranks
+    /// every coincident buff expiry, phase boundary, and rotation wake;
+    /// within a class, scheduling order still decides.
     CompletionsFirst,
 }
 
@@ -301,7 +311,11 @@ pub enum EventOrder {
 ///
 /// - [`PerCast`](ProcRolls::PerCast) (default): one roll per damaging
 ///   cast, `hits_per_use`-blind — a 5-hit cast presents the same single
-///   qualifying roll a 1-hit cast does.
+///   qualifying roll a 1-hit cast does. For a SEGMENTED action
+///   ([`ActionDef::segments`]) "per cast" reads per DAMAGING SEGMENT:
+///   each damaging landing is one qualifying event, a wind-up segment
+///   (no `damage`) presents none, and `per_hit` counts each segment's
+///   own measured hits.
 /// - [`PerHit`](ProcRolls::PerHit): one roll per HIT, where the hit
 ///   count is the cast's measured `hits_per_use` (from the cast's world
 ///   snapshot — the [`Measure`] instant, the same value its damage is
@@ -325,8 +339,8 @@ pub enum EventOrder {
 /// [`Trigger::OnCrit`], [`Trigger::OnNonCrit`]) — the ones whose event
 /// today approximates "the cast's hits" as a single roll. An
 /// [`Trigger::OnCast`] proc's event is the CAST itself, so it rolls once
-/// per cast under either setting, whatever `rolls` says (the
-/// [`Measure`]-on-instant-casts precedent: documented behavior, not an
+/// per cast (at its first landing) under either setting, whatever
+/// `rolls` says (the [`Measure`]-on-instant-casts precedent: documented behavior, not an
 /// error — a utility cast has no hits at all, so there is nothing for
 /// `per_hit` to count there). Unchanged rules: a utility cast (no damage)
 /// presents no `on_hit`/`on_crit`/`on_non_crit` roll under either policy,
@@ -422,7 +436,8 @@ pub enum ProcRolls {
 /// | [`BuffDef::duration`] | at application (snapshotted onto that window) |
 /// | [`ActionDef::cooldown`] | at cast start |
 /// | [`ActionDef::cost`] values | at cast start — and at every decision that merely CHECKS affordability |
-/// | [`ActionDef::gain`] values | at cast complete |
+/// | [`ActionDef::gain`] values | at cast complete (the last landing of a segmented action) |
+/// | [`SegmentDef::duration`] | at the segment's start (the previous landing, or cast start for segment 0) |
 /// | [`ActionDamage::stats`] values | at the action's MEASURED instant — cast complete by default, cast start under [`Measure::CastStart`] |
 ///
 /// A cost expression is therefore RE-CHECKED at each decision point, never
@@ -560,7 +575,27 @@ impl ResourceDef {
 pub struct ActionDef {
     /// Expression (over stats/conditions/sim-state; never pipeline
     /// stages/buckets) for the cast time in seconds. `"0"` = instant.
-    pub cast_time: String,
+    ///
+    /// # Default
+    ///
+    /// ABSENT (`None`) is valid ONLY for a segmented action, whose cast
+    /// time is the sum of its [`ActionDef::segments`] durations. An
+    /// action naming neither this field nor `segments` is a compile
+    /// error, as is one naming both (the cast time would be stated
+    /// twice).
+    ///
+    /// # Evaluation instant
+    ///
+    /// AT CAST START, after the cost is paid and the cooldown armed;
+    /// must be finite and `>= 0`.
+    ///
+    /// # Interactions
+    ///
+    /// Mutually exclusive with [`ActionDef::segments`], as above. Rust
+    /// callers migrating from the pre-segments `String` write
+    /// `cast_time: Some("1".into())`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_time: Option<String>,
     /// Cooldown in seconds, starting when the cast begins (`0.0` = none).
     /// Literal or expression; an expression is evaluated AT CAST START
     /// (before the cost is deducted) and must be finite and `>= 0` —
@@ -765,6 +800,21 @@ pub struct ActionDef {
     /// ambient world at the fire, with no action's overlay on it —
     /// sequential across the proc's own effects list (the P8b rule).
     ///
+    /// # Segmented actions
+    ///
+    /// On a SEGMENTED action ([`ActionDef::segments`]) this list runs once,
+    /// at the LAST landing, after that segment's own
+    /// [`SegmentDef::effects`], and reads the ONE world that last landing
+    /// measured — never an earlier segment's, and never a world of its
+    /// own. That is: the last segment's [`ActionDamage::stats`] overlay if
+    /// it deals damage; the plain effective build and phase if it is a
+    /// wind-up (no damage); and, if it measures at `cast_start`, the world
+    /// captured at THAT segment's start rather than at its landing. So a
+    /// snapshot `tick_objective` applied here inherits the final hit's
+    /// magnitude, exactly as it would from an unsegmented action's one
+    /// hit; pinned by
+    /// `action_effects_on_a_segmented_action_capture_the_last_segments_world`.
+    ///
     /// # Elsewhere
     ///
     /// Run by a proc-triggered FREE cast of this action (a `cast_action`
@@ -778,6 +828,61 @@ pub struct ActionDef {
     /// another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectDef>,
+    /// The ordered segments of a MULTI-LANDING cast (a channel, a combo
+    /// string, a wind-up followed by a slam): one cast, several landings,
+    /// each with its own damage and effects. See [`SegmentDef`].
+    ///
+    /// # Default
+    ///
+    /// Empty: an ordinary single-landing action driven by
+    /// [`ActionDef::cast_time`]. A one-segment action reproduces an
+    /// unsegmented cast's landing exactly.
+    ///
+    /// # Evaluation instant
+    ///
+    /// Structure is fixed at compile time. Cost and cooldown are paid and
+    /// armed at cast START, once per cast, exactly as for an unsegmented
+    /// action. Each segment's own `duration`, damage and effects are
+    /// evaluated at the instants [`SegmentDef`] documents. The action's
+    /// own [`ActionDef::gain`] and [`ActionDef::effects`] run only when
+    /// the LAST segment lands (full completion).
+    ///
+    /// # Interactions
+    ///
+    /// - Mutually exclusive with `cast_time`, and with action-level
+    ///   `damage` (damage lives on the segments): either combination, or
+    ///   neither `cast_time` nor `segments`, is a compile error naming
+    ///   the action.
+    /// - A segmented action cannot be named by any proc's `cast_action`
+    ///   effect (free casts of segmented actions are out of scope; a
+    ///   compile error), and no segment may itself carry a `cast_action`
+    ///   effect.
+    /// - [`ActionDef::measure`] is the per-segment default; see
+    ///   [`SegmentDef::measure`].
+    /// - The reserved sim words `segments_done` / `segments_remain`
+    ///   (default `0`; evaluation instant: read live wherever a sim
+    ///   expression is evaluated). `segments_done` is incremented at each
+    ///   landing BEFORE that landing's measure, so a segment's own
+    ///   `damage.stats` sees itself counted (`1` at segment 0);
+    ///   `segments_remain` is the segments not yet landed (`n -
+    ///   segments_done`). At the last landing they read `n` / `0`
+    ///   through the WHOLE landing transaction (measure, effects, proc
+    ///   rolls) and reset to `0` only after its proc rolls. They describe
+    ///   the in-flight ROTATION cast: `0` when none is in flight (so
+    ///   `0` for an unsegmented rotation cast and at every rotation
+    ///   decision — a `when` reading them cannot wedge the rotation). A
+    ///   proc-fired FREE cast at a landing of a segmented cast reads THAT
+    ///   cast's values (like a proc `chance` at that instant), whatever
+    ///   the free cast's own action is.
+    /// - COST: an overlay world — an overlay `BuildState` clone plus its
+    ///   phase clone — is built once per DAMAGING or effect-bearing
+    ///   LANDING (or start, under `cast_start`) rather than once per
+    ///   cast; a wind-up last segment builds one only when the action has
+    ///   effects, and a wind-up with nothing to run builds none. That is
+    ///   the only allocation segments add to the run loop, and it is paid
+    ///   per landing, never per hit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<SegmentDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this action.
@@ -799,7 +904,125 @@ impl ActionDef {
         "apply_buff",
         "effects",
         "crit_rolls",
+        "segments",
     ];
+}
+
+/// One segment of a segmented [`ActionDef`]: a landing with its own
+/// timing, damage and effects.
+///
+/// # Landing order
+///
+/// A segment lands, at its boundary instant, in this order (a
+/// one-segment action reproduces an unsegmented cast's completion
+/// exactly): the action's `gain` (last segment only); the action's
+/// `casts.<action>` count (first segment only); `segments_done` is
+/// incremented (so this segment's own measure sees itself counted);
+/// this segment's damage, measured and credited; the cast ends (last
+/// segment only); this segment's `effects` in list order; the action's
+/// `effects` (last segment only); proc rolls (`on_cast` at the first
+/// landing only, then this segment's `on_hit`, `on_crit`,
+/// `on_non_crit`); `segments_done` and `segments_remain` reset to `0`
+/// (last segment only — so the whole transaction above read `n` / `0`);
+/// then, for any other segment, the next one starts (its `duration` is
+/// evaluated, a `cast_start` world captured, its landing scheduled).
+/// The canonical diagram is in the `sim` module docs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SegmentDef {
+    /// Seconds from the previous boundary (the cast start, for segment 0)
+    /// to this segment landing.
+    ///
+    /// # Default
+    ///
+    /// Required (no default).
+    ///
+    /// # Evaluation instant
+    ///
+    /// AT THIS SEGMENT'S START (the previous landing, or cast start for
+    /// segment 0), under the live world there; must be finite and
+    /// `>= 0`. See [`NumOrExpr`].
+    ///
+    /// # Interactions
+    ///
+    /// `0` is an instant segment: it lands synchronously at its start
+    /// instant and is measured at the landing position whatever `measure`
+    /// says (the instant-cast rule). A cast whose every segment is `0` is
+    /// an instant cast and counts against the zero-time chain limit.
+    /// A landing at exactly the horizon is drained like a completion;
+    /// segments that would land after it never land, while the damage,
+    /// effects and proc rolls of segments that did land stand.
+    pub duration: NumOrExpr,
+    /// This segment's damage effect. Same shape and `damage.stats`
+    /// rules as [`ActionDef::damage`].
+    ///
+    /// # Default
+    ///
+    /// ABSENT: a wind-up segment, with no hits and no damage.
+    ///
+    /// # Evaluation instant
+    ///
+    /// The segment's resolved [`Measure`] instant (see
+    /// [`SegmentDef::measure`]).
+    ///
+    /// # Interactions
+    ///
+    /// Mutually exclusive with action-level `damage`. With
+    /// `rolls: "per_cast"`, hit-trigger procs roll once per DAMAGING
+    /// segment; [`ActionDef::crit_rolls`] applies to each segment's own
+    /// measured hits.
+    #[serde(default)]
+    pub damage: Option<ActionDamage>,
+    /// Effects this segment executes when it lands, in list order.
+    ///
+    /// # Default
+    ///
+    /// Empty: the segment applies nothing.
+    ///
+    /// # Evaluation instant
+    ///
+    /// At this segment's landing, after its damage is credited and before
+    /// the action-level `effects` and the proc rolls.
+    ///
+    /// # Interactions
+    ///
+    /// The same rules as [`ActionDef::effects`], except that a
+    /// `cast_action` effect is a compile error here (recursion). The list
+    /// reads THIS segment's measured world; the action-level list that
+    /// follows it at the last landing reads the last segment's (see
+    /// [`ActionDef::effects`]'s "Segmented actions" section).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<EffectDef>,
+    /// Per-segment override of the measurement instant.
+    ///
+    /// # Default
+    ///
+    /// ABSENT: resolved at compile time as
+    /// `segment.measure ?? action.measure ?? defaults.measure`.
+    ///
+    /// # Evaluation instant
+    ///
+    /// `cast_complete` measures at THIS segment's landing; `cast_start`
+    /// at THIS segment's start.
+    ///
+    /// # Interactions
+    ///
+    /// An instant segment (`duration` 0) is always measured at the
+    /// landing position. See [`Measure`] for the instants' semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<Measure>,
+    /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
+    /// section: `_`-prefixed annotations survive round-trips; anything
+    /// else fails closed at `sim::compile`, naming this segment.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl SegmentDef {
+    /// The declared field names, for `sim::compile`'s unknown-key walk.
+    /// Staleness here only degrades the did-you-mean, never
+    /// correctness — see `config_keys`' module docs ("Staleness").
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] =
+        &["duration", "damage", "effects", "measure"];
 }
 
 /// Per-cast stat overrides folded onto the `Plan`'s `BuildState` before the
@@ -1264,9 +1487,13 @@ impl Default for BuffDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
-    /// Rolls once per cast begun. Always cast-shaped: a cast is one
-    /// event whatever its hit count, so [`ProcRolls`] does not change
-    /// this trigger's roll count (see [`ProcRolls`]'s scope section).
+    /// Rolls once per cast, at the cast's FIRST landing (its completion,
+    /// for an unsegmented action; segment 0's landing for a segmented
+    /// one, [`ActionDef::segments`]) — not at cast start, and a cast
+    /// cut off before its first landing never rolls it. Always
+    /// cast-shaped: a cast is one event whatever its hit count or
+    /// segment count, so [`ProcRolls`] does not change this trigger's
+    /// roll count (see [`ProcRolls`]'s scope section).
     OnCast,
     /// Rolls once per completing cast of a DAMAGING action BY DEFAULT —
     /// not once per hit — and once per MEASURED HIT under
@@ -1671,7 +1898,7 @@ mod tests {
         assert_eq!(def.resources["mana"].regen_per_sec, "mana_regen");
 
         let fireball = &def.actions["fireball"];
-        assert_eq!(fireball.cast_time, "1.0 / base_aps");
+        assert_eq!(fireball.cast_time.as_deref(), Some("1.0 / base_aps"));
         // P7b: these four positions became `NumOrExpr`. Untagged serde
         // must keep reading the spec's plain JSON NUMBERS as `Num` — this
         // is the 0.2.0 backward-compatibility contract at the parse layer
@@ -1996,9 +2223,10 @@ mod tests {
     // second spelling of its defaults to disagree with.)
     #[test]
     fn action_def_serde_defaults_and_derived_default_agree_field_for_field() {
-        let bare: ActionDef = serde_json::from_str(r#"{ "cast_time": "" }"#).unwrap();
+        let bare: ActionDef = serde_json::from_str("{}").unwrap();
         let derived = ActionDef::default();
         assert_eq!(bare.cast_time, derived.cast_time);
+        assert_eq!(bare.segments.len(), derived.segments.len());
         assert_eq!(bare.cooldown, derived.cooldown);
         assert_eq!(bare.cost, derived.cost);
         assert_eq!(bare.gain, derived.gain);

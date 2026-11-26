@@ -165,10 +165,13 @@ pub struct Totals {
 #[non_exhaustive]
 pub struct ActionReport {
     /// Number of times this action was cast (rotation-driven or
-    /// proc-driven free casts alike).
+    /// proc-driven free casts alike). A segmented cast counts at its
+    /// FIRST landing, so one cut off by the horizon after that landing
+    /// still counts.
     pub casts: u64,
     /// Damage this action's completed casts accumulated
-    /// (`damage_objective × hits`, summed).
+    /// (`damage_objective × hits`, summed). A segmented cast cut off by
+    /// the horizon contributes the segments that landed.
     pub damage: f64,
     /// `damage / total.total_damage` (`0.0` if total damage is `0.0`).
     pub share: f64,
