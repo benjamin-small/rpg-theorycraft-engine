@@ -9585,16 +9585,19 @@ mod tests {
             );
         }
 
-        // The filter is documented as applying to ALL THREE triggers, since
-        // all three are events OF a cast. Pinned for all three rather than
-        // for `on_cast` alone: a filter wired into one arm of the trigger
+        // The filter is documented as applying to every trigger, since
+        // every trigger is an event OF a cast. Pinned across the loop rather
+        // than for `on_cast` alone: a filter wired into one arm of the trigger
         // match and not the others is exactly the shape a single-trigger
         // fixture cannot see.
         //
         // `crit_plan` with `crit_chance` 100: EV's `on_crit` weight is then
         // `Plan::crit_chance` = 1.0, so an `on_crit` proc at `chance` 1 fires
-        // once per hit exactly as `on_cast`/`on_hit` do, and all three
-        // triggers share the one hand-worked 20/10 count. (`scoped_plan`
+        // once per hit exactly as `on_cast`/`on_hit` do, and those
+        // triggers share the one hand-worked 20/10 count. `OnNonCrit` is
+        // deliberately absent from the loop (crit 100 would make it fire 0
+        // times — vacuous); `the_actions_filter_applies_to_on_non_crit`
+        // covers it. (`scoped_plan`
         // could not host this: with no `crit` event at all, `Plan::crit_chance`
         // fail-softs to 0.0 and an `on_crit` proc never fires under any
         // filter — the test would pass vacuously.)

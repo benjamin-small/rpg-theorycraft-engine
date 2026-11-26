@@ -65,8 +65,8 @@ pub fn lexicon() -> Value {
         json!({ "term": "casts.<action>", "kind": "engine", "scope": "sim expressions", "meaning": "Number of completed casts of a declared action.", "example": "casts.power_shot >= 3" }),
         json!({ "term": "stacks.<buff>", "kind": "engine", "scope": "sim expressions", "meaning": "Number of live instances of a declared buff.", "example": "stacks.combo >= 3" }),
         json!({ "term": "hits_per_use", "kind": "convention", "scope": "action.damage.stats", "meaning": "Executor-handled hit count for one cast. It defaults to 1 and is not passed to the GameDef as a stat.", "example": "\"hits_per_use\": 3" }),
-        json!({ "term": "crit", "kind": "convention", "scope": "GameDef event name", "meaning": "The event name used by on_crit proc behavior. Other event names still branch damage normally.", "example": "\"event\": \"crit\"" }),
-        json!({ "term": "on_cast / on_hit / on_crit", "kind": "convention", "scope": "ProcDef.trigger", "meaning": "The three supported proc trigger values. on_crit uses the GameDef event named crit.", "example": "\"trigger\": \"on_crit\"" }),
+        json!({ "term": "crit", "kind": "convention", "scope": "GameDef event name", "meaning": "The event name used by on_crit and on_non_crit proc behavior. Other event names still branch damage normally.", "example": "\"event\": \"crit\"" }),
+        json!({ "term": "on_cast / on_hit / on_crit / on_non_crit", "kind": "convention", "scope": "ProcDef.trigger", "meaning": "The four supported proc trigger values. on_crit and on_non_crit use the GameDef event named crit (with no such event, every hit is a non-crit).", "example": "\"trigger\": \"on_crit\"" }),
         json!({ "term": "_source / _guide", "kind": "annotation", "scope": "config objects", "meaning": "Human-readable notes. Any underscore-prefixed key is ignored by the calculation.", "example": "\"_source\": \"Stormstring Bow\"" }),
     ];
 
@@ -296,6 +296,17 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry["term"] == "pipeline[].recurrence" && entry["kind"] == "schema"
         }));
+        let trigger = entries
+            .iter()
+            .find(|entry| entry["scope"] == "ProcDef.trigger")
+            .unwrap();
+        assert!(
+            trigger["term"].as_str().unwrap().contains("on_non_crit")
+                && trigger["meaning"].as_str().unwrap().contains("four"),
+            "trigger lexicon entry must list on_non_crit: {trigger}"
+        );
+        let crit = entries.iter().find(|e| e["term"] == "crit").unwrap();
+        assert!(crit["meaning"].as_str().unwrap().contains("on_non_crit"));
         for term in ["sqrt(x)", "pow(base, exponent)"] {
             assert!(
                 entries

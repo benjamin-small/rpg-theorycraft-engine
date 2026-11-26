@@ -1374,9 +1374,10 @@ pub struct ProcDef {
     /// action — rtce 0.2.0's behavior, and what every 0.2.0 config gets
     /// without naming the field.
     ///
-    /// Applies to all three triggers alike, because all three are events
+    /// Applies to every trigger alike, because every trigger is an event
     /// of a cast: the filter names the action whose cast produced the
-    /// event, so `on_hit`/`on_crit` are filtered by the action that HIT.
+    /// event, so `on_hit`/`on_crit`/`on_non_crit` are filtered by the action
+    /// that HIT.
     /// A filtered-out cast contributes NOTHING — in [`Trigger::OnHit`]'s
     /// EV accumulator it is not banked any more than an ICD-gated roll
     /// is, and in Monte Carlo mode it consumes no RNG draw.
