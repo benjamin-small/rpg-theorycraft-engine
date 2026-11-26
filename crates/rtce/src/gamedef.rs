@@ -73,9 +73,13 @@ pub struct EventDef {
     /// stages BEFORE the first `branched` stage (every stage when none is
     /// branched); the engine clamps the result to [0, 1].
     ///
-    /// DEFAULT: required, no default. EVALUATION INSTANT: per phase, after
-    /// the readable stages are computed and before any branch is enumerated,
-    /// so it sees the same stage values in every branch. INTERACTIONS: naming
+    /// DEFAULT: required, no default. EVALUATION INSTANT: once per branched
+    /// stage per phase evaluation, after the readable stages are computed and
+    /// before any branch is enumerated, so it sees the same stage values in
+    /// every branch; plus once per crit-weighted EV cast in the sim.
+    /// INTERACTIONS: the sim's EV `on_crit`/`on_non_crit` weight
+    /// (`Plan::crit_chance`) evaluates this same stage prefix once per
+    /// measured cast. Naming
     /// the first branched stage or any later stage (including a later
     /// non-branched one) is a positioned compile error, since those stages
     /// depend on this event's own outcome; `event_factors` is not readable

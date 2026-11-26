@@ -452,9 +452,9 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         compile_expr(src, &event_syms).map_err(|e| {
             let what = match event_syms.rejected.borrow().as_deref() {
                 Some(stage) => format!(
-                    "event `{event}` {field}: stage `{stage}` is not readable here: events \
-                     may read only stages before the first branched stage `{}`",
-                    stage_names[event_stage_prefix]
+                    "event `{event}` {field}: at byte {}: stage `{stage}` is not readable \
+                     here: events may read only stages before the first branched stage `{}`",
+                    e.pos, stage_names[event_stage_prefix]
                 ),
                 None => format!("event `{event}` {field}: {e}"),
             };
@@ -1350,9 +1350,9 @@ impl Plan {
     /// and BASE bucket raw folds (event-gated contributions excluded — see
     /// [`Plan::fold_buckets`]) written into bucket slots. This is the exact
     /// prefix [`Plan::eval_phase`] then evaluates stages/branches on top
-    /// of, and the exact prefix a branched stage's own `chance`
-    /// expressions read — shared with [`Plan::crit_chance`], which reads
-    /// no further than this.
+    /// of. A branched stage's own `chance` expressions read this prefix
+    /// plus the pre-branch stage prefix; [`Plan::crit_chance`] shares this
+    /// fill and evaluates those stages on top of it.
     fn fill_prefix_slots(
         &self,
         build: &BuildState,
@@ -1786,6 +1786,11 @@ impl Plan {
     /// branched stage (`event_stage_prefix`, evaluated in order) — exactly
     /// what an event `chance` expression may read (see
     /// [`Plan::fill_prefix_slots`]).
+    ///
+    /// COST: evaluates every pre-branch stage (the whole pipeline when
+    /// nothing is branched) on each call, even if the chance reads none of
+    /// them; allocation-free.
+    ///
     /// Returns `0.0` if this Plan defines no event named `"crit"` (no crit
     /// concept in this game — fail-soft, not fail-closed, since "no crit"
     /// is a legitimate game shape, not a config error).
@@ -2016,6 +2021,7 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("first branched stage `hit`"), "{msg}");
+        assert!(msg.contains("at byte"), "{msg}");
     }
 
     #[test]
@@ -2062,6 +2068,37 @@ mod tests {
 
     fn prefix_phase() -> Phase {
         serde_json::from_str(r#"{ "name": "p", "weight": 1 }"#).unwrap()
+    }
+
+    // bonus fold = 0 -> s = 1 + 0/100 = 1 in every branch; the crit branch
+    // refolds bonus to 100 but the factor reads s's BASE value:
+    // hit = 100 * (0.5*1 + 0.5*1) = 100. Contrast (mutation: factor reads
+    // s recomputed from branch buckets): crit-branch s = 2 -> 150.
+    #[test]
+    fn an_event_factor_reads_the_base_value_of_a_prefix_stage() {
+        let def: GameDef = serde_json::from_str(
+            r#"{
+              "stats": [],
+              "buckets": { "bonus": { "fold": "sum" } },
+              "events": { "crit": { "chance": "0.5", "factor": "s" } },
+              "pipeline": [
+                { "name": "s", "expr": "1 + bonus / 100" },
+                { "name": "hit", "expr": "100 * event_factors", "branched": true }
+              ],
+              "objectives": ["hit"]
+            }"#,
+        )
+        .unwrap();
+        let plan = compile(&def).unwrap();
+        let build: BuildState = serde_json::from_str(
+            r#"{ "contributions": [ { "bucket": "bonus", "value": 100, "event": "crit" } ] }"#,
+        )
+        .unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let mut scratch = plan.scratch();
+        let got = plan.evaluate(&build, &scenario, &mut scratch).unwrap()[0];
+        assert!(close(got, 100.0), "{got}");
     }
 
     // eff_crit = 10 * 2 = 20 -> p = 0.2 on a fresh scratch (no stage slot
