@@ -2353,11 +2353,19 @@ impl<'a> Sim<'a> {
     ///   `damage.stats` overlay folded onto the effective build, through
     ///   the SAME construction a measured cast uses
     ///   ([`Sim::overlay_build_for_action`] — one `BuildState` clone per
-    ///   fill, the only allocation this adds), evaluated at THIS instant;
+    ///   fill, plus the overlay map's per-stat key clones), evaluated at
+    ///   THIS field's instant, not the measure instant (so `gain` sees
+    ///   `casts.<self>` one lower than the measured overlay, and a
+    ///   cost/cooldown overlay sees pre-payment resources);
     ///   a part with no `damage` (a utility action, a segmented action's
     ///   action-level fields, a wind-up segment) falls back to the plain
     ///   build. `instant` names the position for that overlay's
     ///   positioned error.
+    ///
+    /// COST: one `evaluate_phase` per fill (zero-allocation on the
+    /// `Plain` path); a rule `when` or a `cost` reading objectives fills
+    /// once per rule per decision. A `Part` fill on a damaging action adds
+    /// the overlay clone above.
     ///
     /// Never sampled, never an RNG draw, in either mode: the read is the
     /// branch-weighted EXPECTED objective by definition. A non-finite

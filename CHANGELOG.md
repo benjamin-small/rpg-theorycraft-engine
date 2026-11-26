@@ -8,6 +8,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
 ## [Unreleased]
 
 ### Upgrade notes
+- **Compiled sim programs are now `SimProgram`** (#33 slice 6). Affects
+  only consumers that inspect `SimPlan` internals; configs and the run
+  API are unchanged.
 - **`ActionDef::cast_time` is now `Option<String>`** (#33 slice 4).
   JSON is unchanged for every config that names it; Rust struct literals
   change `cast_time: "1".into()` to `cast_time: Some("1".into())`. An
@@ -40,6 +43,19 @@ until then, per semver's "anything goes" pre-1.0 clause).
   pipeline once per hit (up to 10 000 per cast), allocation-free.
 
 ### Added
+- **`objective.<name>` sim reads** (#33 item 2, slice 6) — a `Plan`
+  objective's deterministic expected value, readable in action
+  `cast_time`/`cooldown`/`cost`/`gain`, segment `duration`, buff
+  `duration`, proc `chance` and rule `when`; evaluated at each field's
+  instant against that field's world (overlay for damaging action/segment
+  fields, plain build otherwise); never sampled, no RNG draw, both modes.
+  A compile error in `damage.stats` and resource `max`/`regen_per_sec`;
+  an unknown name gets a did-you-mean. Configs reading none are
+  unchanged. Cost: one `evaluate_phase` per read (per rule per decision
+  for `when`/`cost`), plus an overlay `BuildState` clone for a damaging
+  action.
+- Public API: `SimPlan::segments_done_slot` (pub) and the `SimProgram`
+  re-export from `rtce::sim`.
 - **Segmented actions** (`ActionDef::segments`, `SegmentDef`) — a
   multi-landing cast (channel, combo string, wind-up then slam) with a
   per-segment `duration`, `damage`, `effects` and `measure`
