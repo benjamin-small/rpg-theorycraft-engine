@@ -10,14 +10,22 @@ truth) and `docs/superpowers/plans/` for the active plan.
 
 ## Consumers
 
-Both consume `rtce` as a PATH dependency (`../rpg-theorycraft-engine`), so
-a change here reaches them immediately — and both were renamed and
-restructured in 2026-08:
+Both consume `rtce` from **crates.io** (verified 2026-11-26), NOT by path,
+so a change here does NOT reach them until it is published and they bump
+their requirement. Both were renamed and restructured in 2026-08:
 
-| now | was | consumes |
-|---|---|---|
-| `../d4-theory-crafting` | `diablo4-calc` | `plan` (production: its native math is deleted) |
-| `../poe2-theory-crafting` | `poe2-calcs` | `plan` + `sim` + `search` (parity proof; its `calc.rs` stays normative) |
+| now | was | requires | consumes |
+|---|---|---|---|
+| `../d4-theory-crafting` | `diablo4-calc` | `rtce = "0.4"` | `plan` (production: its native math is deleted) |
+| `../poe2-theory-crafting` | `poe2-calcs` | `rtce = "0.7.0"` | `plan` + `sim` + `search` (parity proof; its `calc.rs` stays normative) |
+
+To test THIS working tree against a consumer, override its dependency for
+one run without editing its manifest, then restore its lockfile:
+`cargo test --workspace --config 'patch.crates-io.rtce.path="<abs path to>/rpg-theorycraft-engine/crates/rtce"'`
+(back up and restore `Cargo.lock` around it). That works only while the
+consumer's requirement accepts this crate's version — d4's `^0.4` does not
+accept the 0.7 line, so d4 cannot exercise unreleased changes until it
+upgrades.
 
 Older entries in CHANGELOG and `docs/superpowers/` use the previous names
 and are left alone — they record what was true when written.
@@ -65,12 +73,15 @@ cross-reference in the same commit (the 0.4.0 staging proved it).
 - `cargo test --workspace`
 - `cargo clippy --workspace --all-targets -- -D warnings` · `cargo fmt
   --all --check` · `#![warn(missing_docs)]` · `cargo doc` zero warnings
-- Both consumers re-verified (each from its own repo root):
-  - `../d4-theory-crafting` — `cargo test --workspace` green, and
-    `cargo run -q -p d4-core --example eval` (no args) golden
-    `17574.299999999996`.
+- Consumers re-verified against THIS tree (each from its own repo root,
+  with the `--config patch.crates-io…` override from "Consumers" above;
+  a plain run tests the published crate, not your change):
   - `../poe2-theory-crafting` — `cargo test --workspace` green, and
     `cargo test -p poe2-core --test rtce_parity` → 96 passed.
+  - `../d4-theory-crafting` — not applicable while it pins `rtce = "0.4"`
+    (the override cannot apply). Once it upgrades: `cargo test
+    --workspace` green, and `cargo run -q -p d4-core --example eval` (no
+    args) golden `17574.299999999996`.
 - `examples/diablo4_rotation.rs` EV **and** MC blocks byte-identical
   under serde defaults (the standing proof no RNG draw or event
   reordering leaked into the default path).
