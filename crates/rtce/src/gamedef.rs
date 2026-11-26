@@ -69,12 +69,28 @@ pub enum FoldKind {
 /// events is enumerated as a branch inside a `branched` stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventDef {
-    /// Expression over declared stats, conditions, and buckets; the engine
-    /// clamps the result to [0, 1].
+    /// Expression over declared stats, conditions, buckets, and the pipeline
+    /// stages BEFORE the first `branched` stage (every stage when none is
+    /// branched); the engine clamps the result to [0, 1].
+    ///
+    /// DEFAULT: required, no default. EVALUATION INSTANT: per phase, after
+    /// the readable stages are computed and before any branch is enumerated,
+    /// so it sees the same stage values in every branch. INTERACTIONS: naming
+    /// the first branched stage or any later stage (including a later
+    /// non-branched one) is a positioned compile error, since those stages
+    /// depend on this event's own outcome; `event_factors` is not readable
+    /// here either.
     pub chance: String,
-    /// Expression over declared stats, conditions, and buckets (with buckets
-    /// refolded for this branch); multiplied into `event_multiplier` when this
-    /// event fires.
+    /// Expression over declared stats, conditions, buckets (with buckets
+    /// refolded for this branch), and the pipeline stages BEFORE the first
+    /// `branched` stage; multiplied into `event_multiplier` when this event
+    /// fires.
+    ///
+    /// DEFAULT: required, no default. EVALUATION INSTANT: per branch where
+    /// the event fires, reading the phase's prefix-stage values (stages are
+    /// not recomputed per branch) and this branch's refolded buckets.
+    /// INTERACTIONS: the same stage-readability rule and compile error as
+    /// `chance`.
     pub factor: String,
     /// Unknown keys collected at parse (P8a). `_`-prefixed keys are the
     /// annotation namespace: accepted at every nesting level and carried
