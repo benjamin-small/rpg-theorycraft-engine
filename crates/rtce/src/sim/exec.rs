@@ -2683,17 +2683,15 @@ impl<'a> Sim<'a> {
         Ok((dmg, is_crit))
     }
 
-    /// EV mode: the accumulator method (see module docs). `weight`
-    /// multiplies each qualifying roll's `chance` BEFORE accumulation —
-    /// `1.0` for `OnCast`/`OnHit` (every cast/hit qualifies outright),
-    /// `crit_chance` for `OnCrit` and `1 − crit_chance` for `OnNonCrit`
-    /// (its exact complement). The `OnCrit` weight is the EV-consistent
-    /// choice this task pins, since the design spec is silent on it: a hit
-    /// isn't "certainly" a crit in EV mode, so an `on_crit` proc's per-hit contribution is
-    /// `proc_chance × P(crit)`, not `proc_chance` outright — this is
-    /// exactly what makes the EV accumulator's LONG-RUN fire rate agree
-    /// with MC mode's (which only rolls `on_crit` procs on hits that
-    /// actually sampled a crit).
+    /// EV mode: the accumulator method (see module docs). `weight` multiplies each
+    /// qualifying roll's `chance` BEFORE accumulation — `1.0` for `OnCast`/`OnHit`
+    /// (every cast/hit qualifies outright), `crit_chance` for `OnCrit` and
+    /// `1 − crit_chance` for `OnNonCrit` (its exact complement). The `OnCrit` weight is
+    /// the EV-consistent choice this task pins, since the design spec is silent on it:
+    /// a hit isn't "certainly" a crit in EV mode, so an `on_crit` proc's per-hit
+    /// contribution is `proc_chance × P(crit)`, not `proc_chance` outright — this is
+    /// exactly what makes the EV accumulator's LONG-RUN fire rate agree with MC mode's
+    /// (which only rolls `on_crit` procs on hits that actually sampled a crit).
     ///
     /// ICD semantics (P6 review/I1 — supersedes the original P6d choice of
     /// "accumulate through ICD, defer one fire": that let the accumulator
