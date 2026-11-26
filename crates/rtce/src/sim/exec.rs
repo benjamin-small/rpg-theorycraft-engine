@@ -14729,5 +14729,180 @@ mod tests {
             assert_eq!(m.applications, 1, "{m:?}");
             assert!(close(m.uptime, 0.375), "got {}", m.uptime);
         }
+
+        // --------------------------------------------------------------
+        // The action-level `effects` of a SEGMENTED action run at the
+        // last landing and capture the LAST segment's world: its
+        // `damage.stats` overlay (or the plain build for a wind-up last
+        // segment), at that segment's measure instant. `dot` is a
+        // 0.2 s SNAPSHOT `tick_objective` buff on `hit = dmg × (1 +
+        // bonus/100) × event_factors`; cc 0 → event_factors 1; plain
+        // build dmg 50, bonus 0. Segment 0 lands 0.5 and applies `fury`
+        // (+50 bonus, 0.5 s → gone at 1.0); the last segment lands 1.25
+        // and the action effect applies `dot`, ticking 1.25..1.45 (weight
+        // 1.5; cast 2's first landing, 1.75, never happens):
+        //   (A) last segment damaging, dmg 300, cast_complete:
+        //       rate 300 × 1 × 1 = 300 → 0.2 × 300 = 60
+        //   (B) last segment a wind-up: plain build, rate 50 →
+        //       0.2 × 50 = 10
+        //   (C) last segment dmg 300 measured cast_start at 0.5, when
+        //       `fury` is live: rate 300 × 1.5 = 450 → 0.2 × 450 = 90
+        // Mutation (the action-level effects read a plain `Part::Whole`
+        // capture instead of the landing's world): A → 10 (not 60) and
+        // C → 10 (not 90).
+        // --------------------------------------------------------------
+        #[test]
+        fn action_effects_on_a_segmented_action_capture_the_last_segments_world() {
+            let seg0 = r#"{ "duration": 0.5, "damage": { "stats": { "dmg": 100 } },
+                            "effects": [ { "apply_buff": "fury" } ] }"#;
+            let dot_of = |last: &str| {
+                let slam = format!(
+                    r#"{{ "effects": [ {{ "apply_buff": "dot" }} ],
+                          "segments": [ {seg0}, {last} ] }}"#
+                );
+                let json = simdef(&slam, 0.5, "").replace(
+                    r#""blip": { "duration": 0.1 }"#,
+                    r#""blip": { "duration": 0.1 },
+                       "dot": { "duration": 0.2,
+                                "tick_objective": { "objective": "hit", "snapshot": true } }"#,
+                );
+                let build: BuildState =
+                    serde_json::from_str(r#"{ "stats": { "dmg": 50.0, "cc": 0.0 } }"#).unwrap();
+                let r = try_run(&json, &build, 1.5, Mode::Expected).unwrap();
+                assert_eq!(r.buffs["dot"].applications, 1, "{:?}", r.buffs["dot"]);
+                r.buffs["dot"].damage
+            };
+            let a = dot_of(r#"{ "duration": 0.75, "damage": { "stats": { "dmg": 300 } } }"#);
+            let b = dot_of(r#"{ "duration": 0.75 }"#);
+            let c = dot_of(
+                r#"{ "duration": 0.75, "measure": "cast_start",
+                     "damage": { "stats": { "dmg": 300 } } }"#,
+            );
+            assert!(close(a, 60.0), "(A) damaging last segment: got {a}");
+            assert!(close(b, 10.0), "(B) wind-up last segment: got {b}");
+            assert!(close(c, 90.0), "(C) cast_start last segment: got {c}");
+        }
+
+        // --------------------------------------------------------------
+        // A proc-fired FREE cast at a landing of a segmented cast reads
+        // the in-flight rotation cast's segment words (like a proc
+        // `chance` at that instant). `echo` (unsegmented, free-cast by an
+        // on_hit proc, chance 1, icd 0) deals `100 × segments_done`.
+        // Weight 1.25: the proc fires at landing 0.5 (done 1 → 100) and
+        // at 1.25 (done 2 → 200) → echo 300, total 400 + 300 = 700.
+        // Mutation (reset the words before the last landing's effects and
+        // procs): the second free cast reads 0 → echo 100 (not 300).
+        // --------------------------------------------------------------
+        #[test]
+        fn a_free_cast_at_a_landing_reads_the_in_flight_casts_segment_words() {
+            let json = format!(
+                r#"{{ "procs": {{ "pe": {{ "trigger": "on_hit", "chance": "1", "icd": 0.0,
+                                         "rolls": "per_cast", "cast_action": "echo" }} }},
+                     "actions": {{
+                       "slam": {{ "segments": {SLAM} }},
+                       "echo": {{ "cast_time": "1",
+                                  "damage": {{ "stats": {{ "dmg": "100 * segments_done" }} }} }} }},
+                     "buffs": {{}}, "damage_objective": "hit" }}"#
+            );
+            let r = ev(&json, 1.25);
+            assert!(
+                close(r.actions["echo"].damage, 300.0),
+                "echo got {}",
+                r.actions["echo"].damage
+            );
+            assert!(
+                close(r.total.total_damage, 700.0),
+                "got {}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // MC x segments. cc 0.5, two damaging segments of hits_per_use 50,
+        // weight 5 → 4 casts, 8 landings, 400 hits; ONE iteration so the
+        // proc counts are exact (no pooled-mean rounding).
+        //  - crit_rolls per_hit + per_hit `on_crit` / `on_non_crit`
+        //    procs (chance 1, icd 0): every one of the 400 hits is
+        //    sampled and gates exactly one of the pair → pc + pn == 400,
+        //    whatever the seed. Were each landing's hits to share ONE
+        //    mask, pc would be a multiple of 50; independent per-hit
+        //    draws leave pc % 50 != 0 (true at the fixed seed).
+        //  - contrast, per_cast sampling: one shared mask per landing →
+        //    pc + pn == 8.
+        //  - ICD across the two landings of a cast (different instants):
+        //    landings 0.5, 1.25, 1.75, 2.5, 3.0, 3.75, 4.25, 5.0 (gaps
+        //    0.75/0.5 alternating); an on_hit per_cast proc, chance 1:
+        //    icd 0.6 fires at 0.5, 1.25, 2.5, 3.75, 5.0 = 5; icd 0.8
+        //    fires at 0.5, 1.75, 3.0, 4.25 = 4; icd 0.4 fires at all 8.
+        // Mutation (per-hit sampling skipped for segmented parts):
+        // pc % 50 == 0 (shared masks). Mutation (ICD gate ignored): 8, not 5.
+        // --------------------------------------------------------------
+        #[test]
+        fn mc_segmented_casts_sample_crit_per_segment() {
+            let segs = |crit: &str| {
+                format!(
+                    r#"{{ {crit} "segments": [
+                       {{ "duration": 0.5,
+                          "damage": {{ "stats": {{ "dmg": 100, "hits_per_use": 50 }} }} }},
+                       {{ "duration": 0.75,
+                          "damage": {{ "stats": {{ "dmg": 300, "hits_per_use": 50 }} }} }} ] }}"#
+                )
+            };
+            let procs = |rolls: &str| {
+                format!(
+                    r#""procs": {{
+                     "pc": {{ "trigger": "on_crit", "chance": "1", "icd": 0.0,
+                              "rolls": "{rolls}", "apply_buff": "blip" }},
+                     "pn": {{ "trigger": "on_non_crit", "chance": "1", "icd": 0.0,
+                              "rolls": "{rolls}", "apply_buff": "blip" }} }},"#
+                )
+            };
+            let mc = Mode::MonteCarlo {
+                iterations: 1,
+                seed: 20261126,
+            };
+            let b = seg_build(0.5);
+            let r = try_run(
+                &simdef(
+                    &segs(r#""crit_rolls": "per_hit","#),
+                    10.0,
+                    &procs("per_hit"),
+                ),
+                &b,
+                5.0,
+                mc,
+            )
+            .unwrap();
+            let (pc, pn) = (r.proc_counts["pc"], r.proc_counts["pn"]);
+            assert_eq!(pc + pn, 400, "per_hit: {:?}", r.proc_counts);
+            // A shared mask per landing could only give a multiple of 50.
+            assert!(pc % 50 != 0, "per_hit: {:?}", r.proc_counts);
+            let r = try_run(
+                &simdef(
+                    &segs(r#""crit_rolls": "per_cast","#),
+                    10.0,
+                    &procs("per_cast"),
+                ),
+                &b,
+                5.0,
+                mc,
+            )
+            .unwrap();
+            assert_eq!(
+                r.proc_counts["pc"] + r.proc_counts["pn"],
+                8,
+                "per_cast: {:?}",
+                r.proc_counts
+            );
+
+            for (icd, want) in [(0.6, 5), (0.8, 4), (0.4, 8)] {
+                let p = format!(
+                    r#""procs": {{ "ph": {{ "trigger": "on_hit", "chance": "1", "icd": {icd},
+                                          "rolls": "per_cast", "apply_buff": "blip" }} }},"#
+                );
+                let r = try_run(&simdef(&slam_with(""), 10.0, &p), &b, 5.0, mc).unwrap();
+                assert_eq!(r.proc_counts["ph"], want, "icd {icd}: {:?}", r.proc_counts);
+            }
+        }
     }
 }
