@@ -1822,6 +1822,12 @@ impl Plan {
         Ok(self.events[ei].chance.eval(&scratch.slots).clamp(0.0, 1.0))
     }
 
+    /// Whether the plan declares ANY event. With none, a sampled
+    /// evaluation draws nothing and every sample is the same value.
+    pub(crate) fn has_events(&self) -> bool {
+        !self.event_names.is_empty()
+    }
+
     /// pub(crate): whether the bit for the event named `"crit"` is set in
     /// an [`Plan::evaluate_phase_sampled`] fired-mask — `false` if this
     /// Plan has no such event (mirrors [`Plan::crit_chance`]'s "no crit

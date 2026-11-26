@@ -97,6 +97,11 @@ pub struct SimDefaults {
     /// rule, the once-per-cast chance evaluation). Defaults to
     /// [`ProcRolls::PerCast`], the long-standing one-roll-per-cast
     /// behavior.
+    ///
+    /// This is ALSO the default for [`ActionDef::crit_rolls`] (how a
+    /// damaging cast's crit is SAMPLED in Monte Carlo): an action that
+    /// omits `crit_rolls` inherits this value, so `per_hit` here makes
+    /// every action sample its crit per hit.
     #[serde(default)]
     pub proc_rolls: ProcRolls,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
@@ -301,13 +306,18 @@ pub enum EventOrder {
 ///   count is the cast's measured `hits_per_use` (from the cast's world
 ///   snapshot — the [`Measure`] instant, the same value its damage is
 ///   multiplied by). In `Mode::Expected` the EV accumulator is fed once
-///   per hit (`acc += chance × weight` per hit — the `on_crit`
-///   crit-probability weight applies per hit) and multiple crossings can
+///   per hit (`acc += chance × weight` per hit — under the default
+///   `per_cast` [`ActionDef::crit_rolls`], the `on_crit` crit-probability
+///   weight applies per hit) and multiple crossings can
 ///   fire within one cast; in `Mode::MonteCarlo` each hit is its own
 ///   Bernoulli draw. The two modes' long-run fire rates agree under
-///   either policy: EV's per-hit weight times the hit count is exactly
-///   the expectation of MC's per-hit draws under the cast's one sampled
-///   crit mask (see "on_crit" below).
+///   either policy: under the default `per_cast` crit sampling, EV's
+///   per-hit weight times the hit count is exactly the expectation of
+///   MC's per-hit draws under the cast's one sampled crit mask (see
+///   "on_crit" below).
+///   (That one-mask-per-cast statement holds under a resolved
+///   [`ActionDef::crit_rolls`] of `per_cast`; under `per_hit` each hit
+///   samples its own crit — see that field.)
 ///
 /// # Scope: which rolls this governs
 ///
@@ -584,6 +594,79 @@ pub struct ActionDef {
     /// firing proc's instant and is always measured live there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measure: Option<Measure>,
+    /// How this action's measured HITS are sampled for crit in
+    /// `Mode::MonteCarlo`, and how the crit-gated procs of this cast are
+    /// weighted in `Mode::Expected`. Same policy type as
+    /// [`SimDefaults::proc_rolls`] and [`ProcDef::rolls`].
+    ///
+    /// # Default
+    ///
+    /// ABSENT = inherit [`SimDefaults::proc_rolls`], whose own default is
+    /// [`ProcRolls::PerCast`]. The resolution is
+    /// `crit_rolls ?? defaults.proc_rolls ?? per_cast`; a present value
+    /// here always wins over the defaults block. Under the resolved
+    /// `per_cast` nothing changes: one crit mask per cast, shared by all
+    /// its hits.
+    ///
+    /// # Evaluation instant
+    ///
+    /// Resolved once at compile time. The hit count it samples over is the
+    /// cast's measured `hits_per_use`, read from the cast's world
+    /// snapshot at the action's [`Measure`] instant (the same value its
+    /// damage is multiplied by).
+    ///
+    /// # Interactions
+    ///
+    /// - [`SimDefaults::proc_rolls`]: this field's fallback, as above.
+    /// - [`ProcDef::rolls`]: UNCHANGED. It governs only how many rolls a
+    ///   proc is presented; this field governs how many crit samples the
+    ///   cast's damage draws. The two axes cross freely.
+    /// - Under a resolved `per_hit` in Monte Carlo each hit samples its
+    ///   OWN crit and the damage credited is the sum. A `per_hit`
+    ///   `on_crit`/`on_non_crit` proc rolls once per hit against that
+    ///   hit's own result; a `per_cast` one gates on ANY hit crit
+    ///   (`on_crit`) or ANY hit not crit (`on_non_crit`).
+    /// - In `Mode::Expected`, with `p` the crit chance and `n` the
+    ///   measured hits, a `per_cast` `on_crit` proc's weight follows as
+    ///   `1 - (1 - p)^n` (`on_non_crit`: `1 - p^n`); `icd > 0` `per_hit`
+    ///   procs fire at most once per cast, with probability
+    ///   `1 - (1 - q)^n`, `q = chance * p` (`* (1 - p)` for
+    ///   `on_non_crit`).
+    /// - WHO MOVES: only an action that resolves to `per_hit` AND whose
+    ///   plan has events AND whose measured `n != 1` (`n = 0` included:
+    ///   it presents NO crit-gated roll at all, whereas `per_cast` still
+    ///   presents one). That is not limited
+    ///   to plans with a `"crit"` event: with any event, the sampled
+    ///   pipeline draws `n` independent branch masks per cast instead of
+    ///   one. And a crit-gated proc moves in EV even with NO `"crit"`
+    ///   event: the crit chance is then `p = 0`, so `on_non_crit` gets
+    ///   `p_hit = 1` and a `per_hit` `on_non_crit` proc with `icd > 0`
+    ///   changes from up to `n x chance` per cast to ONE accumulation of
+    ///   `1 - (1 - chance)^n` (pinned by
+    ///   `ev_per_hit_icd_on_non_crit_moves_without_a_crit_event`).
+    /// - At `n = 0` (a resolved `per_hit`, events, zero measured hits) no
+    ///   crit sample is drawn and NO crit-gated proc roll is presented,
+    ///   in either mode; `per_cast` still presents one (pinned by
+    ///   `per_hit_crit_sampling_presents_no_crit_gated_roll_at_zero_hits`).
+    /// - `on_cast` and `on_hit` procs are unaffected by this field (they
+    ///   read no crit). A `per_hit` `icd: 0` crit-gated proc is unchanged
+    ///   too: `n` accumulations of `chance × p` (pinned by
+    ///   `ev_per_hit_icd0_proc_is_unchanged_by_crit_sampling`).
+    /// - COST: per-hit sampling evaluates the sampled pipeline once per
+    ///   hit (up to `PER_HIT_ROLL_LIMIT` = 10 000 per cast) instead of
+    ///   once per cast. It stays allocation-free: only the crit COUNT is
+    ///   kept, never per-hit masks.
+    /// - `n = 1`, or a plan with no events at all, is identical to
+    ///   `per_cast`, byte-for-byte, BY CONSTRUCTION: the executor takes
+    ///   the `per_cast` path outright (a per-hit sum can differ from
+    ///   `damage * n` by an ulp). The whole-count rule still runs first.
+    /// - A fractional `hits_per_use` (or one over the roll limit) under a
+    ///   resolved `per_hit` is a run error, since per-hit sampling needs
+    ///   a whole count.
+    /// - Proc-fired FREE casts of this action (`cast_action`) are out of
+    ///   scope: they keep their unsampled expected damage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crit_rolls: Option<ProcRolls>,
     /// Buffs this action applies when its cast COMPLETES — one
     /// application per entry, in list order.
     ///
@@ -715,6 +798,7 @@ impl ActionDef {
         "measure",
         "apply_buff",
         "effects",
+        "crit_rolls",
     ];
 }
 
@@ -1207,9 +1291,16 @@ pub enum Trigger {
     /// per measured hit under [`ProcRolls::PerHit`], exactly as
     /// [`Trigger::OnHit`] — weighted by the probability the cast crit
     /// ([`crate::sim::Mode::Expected`]; under `per_hit` the weight
-    /// applies per hit) or gated on whether the sampled branch actually
-    /// crit ([`crate::sim::Mode::MonteCarlo`]; ONE mask per cast — the
-    /// cast's simultaneous hits share it).
+    /// applies per hit; under a resolved `per_hit`
+    /// [`ActionDef::crit_rolls`] with events and `n != 1` hits the EV
+    /// weight is instead `1 − (1 − p)^n` for a `per_cast` proc, and one
+    /// accumulation of `1 − (1 − q)^n`, `q = chance × p`, for a
+    /// `per_hit` proc with `icd > 0`) or gated on whether the sampled branch actually
+    /// crit ([`crate::sim::Mode::MonteCarlo`]). The MC mask is ONE per
+    /// cast — the cast's simultaneous hits share it — unless the action's
+    /// resolved [`ActionDef::crit_rolls`] is `per_hit`, in which case
+    /// each hit samples its own: a `per_cast` proc then qualifies when
+    /// ANY hit crit, a `per_hit` proc rolls once per crit hit.
     OnCrit,
     /// The complement of [`Trigger::OnCrit`]: rolls once per completing
     /// cast of a damaging action by default — per measured hit under
@@ -1224,9 +1315,16 @@ pub enum Trigger {
     ///   ([`crate::sim::Mode::Expected`]); under `per_hit` the weight
     ///   applies per hit. With no `"crit"` event in the game def the crit
     ///   chance is 0, so every damaging hit qualifies (weight 1.0).
+    ///   Under a resolved `per_hit` [`ActionDef::crit_rolls`] (events,
+    ///   `n != 1`) the weight is instead `1 − p^n` for a `per_cast` proc,
+    ///   and one accumulation of `1 − (1 − q)^n`, `q = chance × (1 − p)`,
+    ///   for a `per_hit` proc with `icd > 0`.
     /// - **MC:** qualifies when the cast's sampled branch mask has the
     ///   crit bit CLEAR — the same single draw `OnCrit` gates on, so the
-    ///   two triggers are exact complements per cast.
+    ///   two triggers are exact complements per cast. Under a resolved
+    ///   [`ActionDef::crit_rolls`] of `per_hit` the complement is per
+    ///   hit: a `per_cast` proc qualifies when ANY hit did not crit, a
+    ///   `per_hit` proc rolls once per non-crit hit.
     /// - **Interactions:** `rolls`, `icd` and `actions` behave identically
     ///   to `OnCrit` (chance evaluated once per proc per cast; ICD is a
     ///   hard gate). A utility cast (no damage) and a proc-fired free
