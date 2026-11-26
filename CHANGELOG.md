@@ -48,10 +48,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
   hit-trigger procs roll per damaging segment; `crit_rolls` applies to
   each segment's own hits; an instant segment lands synchronously
   (and an all-instant action hits the livelock guard). Cost: one overlay
-  world per damaging segment instead of per cast.
-- **`segments_done` / `segments_remain`** sim symbols — segments landed
-  (counting the one being measured) and still to land during a
-  segmented cast, `0` otherwise and at every rotation decision.
+  world per damaging or effect-bearing landing instead of per cast (a
+  wind-up last segment builds one when the action has effects).
+- **`segments_done` / `segments_remain`** sim symbols — they describe the
+  in-flight ROTATION cast: segments landed (counting the one being
+  measured) and still to land during a segmented cast, `0` when none is
+  in flight (so at every rotation decision). A proc-fired free cast at
+  one of its landings reads that cast's values.
 - **`ActionDef::crit_rolls`** (`per_cast` | `per_hit`, default inherits
   `defaults.proc_rolls`) — how an action's hits are sampled for crit; a
   `per_cast` `on_crit` proc gates on any hit, EV weight `1 - (1 - p)^n`

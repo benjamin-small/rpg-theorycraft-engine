@@ -14,11 +14,14 @@
 //!
 //! - `time`, `duration` — reserved words; the current sim clock and the
 //!   scenario's total duration in seconds.
-//! - `segments_done`, `segments_remain` — reserved words; while a
-//!   SEGMENTED cast ([`crate::simdef::ActionDef::segments`]) is in
-//!   flight, the segments landed so far (counting the landing being
-//!   measured) and the segments still to land; `0` for every unsegmented
-//!   action and at every rotation decision.
+//! - `segments_done`, `segments_remain` — reserved words describing the
+//!   in-flight ROTATION cast: while a SEGMENTED cast
+//!   ([`crate::simdef::ActionDef::segments`]) is in flight, the segments
+//!   landed so far (counting the landing being measured) and the
+//!   segments still to land; `0` when none is in flight (so for an
+//!   unsegmented rotation cast and at every rotation decision). A
+//!   proc-fired free cast at one of a segmented cast's landings reads
+//!   that cast's values.
 //! - each resource, by its bare name — the resource's current amount.
 //! - `cooldown.<action>` — seconds remaining before `<action>` is off
 //!   cooldown (`0` = ready).
@@ -70,16 +73,16 @@
 //! compile error, the same as any other unresolved name. Resource/action/
 //! buff names join the SAME flat namespace as stats/conditions: a name
 //! colliding with an existing stat or condition, or reusing the reserved
-//! `time`/`duration`/`segments_done`/`segments_remain` words, is a compile error rather than a silent
-//! shadow.
+//! `time`/`duration`/`segments_done`/`segments_remain` words, is a
+//! compile error rather than a silent shadow.
 //!
 //! # The cast-complete order
 //!
 //! A landing — an unsegmented cast's completion, or one segment of a
 //! segmented cast ([`crate::simdef::ActionDef::segments`]) — resolves
-//! several effects at ONE instant, and their order is observable — a `damage.stats` expression, a proc `chance`,
-//! and a snapshot capture can each read state an earlier step wrote. It
-//! is therefore fixed, and this is the canonical statement of it (every
+//! several effects at ONE instant, and their order is observable — a
+//! `damage.stats` expression, a proc `chance`, and a snapshot capture
+//! can each read state an earlier step wrote. It is therefore fixed, and this is the canonical statement of it (every
 //! other mention in this crate links here):
 //!
 //! ```text

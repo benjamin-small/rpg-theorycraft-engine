@@ -2546,21 +2546,26 @@ impl<'a> Sim<'a> {
     /// ```text
     /// [last]  apply action `gain`
     /// [first] casts.<action> += 1
+    /// [segmented] segments_done += 1
     ///   → measure this part's world, evaluate its damage, credit it
     /// [last]  → end the cast (mid_cast = false)
     ///   → this part's effects, in list order
     /// [last, segmented] → the action-level effects, in list order
     ///   → proc rolls: [first] on_cast, then this part's on_hit,
     ///     on_crit, on_non_crit (damaging parts only)
+    /// [last, segmented] → segments_done / segments_total reset to 0
     /// ```
     ///
-    /// Both effects lists read the ONE world this landing measured.
-    /// Cost: the overlay `BuildState` clone in [`Sim::capture_world`]
-    /// happens once per damaging LANDING, so once per segment for a
-    /// segmented cast instead of once per cast — the only allocation
-    /// segments add to the run loop. The next segment's start (duration,
-    /// `cast_start` capture, schedule) follows in [`Sim::land_segment`],
-    /// AFTER this transaction's proc rolls.
+    /// This is the same order as the canonical diagram in the `sim`
+    /// module docs. Both effects lists read the ONE world this landing
+    /// measured. Cost: the overlay `BuildState` clone in
+    /// [`Sim::capture_world`] happens once per damaging or effect-bearing
+    /// LANDING (a wind-up last segment builds one when the action has
+    /// effects), so once per segment for a segmented cast instead of once
+    /// per cast — the only allocation segments add to the run loop. The
+    /// next segment's start (duration, `cast_start` capture, schedule)
+    /// follows in [`Sim::land_segment`], AFTER this transaction's proc
+    /// rolls and reset.
     fn land(&mut self, action: usize, part: Part) -> Result<(), PlanError> {
         let now = self.time;
         let (first, last) = match part {
@@ -2729,12 +2734,13 @@ impl<'a> Sim<'a> {
             // landing's whole transaction (effects and proc rolls read
             // `segments_done = n`, `segments_remain = 0`), do both
             // reserved words return to 0 — so they read 0 at the next
-            // rotation decision. Adjacent: `segments_remain` is a u32
-            // subtraction, and no slot refresh runs between the two
-            // statements, so nothing can observe `done = 0` with a stale
-            // `total` (an underflow in `total - done`).
-            self.segments_total = 0;
+            // rotation decision. `segments_remain` is a u32 subtraction
+            // (`total - done`), so `done` resets FIRST: no intermediate
+            // state ever has `total < done` (resetting `total` first
+            // would underflow it). No slot refresh runs between the two
+            // statements regardless.
             self.segments_done = 0;
+            self.segments_total = 0;
         }
         Ok(())
     }
@@ -2790,10 +2796,11 @@ impl<'a> Sim<'a> {
     /// utility action with an empty effects list), so the 0.2.0 default
     /// path pays nothing it did not already pay.
     ///
-    /// WHEN this runs is the action's resolved [`Measure`]:
-    /// [`Sim::complete_cast`] calls it in the completion transaction
-    /// (`cast_complete`, the default), and [`Sim::begin_cast`] calls it
-    /// at cast start for a SCHEDULED `cast_start` cast. An instant cast
+    /// WHEN this runs is the part's resolved [`Measure`]: [`Sim::land`]
+    /// calls it in the landing transaction (`cast_complete`, the
+    /// default), and [`Sim::begin_cast`] / [`Sim::start_segment`] call it
+    /// at the cast's (or segment's) start for a SCHEDULED `cast_start`
+    /// part. An instant cast
     /// is always measured at the completion position, whatever `measure`
     /// says (see [`Measure`] for the discontinuity this implies).
     ///

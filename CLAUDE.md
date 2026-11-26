@@ -22,8 +22,8 @@ their requirement. Both were renamed and restructured in 2026-08:
 To test THIS working tree against a consumer, override its dependency for
 one run without editing its manifest, then restore its lockfile:
 `cargo test --workspace --config 'patch.crates-io.rtce.path="<abs path to>/rpg-theorycraft-engine/crates/rtce"'`
-(back up and restore `Cargo.lock` around it — in d4, `git checkout
-Cargo.lock` afterwards). That works only while the consumer's requirement
+(both consumers track `Cargo.lock`: restore it afterwards with `git
+checkout Cargo.lock`). That works only while the consumer's requirement
 accepts this crate's version: when this crate's version moves to a new
 0.x minor (e.g. 0.8.0), both consumers' `^0.7` stops matching and each
 needs a requirement bump before the override applies again.
