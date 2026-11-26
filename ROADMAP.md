@@ -124,6 +124,36 @@
   galloping transitions (#30) reach long uniform runs in about
   2·log2(N) transitions (333,334 steps in 37), bit-identical to single
   stepping under the documented exactness and monotonicity contract.
+- **Hit-level casts, first half, DONE (0.8.0).** #33 items 1, 2, 3 and
+  5, plus multi-strike segments (design:
+  `docs/superpowers/specs/2026-11-25-hit-level-casts-design.md`). That
+  covers `on_non_crit`, event chances reading pre-branch stages,
+  per-hit crit sampling (`crit_rolls`), `ActionDef::segments` with
+  `SegmentLand` events and the generalized landing order, and
+  `objective.<name>` reads in sim timing fields.
+- [ ] **Hit-level casts, second half** (design §6 slices 5, 7 and 8).
+  Open debt, deliberately not yet built:
+  - **Player cancels:** `Rule::interrupt` / `interrupt_if` at segment
+    boundaries, the `cancelled` report column, and the cast-id
+    staleness guard on `SegmentLand`. `interrupt_if` must compile as a
+    legal objective-read field.
+  - **Outside interruptions:** `SimDef::interruptions`. EV accepts only
+    deterministic schedules; jitter and chance are MC-only.
+  - **A Rolling-Slam-shaped CI-run example** with hand-worked EV pins.
+- [ ] Open debt from 0.8.0 (each deliberately unpinned or not yet built):
+  - #33 item 4, EV expected uptime for Bernoulli-driven buffs. This is
+    research, and MC is the documented answer meanwhile.
+  - A `when`/`cost` that reads an objective on a damaging action clones
+    the overlay `BuildState` on every decision. It is opt-in and
+    documented; memoize per (instant, world), or build the overlay
+    into scratch, if a bench asks.
+  - `on_non_crit` × `measure: "cast_start"` is true by construction but
+    not pinned by name.
+  - A general `{ on_event, fired }` trigger for arbitrary events.
+  - Per-action segment words (`segments_done.<action>`).
+  - Free-casting a segmented action, which is a compile error today.
+  - SimC-style `chain` / `early_chain_if`.
+  - Refund-on-cancel knobs.
 
 - [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
       the registry (`cargo search` confirms), alongside `rtce-testkit`
@@ -132,7 +162,7 @@
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
       actually touches `crates/rtce-testkit/`.
-- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, and 0.7.0 are
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, and 0.8.0 are
       also live; the tag-driven trusted-publishing workflow verifies the tag,
       changelog, formatting, clippy, tests, and package contents before it
       publishes missing crate versions.
@@ -451,3 +481,17 @@ their shape. Three groups:
 
 ## Explicitly out of scope
 - Knowledge-graph construction (external drivers).
+- **An engine-side inventory/equipment layer** (considered and set aside
+  2026-11-22). Its supposed value — standardizing consumers and checking
+  config fail-closed — has nothing to act on yet: neither
+  `rtce_adapter.rs` handles items (both route already-resolved stats;
+  gear resolution lives in each consumer's own game code), no search
+  driver searches over items, and D4's gear (aspects, uniques, charms,
+  seals, set tiers) shares little shape with PoE2's (bases with tiered
+  affixes). The item CATALOG (importers, browsing, licensing) belongs in
+  consumers regardless. Revisit only a narrow equip layer — slots,
+  co-equip constraints, item → `BuildState` lowering, an item-swap
+  `Move` — when one of these appears: a search driver that swaps items,
+  a third game whose gear shares a shape with an existing one, or a
+  wrong number traced to gear input that the consumer's own checks
+  missed.
