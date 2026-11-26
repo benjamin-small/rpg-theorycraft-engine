@@ -7,6 +7,19 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-26
+
+**Hit-level casts, first half.** Version 0.8.0 lets a timeline derive
+"Recently" conditions from the hits it simulates (#33):
+- an `on_non_crit` trigger;
+- event chances that read pipeline stages;
+- per-hit crit sampling (`crit_rolls`);
+- multi-strike casts made of timed segments;
+- sim timing fields that read Plan objectives, so cadence follows the build.
+
+Every config that names none of the new fields is byte-identical.
+Player cancels and outside interruptions follow in a later release.
+
 ### Upgrade notes
 - **Compiled sim programs are now `SimProgram`** (#33 slice 6). Affects
   only consumers that inspect `SimPlan` internals; configs and the run
