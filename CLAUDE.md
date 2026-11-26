@@ -70,7 +70,7 @@ cross-reference in the same commit (the 0.4.0 staging proved it).
     `cargo run -q -p d4-core --example eval` (no args) golden
     `17574.299999999996`.
   - `../poe2-theory-crafting` — `cargo test --workspace` green, and
-    `cargo test -p poe2-core --test rtce_parity` → 63 passed.
+    `cargo test -p poe2-core --test rtce_parity` → 96 passed.
 - `examples/diablo4_rotation.rs` EV **and** MC blocks byte-identical
   under serde defaults (the standing proof no RNG draw or event
   reordering leaked into the default path).
