@@ -634,8 +634,12 @@ pub struct ActionDef {
     ///   plan has events AND whose measured `n >= 2`. That is not limited
     ///   to plans with a `"crit"` event: with any event, the sampled
     ///   pipeline draws `n` independent branch masks per cast instead of
-    ///   one (an `on_crit`/`on_non_crit` proc is unaffected without a
-    ///   `"crit"` event, but the damage draws still move).
+    ///   one. And a crit-gated proc moves in EV even with NO `"crit"`
+    ///   event: the crit chance is then `p = 0`, so `on_non_crit` gets
+    ///   `p_hit = 1` and a `per_hit` `on_non_crit` proc with `icd > 0`
+    ///   changes from up to `n x chance` per cast to ONE accumulation of
+    ///   `1 - (1 - chance)^n` (pinned by
+    ///   `ev_per_hit_icd_on_non_crit_moves_without_a_crit_event`).
     /// - COST: per-hit sampling evaluates the sampled pipeline once per
     ///   hit (up to `PER_HIT_ROLL_LIMIT` = 10 000 per cast) instead of
     ///   once per cast. It stays allocation-free: only the crit COUNT is

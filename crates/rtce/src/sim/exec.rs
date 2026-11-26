@@ -2452,17 +2452,11 @@ impl<'a> Sim<'a> {
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = if self.rng.is_some() {
-                    // Run the whole-count rule FIRST whenever per_hit
-                    // resolves, so a fractional count fails closed even
-                    // when the shortcut below then skips the sampling.
-                    let per_hit = self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit;
-                    let n = if per_hit {
-                        Some(self.whole_hits(action, d, || {
-                            "crit_rolls resolves to per_hit".to_string()
-                        })?)
-                    } else {
-                        None
-                    };
+                    // The whole-count rule runs FIRST whenever per_hit
+                    // resolves (see `per_hit_sample_count`), so a
+                    // fractional count fails closed even when the
+                    // shortcut then skips the sampling.
+                    let n = self.per_hit_sample_count(action, d)?;
                     match n {
                         // Per-hit sampling matters only with events to
                         // sample and 2+ hits (n = 0 with events: zero
@@ -2471,7 +2465,7 @@ impl<'a> Sim<'a> {
                         // construction: `obj * h` and `obj` summed n
                         // times differ by an ulp for inexact `obj`, and
                         // `h` may sit within HITS_WHOLE_EPSILON of 1.
-                        Some(n) if self.plan.has_events() && n != 1 => {
+                        Some(n) => {
                             // Each hit is its OWN sampled draw (hits = 1)
                             // and the damage credited is the SUM. Only
                             // counts are kept — never per-hit masks.
@@ -2541,14 +2535,7 @@ impl<'a> Sim<'a> {
                 // Same condition as the MC sampling above — and the same
                 // whole-count rule, run whenever per_hit resolves so a
                 // fractional count fails closed in BOTH modes.
-                let independent_n = if self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit
-                {
-                    let n = self
-                        .whole_hits(action, d, || "crit_rolls resolves to per_hit".to_string())?;
-                    (self.plan.has_events() && n != 1).then_some(n)
-                } else {
-                    None
-                };
+                let independent_n = self.per_hit_sample_count(action, d)?;
                 let (on_crit, on_non_crit) = match independent_n {
                     Some(hits) => (
                         CritWeight::Independent {
@@ -2990,6 +2977,25 @@ impl<'a> Sim<'a> {
                 format!("proc `{}` rolls per_hit", self.sim_plan.procs[pi].name)
             }),
         }
+    }
+
+    /// The ONE selection of the per-hit crit path, shared by the MC
+    /// sampling and the EV weights so both choose by the same condition:
+    /// `Some(n)` iff the action's `crit_rolls` resolves `per_hit`, the
+    /// plan has events, and the measured count `n != 1` (`n = 0` is
+    /// `Some(0)`: no samples, no crit-gated rolls). The whole-count rule
+    /// runs whenever per_hit resolves, even when the answer is `None`,
+    /// so a fractional count fails closed in both modes.
+    fn per_hit_sample_count(
+        &self,
+        action: usize,
+        d: &DamageMeasure,
+    ) -> Result<Option<u64>, PlanError> {
+        if self.sim_plan.actions[action].crit_rolls != ProcRolls::PerHit {
+            return Ok(None);
+        }
+        let n = self.whole_hits(action, d, || "crit_rolls resolves to per_hit".to_string())?;
+        Ok((self.plan.has_events() && n != 1).then_some(n))
     }
 
     /// The whole-hit-count rule shared by every per-hit consumer of a
@@ -12633,8 +12639,9 @@ mod tests {
             assert_eq!(go("", PER_HIT_CRIT), 15, "absent / crit per_hit");
         }
 
-        // n = 1, no-event plans, and n = 0 with events cannot tell the
-        // two samplings apart: the whole EV report is byte-identical.
+        // n = 1 and no-event plans cannot tell the two samplings apart:
+        // the whole EV report is byte-identical. (n = 0 is NOT in this
+        // set: see `per_hit_crit_sampling_presents_no_crit_gated_roll_at_zero_hits`.)
         #[test]
         fn ev_per_hit_sampling_is_byte_identical_when_it_cannot_matter() {
             let procs = r#"{
@@ -12665,6 +12672,77 @@ mod tests {
                 go(&mp, &mb, "5", PER_CAST_CRIT),
                 "no events"
             );
+        }
+
+        // n = 0 with events: per_hit presents NO crit-gated roll (Counted
+        // { 0, 0 } in MC, weight 1 - 0.75^0 = 0 in EV), while per_cast
+        // still presents a Shared(p) on_crit roll: 20 x 0.25 = 5 fires.
+        #[test]
+        fn per_hit_crit_sampling_presents_no_crit_gated_roll_at_zero_hits() {
+            let json = |cr: &str| crit_nova("0", cr, ANY_CRIT_PROC);
+            let ev = |cr: &str| {
+                ev_json(
+                    &crit_plan(),
+                    &crit_build_25(),
+                    &json(cr),
+                    NOVA_ROT,
+                    &dummy(20),
+                )
+                .proc_counts["any"]
+            };
+            assert_eq!(ev(PER_HIT_CRIT), 0, "EV per_hit");
+            assert_eq!(ev(PER_CAST_CRIT), 5, "EV per_cast twin");
+            let mc = mc_json(
+                &crit_plan(),
+                &crit_build_25(),
+                &json(PER_HIT_CRIT),
+                NOVA_ROT,
+                &dummy(20),
+                1,
+                PER_HIT_SEED,
+            );
+            assert_eq!(
+                mc.proc_counts.get("any").copied().unwrap_or(0),
+                0,
+                "MC per_hit"
+            );
+        }
+
+        // A plan with events but NO "crit" event: crit_chance is 0, so
+        // on_non_crit gets Independent { p_hit: 1, hits: 5 } and an icd>0
+        // per_hit proc moves. p = 0 -> q = 0.1 -> ONE accumulation of
+        // 1 - 0.9^5 = 0.40951 per cast -> 20 casts sum 8.19 -> 8 fires.
+        // Twin per_cast sampling: +0.1 per hit until a fire, then the ICD
+        // (0.5 s, > hit instant) gates the rest; the fire is at the 10th
+        // hit = 2nd cast, ICD clears before the next cast -> a fire every
+        // 2 casts -> 10.
+        #[test]
+        fn ev_per_hit_icd_on_non_crit_moves_without_a_crit_event() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "op"],
+                     "events": { "overpower": { "chance": "op", "factor": "1.5" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * event_factors",
+                                     "branched": true } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "op": 0.3 } }"#).unwrap();
+            let procs = r#"{ "nc": { "trigger": "on_non_crit", "chance": "0.1",
+                "icd": 0.5, "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            let go = |cr: &str| {
+                ev_json(
+                    &plan,
+                    &build,
+                    &crit_nova("5", cr, procs),
+                    NOVA_ROT,
+                    &dummy(20),
+                )
+                .proc_counts["nc"]
+            };
+            assert_eq!(go(PER_HIT_CRIT), 8);
+            assert_eq!(go(PER_CAST_CRIT), 10);
         }
 
         // A plan with events but no crit-gated proc still resolves the

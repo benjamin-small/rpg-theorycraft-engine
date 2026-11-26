@@ -20,8 +20,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
   action), Monte Carlo now rolls crit independently per hit and EV
   crit-gated weights follow (#33). Only an action that resolves to
   `per_hit` in a plan WITH events and has more than one hit moves
-  (including a plan with events but no `"crit"` event, which now draws `n`
-  independent branch masks per cast instead of one). `"crit_rolls":
+  (including a plan with events but no `"crit"` event: it draws `n`
+  independent branch masks per cast instead of one, and in EV a `per_hit`
+  `on_non_crit` proc with `icd > 0` moves too, since the crit chance is 0). `"crit_rolls":
   "per_cast"` on an action restores the old behaviour. Per-hit sampling
   evaluates the sampled pipeline once per hit (up to 10 000 per cast),
   allocation-free.
