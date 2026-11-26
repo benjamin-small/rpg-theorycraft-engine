@@ -115,7 +115,7 @@ pub(crate) fn unknown_key_message(key: &str, context: &str, known: &[&str]) -> S
 /// within distance 2 (a typo, not a different word). Ties keep the
 /// earlier entry in `known` — deterministic, and `known` lists are
 /// declaration-ordered.
-fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn nearest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
     let mut best: Option<(&str, usize)> = None;
     for k in known {
         let d = edit_distance(key, k);

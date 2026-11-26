@@ -2313,8 +2313,9 @@ impl<'a> Sim<'a> {
         for bi in 0..sim_plan.buffs.len() {
             self.scratch.slots[stacks_base + bi] = self.buffs[bi].instances.len() as f64;
         }
-        // The two reserved segment words are the LAST two sim slots.
-        let end = sim_plan.slot_width;
+        // The two reserved segment words sit just before the objective
+        // region (`SimPlan::objective_base`), which closes the layout.
+        let end = sim_plan.objective_base;
         self.scratch.slots[end - 2] = f64::from(self.segments_done);
         self.scratch.slots[end - 1] = f64::from(self.segments_total - self.segments_done);
     }
