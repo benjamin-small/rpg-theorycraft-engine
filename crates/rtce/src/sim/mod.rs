@@ -35,6 +35,19 @@
 //! - `stacks.<buff>` — `<buff>`'s live instance count as an `f64` (`0`
 //!   when inactive). The counted companion to `buff.<buff>`; see
 //!   [`crate::simdef::BuffDef`] for what a stack count scales.
+//! - `objective.<name>` — a `Plan` objective's DETERMINISTIC
+//!   `evaluate_phase` value (branch-weighted expectation, never sampled,
+//!   no RNG draw, in both modes), evaluated at the reading field's own
+//!   instant against that field's world: the effective build WITH the
+//!   action's (or segment's) `damage.stats` overlay for action
+//!   `cast_time`/`cooldown`/`cost`/`gain` and segment `duration` (the
+//!   plain effective build for a utility action and for a segmented
+//!   action's action-level fields), the plain effective build for buff
+//!   `duration`, proc `chance` and rule `when`; always the effective
+//!   phase. Legal ONLY in those fields — in `damage.stats` (circular)
+//!   and resource `max`/`regen_per_sec` (refold-time) it is a compile
+//!   error, and an unknown name gets a did-you-mean. A field that reads
+//!   none pays nothing. A non-finite value fails closed at the field.
 //!
 //! A buff's [`crate::simdef::BuffDef::tick_objective`] names a `Plan`
 //! objective rather than an expression, and takes either of two shapes: a
@@ -287,22 +300,28 @@
 //! The executor ([`run`]) maintains one flat `&[f64]` slot array shaped
 //! `[Plan's own slot layout | sim slots]` — [`compile::SimPlan::sim_base`]
 //! marks where the sim segment begins, [`compile::SimPlan::slot_width`]
-//! its total width. The sim segment itself is laid out in EXACTLY this
+//! its total width (ending with the objective region, which starts at
+//! [`compile::SimPlan::objective_base`]). The sim segment itself is laid out in EXACTLY this
 //! order, each named sub-range sorted by name (`SimDef`'s registries are
 //! `BTreeMap`s, which already iterate sorted):
 //!
 //! ```text
 //! [ time, duration, resources…, cooldown.<action>…, buff.<buff>…,
 //!   buff_remaining.<buff>…, casts.<action>…, stacks.<buff>…,
-//!   segments_done, segments_remain ]
+//!   segments_done, segments_remain, objective.<name>… ]
 //! ```
+//!
+//! The `objective.<name>…` region is one slot per `Plan` objective in
+//! the Plan's objective order (NOT name-sorted), and is the one region
+//! the per-instant tail refresh does not write: it is filled only
+//! immediately before a program that reads it.
 
 mod compile;
 mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
-    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan,
+    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan, SimProgram,
 };
 pub use exec::{run, Mode};
 pub use report::{
