@@ -959,6 +959,28 @@ enum CritOutcome {
     Counted { crit_hits: u64, hits: u64 },
 }
 
+/// The crit weight [`Sim::roll_procs_ev`] multiplies a proc's chance by —
+/// the EV twin of [`CritOutcome`], chosen by the SAME condition (the
+/// action resolves `crit_rolls: per_hit`, the plan has events, and the
+/// measured hit count `n != 1`; otherwise `Shared`, so the two modes
+/// agree and the "byte-identical when it cannot matter" cells hold).
+///
+/// - `Shared(w)`: one weight for the whole cast — `1.0` for
+///   `OnCast`/`OnHit`, `p` / `1 − p` for `OnCrit` / `OnNonCrit` under a
+///   per_cast `crit_rolls`. Exactly the pre-slice-3 `weight: f64`.
+/// - `Independent { p_hit, hits }`: `hits` independent hits each with
+///   this trigger's per-hit probability `p_hit` (`p` for `OnCrit`,
+///   `1 − p` for `OnNonCrit`). A `per_cast` proc's weight is
+///   `1 − (1 − p_hit)^hits` (any hit qualifies); a `per_hit` proc with
+///   `icd > 0` makes ONE accumulation of `1 − (1 − q)^hits` with
+///   `q = chance × p_hit`; a `per_hit` proc with `icd: 0` makes `hits`
+///   accumulations of `chance × p_hit`, as it always did.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CritWeight {
+    Shared(f64),
+    Independent { p_hit: f64, hits: u64 },
+}
+
 /// Running integral of one tracked condition's effective value over time
 /// (buff-driven while a buff is active, else the current phase's static
 /// uptime — see [`Sim::condition_value`]).
@@ -2509,15 +2531,43 @@ impl<'a> Sim<'a> {
                 self.roll_procs_mc(Trigger::OnNonCrit, non_crit, action, Some(d))?;
             }
         } else {
-            self.roll_procs_ev(Trigger::OnCast, 1.0, action, None)?;
+            let shared = CritWeight::Shared(1.0);
+            self.roll_procs_ev(Trigger::OnCast, shared, action, None)?;
             if let Some(d) = damage_measure {
                 let crit_chance = d.crit_chance.expect(
                     "capture_world(.., true) fills crit_chance for a \
                      damaging action in EV mode",
                 );
-                self.roll_procs_ev(Trigger::OnHit, 1.0, action, Some(d))?;
-                self.roll_procs_ev(Trigger::OnCrit, crit_chance, action, Some(d))?;
-                self.roll_procs_ev(Trigger::OnNonCrit, 1.0 - crit_chance, action, Some(d))?;
+                // Same condition as the MC sampling above — and the same
+                // whole-count rule, run whenever per_hit resolves so a
+                // fractional count fails closed in BOTH modes.
+                let independent_n = if self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit
+                {
+                    let n = self
+                        .whole_hits(action, d, || "crit_rolls resolves to per_hit".to_string())?;
+                    (self.plan.has_events() && n != 1).then_some(n)
+                } else {
+                    None
+                };
+                let (on_crit, on_non_crit) = match independent_n {
+                    Some(hits) => (
+                        CritWeight::Independent {
+                            p_hit: crit_chance,
+                            hits,
+                        },
+                        CritWeight::Independent {
+                            p_hit: 1.0 - crit_chance,
+                            hits,
+                        },
+                    ),
+                    None => (
+                        CritWeight::Shared(crit_chance),
+                        CritWeight::Shared(1.0 - crit_chance),
+                    ),
+                };
+                self.roll_procs_ev(Trigger::OnHit, shared, action, Some(d))?;
+                self.roll_procs_ev(Trigger::OnCrit, on_crit, action, Some(d))?;
+                self.roll_procs_ev(Trigger::OnNonCrit, on_non_crit, action, Some(d))?;
             }
         }
         Ok(())
@@ -2803,10 +2853,29 @@ impl<'a> Sim<'a> {
     ///   removed — see
     ///   `ev_procs_match_mc_in_the_per_hit_icd_bound_regime_regression`).
     ///   `icd: 0` never gates, so multiple crossings per cast can fire.
+    ///
+    /// # Crit weight ([`CritWeight`], slice 3 of #33)
+    ///
+    /// `weight` scales the proc's `chance`. `Shared(w)` is the one
+    /// per-cast weight (`1.0` for `on_cast`/`on_hit`; `p` / `1 − p` for
+    /// the crit-gated triggers under a per_cast `crit_rolls`).
+    /// `Independent { p_hit, hits }` is the resolved-per_hit case (events
+    /// in the plan, `hits != 1`), where hits crit independently:
+    ///
+    /// - a `per_cast` proc: one roll at `chance × (1 − (1 − p_hit)^hits)`
+    ///   — "any hit qualifies";
+    /// - a `per_hit` proc with `icd > 0`: ONE accumulation of
+    ///   `1 − (1 − q)^hits`, `q = clamp(chance × p_hit, 0, 1)` — the ICD
+    ///   allows at most one fire per cast, so multiplying by `hits`
+    ///   would double-count;
+    /// - a `per_hit` proc with `icd: 0`: `hits` accumulations of
+    ///   `chance × p_hit`, unchanged from the shared-mask arithmetic.
+    ///
+    /// The hard ICD gate and the `actions` filter run before any of it.
     fn roll_procs_ev(
         &mut self,
         trigger: Trigger,
-        weight: f64,
+        weight: CritWeight,
         action: usize,
         measure: Option<&DamageMeasure>,
     ) -> Result<(), PlanError> {
@@ -2835,7 +2904,31 @@ impl<'a> Sim<'a> {
             // `casts.*`, telling the same story). Once per CAST, not per
             // hit — see the doc comment.
             self.refresh_time_varying_slots();
-            let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots) * weight;
+            let base = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
+            let (chance, rolls) = match weight {
+                CritWeight::Shared(w) => (base * w, rolls),
+                CritWeight::Independent { p_hit, hits } => {
+                    let p_hit = p_hit.clamp(0.0, 1.0);
+                    // `hits` is capped at PER_HIT_ROLL_LIMIT (whole_hits).
+                    let n = hits as i32;
+                    match (
+                        self.sim_plan.procs[pi].rolls,
+                        self.sim_plan.procs[pi].icd > 0.0,
+                    ) {
+                        // Any hit qualifies the cast: one roll.
+                        (ProcRolls::PerCast, _) => (base * (1.0 - (1.0 - p_hit).powi(n)), 1),
+                        // The ICD arms on the first fire and the hits
+                        // are simultaneous: at most ONE fire per cast,
+                        // so ONE accumulation of P(>= 1 hit fires).
+                        (ProcRolls::PerHit, true) => {
+                            let q = (base * p_hit).clamp(0.0, 1.0);
+                            (1.0 - (1.0 - q).powi(n), 1)
+                        }
+                        // No gate: every hit accumulates, as always.
+                        (ProcRolls::PerHit, false) => (base * p_hit, rolls),
+                    }
+                }
+            };
             for _ in 0..rolls {
                 if now < self.procs[pi].icd_ready_at {
                     // A fire earlier in THIS loop armed the ICD; `now` is
@@ -12321,9 +12414,9 @@ mod tests {
         // Add `any` on_crit per_cast chance 1 icd 0: under per-hit
         // sampling it fires iff >= 1 of the cast's 5 hits crit, so
         //   any <= 20, any <= c, 5 * any >= c — and STRICTLY
-        //   5 * any > c here (equality needs every crit cast to hold
-        //   exactly one crit hit, which is exactly the shared-mask
-        //   world: there `c == 5 * any` always).
+        //   5 * any > c here (equality needs all five hits of every
+        //   crit cast to crit, which is exactly the shared-mask world:
+        //   there `c == 5 * any` always).
         #[test]
         fn mc_a_per_cast_proc_gates_on_any_hit_crit_under_per_hit_sampling() {
             let procs = r#"{
@@ -12444,6 +12537,187 @@ mod tests {
                 assert!(e.contains(needle), "missing `{needle}` in: {e}");
             }
             assert!(run_mc(PER_CAST_CRIT).is_ok(), "per_cast samples 2.5 fine");
+        }
+
+        // --------------------------------------------------------------
+        // PER-HIT CRIT SAMPLING, EV side. `nova` = 5 hits/cast, 20 casts,
+        // dmg 100, cc 0.25. Every number is exact in binary
+        // (0.75^5 = 243/1024, 0.25^5 = 1/1024), so the accumulators have
+        // no rounding drift.
+        // --------------------------------------------------------------
+        fn ev_crit_nova(crit_rolls: &str, procs: &str) -> SimReport {
+            ev_json(
+                &crit_plan(),
+                &crit_build_25(),
+                &crit_nova("5", crit_rolls, procs),
+                NOVA_ROT,
+                &dummy(20),
+            )
+        }
+
+        // `rolls: per_cast` is explicit: `defaults.proc_rolls: per_hit`
+        // (the resolution-cells test) would otherwise flip the PROC's
+        // own axis too, and the cell would stop isolating `crit_rolls`.
+        const ANY_CRIT_PROC: &str = r#"{ "any": { "trigger": "on_crit", "chance": "1",
+            "icd": 0, "apply_buff": "glow", "rolls": "per_cast" } }"#;
+
+        // per_cast on_crit chance 1 icd 0: weight 1 - 0.75^5 = 781/1024
+        // per cast -> 20 casts: sum 15.2539 -> floor = 15 fires.
+        // Contrast crit_rolls per_cast: 0.25/cast -> 5.
+        #[test]
+        fn ev_per_cast_on_crit_under_per_hit_sampling_weights_any_hit_crit() {
+            assert_eq!(
+                ev_crit_nova(PER_HIT_CRIT, ANY_CRIT_PROC).proc_counts["any"],
+                15
+            );
+            assert_eq!(
+                ev_crit_nova(PER_CAST_CRIT, ANY_CRIT_PROC).proc_counts["any"],
+                5
+            );
+        }
+
+        // per_cast on_non_crit chance 1 icd 0: weight 1 - 0.25^5 =
+        // 1023/1024 -> sum 19.98 -> 19. Contrast per_cast sampling:
+        // 0.75/cast -> 15.
+        #[test]
+        fn ev_per_cast_on_non_crit_under_per_hit_sampling_weights_any_hit_non_crit() {
+            let procs = r#"{ "any": { "trigger": "on_non_crit", "chance": "1",
+                "icd": 0, "apply_buff": "glow" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, procs).proc_counts["any"], 19);
+            assert_eq!(ev_crit_nova(PER_CAST_CRIT, procs).proc_counts["any"], 15);
+        }
+
+        // per_hit on_crit chance 1 icd 0.5 (clears before the next 1 s
+        // cast): ONE accumulation of 1 - (1 - 0.25)^5 = 781/1024 per cast
+        // -> 15. Contrast per_cast sampling (shared mask: the per-hit
+        // accumulation hits 1.0 on the 4th hit every cast) -> 20.
+        #[test]
+        fn ev_per_hit_icd_proc_under_per_hit_sampling_fires_with_one_minus_one_minus_q_to_the_n() {
+            let procs = r#"{ "hit": { "trigger": "on_crit", "chance": "1",
+                "icd": 0.5, "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, procs).proc_counts["hit"], 15);
+            assert_eq!(ev_crit_nova(PER_CAST_CRIT, procs).proc_counts["hit"], 20);
+        }
+
+        // per_hit on_crit chance 1 icd 0: n x 0.25 = 1.25/cast -> 25
+        // under BOTH samplings (independent hits and a shared mask have
+        // the same per-hit expectation; icd 0 never gates).
+        #[test]
+        fn ev_per_hit_icd0_proc_is_unchanged_by_crit_sampling() {
+            let procs = r#"{ "hit": { "trigger": "on_crit", "chance": "1",
+                "icd": 0, "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, procs).proc_counts["hit"], 25);
+            assert_eq!(ev_crit_nova(PER_CAST_CRIT, procs).proc_counts["hit"], 25);
+        }
+
+        // The four resolution cells end to end (EV, the per_cast on_crit
+        // proc from the first test): defaults absent / crit absent -> 5;
+        // defaults per_hit / crit absent -> 15; defaults per_hit / crit
+        // per_cast -> 5; defaults absent / crit per_hit -> 15.
+        #[test]
+        fn ev_crit_rolls_resolution_cells_are_each_visible() {
+            let go = |defaults: &str, cr: &str| {
+                let json =
+                    crit_nova("5", cr, ANY_CRIT_PROC).replacen("{", &format!("{{ {defaults}"), 1);
+                ev_json(&crit_plan(), &crit_build_25(), &json, NOVA_ROT, &dummy(20)).proc_counts
+                    ["any"]
+            };
+            let per_hit_defaults = r#""defaults": { "proc_rolls": "per_hit" },"#;
+            assert_eq!(go("", ""), 5, "absent / absent");
+            assert_eq!(go(per_hit_defaults, ""), 15, "defaults per_hit / absent");
+            assert_eq!(
+                go(per_hit_defaults, PER_CAST_CRIT),
+                5,
+                "defaults per_hit / crit per_cast"
+            );
+            assert_eq!(go("", PER_HIT_CRIT), 15, "absent / crit per_hit");
+        }
+
+        // n = 1, no-event plans, and n = 0 with events cannot tell the
+        // two samplings apart: the whole EV report is byte-identical.
+        #[test]
+        fn ev_per_hit_sampling_is_byte_identical_when_it_cannot_matter() {
+            let procs = r#"{
+                "c": { "trigger": "on_crit", "chance": "0.5", "icd": 0,
+                       "apply_buff": "glow" },
+                "n": { "trigger": "on_hit", "chance": "0.5", "icd": 0,
+                       "apply_buff": "glow", "rolls": "per_hit" },
+                "h": { "trigger": "on_crit", "chance": "0.5", "icd": 0.5,
+                       "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            let go = |plan: &Plan, build: &BuildState, hits: &str, cr: &str| {
+                serde_json::to_string(&ev_json(
+                    plan,
+                    build,
+                    &crit_nova(hits, cr, procs),
+                    NOVA_ROT,
+                    &dummy(20),
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                go(&crit_plan(), &crit_build_25(), "1", PER_HIT_CRIT),
+                go(&crit_plan(), &crit_build_25(), "1", PER_CAST_CRIT),
+                "n = 1"
+            );
+            let (mp, mb) = (minimal_plan(), minimal_build());
+            assert_eq!(
+                go(&mp, &mb, "5", PER_HIT_CRIT),
+                go(&mp, &mb, "5", PER_CAST_CRIT),
+                "no events"
+            );
+        }
+
+        // A plan with events but no crit-gated proc still resolves the
+        // whole-count rule in EV: fractional hits fail closed there too.
+        #[test]
+        fn ev_fractional_hits_fail_closed_under_per_hit_crit_sampling() {
+            let run_ev = |cr: &str| {
+                let sp = compile_json(&crit_plan(), &crit_nova("2.5", cr, "{}"), NOVA_ROT);
+                run(
+                    &crit_plan(),
+                    &sp,
+                    &crit_build_25(),
+                    &dummy(5),
+                    Mode::Expected,
+                )
+            };
+            let e = run_ev(PER_HIT_CRIT).unwrap_err().what;
+            for needle in ["crit_rolls", "per_hit", "nova", "2.5"] {
+                assert!(e.contains(needle), "missing `{needle}` in: {e}");
+            }
+            assert!(run_ev(PER_CAST_CRIT).is_ok());
+        }
+
+        // The spec's P(>=1 crit) contrast, EV vs MC agreement: per_cast
+        // on_crit chance 1, icd 0. Per_hit sampling: EV 15, MC mean within
+        // 5% of 15.25 (E = 20 x 781/1024); per_cast sampling: EV 5, MC
+        // mean within 10% of 5.
+        #[test]
+        fn five_strike_at_least_one_crit_agrees_between_ev_and_mc() {
+            let mc_mean = |cr: &str| {
+                mc_json(
+                    &crit_plan(),
+                    &crit_build_25(),
+                    &crit_nova("5", cr, ANY_CRIT_PROC),
+                    NOVA_ROT,
+                    &dummy(20),
+                    2_000,
+                    20261126,
+                )
+                .proc_counts["any"] as f64
+            };
+            assert_eq!(
+                ev_crit_nova(PER_HIT_CRIT, ANY_CRIT_PROC).proc_counts["any"],
+                15
+            );
+            let m = mc_mean(PER_HIT_CRIT);
+            assert!((m - 15.25).abs() / 15.25 < 0.05, "per_hit MC mean {m}");
+            assert_eq!(
+                ev_crit_nova(PER_CAST_CRIT, ANY_CRIT_PROC).proc_counts["any"],
+                5
+            );
+            let m = mc_mean(PER_CAST_CRIT);
+            assert!((m - 5.0).abs() / 5.0 < 0.10, "per_cast MC mean {m}");
         }
 
         // --------------------------------------------------------------

@@ -630,6 +630,16 @@ pub struct ActionDef {
     ///   procs fire at most once per cast, with probability
     ///   `1 - (1 - q)^n`, `q = chance * p` (`* (1 - p)` for
     ///   `on_non_crit`).
+    /// - WHO MOVES: only an action that resolves to `per_hit` AND whose
+    ///   plan has events AND whose measured `n >= 2`. That is not limited
+    ///   to plans with a `"crit"` event: with any event, the sampled
+    ///   pipeline draws `n` independent branch masks per cast instead of
+    ///   one (an `on_crit`/`on_non_crit` proc is unaffected without a
+    ///   `"crit"` event, but the damage draws still move).
+    /// - COST: per-hit sampling evaluates the sampled pipeline once per
+    ///   hit (up to `PER_HIT_ROLL_LIMIT` = 10 000 per cast) instead of
+    ///   once per cast. It stays allocation-free: only the crit COUNT is
+    ///   kept, never per-hit masks.
     /// - `n = 1`, or a plan with no events at all, is identical to
     ///   `per_cast`, byte-for-byte, BY CONSTRUCTION: the executor takes
     ///   the `per_cast` path outright (a per-hit sum can differ from

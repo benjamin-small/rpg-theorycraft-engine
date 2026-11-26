@@ -11,8 +11,26 @@ until then, per semver's "anything goes" pre-1.0 clause).
 - `Trigger` gained a variant (`OnNonCrit`): an exhaustive downstream
   `match` on it needs an arm. JSON and every existing config are
   unchanged.
+- Rust `ActionDef` struct literals need `crit_rolls: None`. A fractional
+  `hits_per_use` now fails under a resolved `per_hit` even with no
+  `per_hit` proc.
+
+### Changed
+- Under `defaults.proc_rolls: "per_hit"` (or `crit_rolls: "per_hit"` on an
+  action), Monte Carlo now rolls crit independently per hit and EV
+  crit-gated weights follow (#33). Only an action that resolves to
+  `per_hit` in a plan WITH events and has more than one hit moves
+  (including a plan with events but no `"crit"` event, which now draws `n`
+  independent branch masks per cast instead of one). `"crit_rolls":
+  "per_cast"` on an action restores the old behaviour. Per-hit sampling
+  evaluates the sampled pipeline once per hit (up to 10 000 per cast),
+  allocation-free.
 
 ### Added
+- **`ActionDef::crit_rolls`** (`per_cast` | `per_hit`, default inherits
+  `defaults.proc_rolls`) — how an action's hits are sampled for crit; a
+  `per_cast` `on_crit`/`on_non_crit` proc gates on any hit, EV weight
+  `1 - (1 - p)^n` (#33).
 - Event `chance`/`factor` may read pipeline stages before the first
   branched stage (#33). A later stage is a compile error naming it. The
   sim's EV crit weight evaluates the same prefix. Configs that read no
