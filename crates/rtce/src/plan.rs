@@ -2076,16 +2076,17 @@ mod tests {
         assert!(close(p, 0.2), "{p}");
     }
 
-    // Build A (crit_base 40 -> 0.8) fills the slot; build B (crit_base 10)
-    // on the SAME scratch must give 0.2, not the stale 0.8.
+    // `evaluate` on build A (crit_base 40 -> eff_crit 80) leaves 80 in the
+    // stage slot of the SAME scratch; `crit_chance` for build B
+    // (crit_base 10) must recompute it to 0.2, not read the stale 0.8.
     #[test]
     fn crit_chance_does_not_read_stale_stage_slots() {
         let plan = compile(&prefix_def()).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
         let mut scratch = plan.scratch();
-        let a = plan
-            .crit_chance(&prefix_build(40.0), &prefix_phase(), &mut scratch)
+        plan.evaluate(&prefix_build(40.0), &scenario, &mut scratch)
             .unwrap();
-        assert!(close(a, 0.8), "{a}");
         let b = plan
             .crit_chance(&prefix_build(10.0), &prefix_phase(), &mut scratch)
             .unwrap();
