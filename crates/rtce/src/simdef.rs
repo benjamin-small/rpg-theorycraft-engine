@@ -312,15 +312,16 @@ pub enum EventOrder {
 /// # Scope: which rolls this governs
 ///
 /// The knob governs the HIT-driven triggers ([`Trigger::OnHit`],
-/// [`Trigger::OnCrit`], [`Trigger::OnNonCrit`]) — the ones whose event today approximates "the
-/// cast's hits" as a single roll. An [`Trigger::OnCast`] proc's event is
-/// the CAST itself, so it rolls once per cast under either setting,
-/// whatever `rolls` says (the [`Measure`]-on-instant-casts precedent:
-/// documented behavior, not an error — a utility cast has no hits at
-/// all, so there is nothing for `per_hit` to count there). Unchanged
-/// rules: a utility cast (no damage) presents no `on_hit`/`on_crit`/`on_non_crit`
-/// roll under either policy, and a proc-triggered FREE cast rolls no
-/// procs at all (P7d), so its hits are never counted by anyone.
+/// [`Trigger::OnCrit`], [`Trigger::OnNonCrit`]) — the ones whose event
+/// today approximates "the cast's hits" as a single roll. An
+/// [`Trigger::OnCast`] proc's event is the CAST itself, so it rolls once
+/// per cast under either setting, whatever `rolls` says (the
+/// [`Measure`]-on-instant-casts precedent: documented behavior, not an
+/// error — a utility cast has no hits at all, so there is nothing for
+/// `per_hit` to count there). Unchanged rules: a utility cast (no damage)
+/// presents no `on_hit`/`on_crit`/`on_non_crit` roll under either policy,
+/// and a proc-triggered FREE cast rolls no procs at all (P7d), so its hits
+/// are never counted by anyone.
 ///
 /// # The ICD-at-one-instant rule
 ///

@@ -7,6 +7,18 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Upgrade notes
+- `Trigger` gained a variant (`OnNonCrit`): an exhaustive downstream
+  `match` on it needs an arm. JSON and every existing config are
+  unchanged.
+
+### Added
+- **`on_non_crit` proc trigger** (#33) — the complement of `on_crit`.
+  EV weight is `1 − crit_chance`; MC rolls when the cast's sampled crit
+  bit is clear (the same single draw `on_crit` gates on, so the pair
+  fires exactly once per cast at chance 1). Same `rolls`/`icd`/`actions`
+  semantics as `on_crit`; with no `"crit"` event every hit qualifies.
+
 ## [0.7.0] — 2026-11-21
 
 **Sequential and long-running recurrences.** Version 0.7.0 adds ordered

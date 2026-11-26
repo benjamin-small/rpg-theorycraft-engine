@@ -2444,6 +2444,7 @@ impl<'a> Sim<'a> {
             if let Some(d) = damage_measure {
                 self.roll_procs_mc(Trigger::OnHit, true, action, Some(d))?;
                 self.roll_procs_mc(Trigger::OnCrit, is_crit, action, Some(d))?;
+                self.roll_procs_mc(Trigger::OnNonCrit, !is_crit, action, Some(d))?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0, action, None)?;
@@ -2685,11 +2686,10 @@ impl<'a> Sim<'a> {
     /// EV mode: the accumulator method (see module docs). `weight`
     /// multiplies each qualifying roll's `chance` BEFORE accumulation —
     /// `1.0` for `OnCast`/`OnHit` (every cast/hit qualifies outright),
-    /// `1 − crit_chance` for `OnNonCrit` (the exact complement of
-    /// `OnCrit`'s weight), and
-    /// (the EV-consistent choice this task pins, since the design spec is
-    /// silent on it) `crit_chance` for `OnCrit`: a hit isn't "certainly" a
-    /// crit in EV mode, so an `on_crit` proc's per-hit contribution is
+    /// `crit_chance` for `OnCrit` and `1 − crit_chance` for `OnNonCrit`
+    /// (its exact complement). The `OnCrit` weight is the EV-consistent
+    /// choice this task pins, since the design spec is silent on it: a hit
+    /// isn't "certainly" a crit in EV mode, so an `on_crit` proc's per-hit contribution is
     /// `proc_chance × P(crit)`, not `proc_chance` outright — this is
     /// exactly what makes the EV accumulator's LONG-RUN fire rate agree
     /// with MC mode's (which only rolls `on_crit` procs on hits that
@@ -2882,7 +2882,8 @@ impl<'a> Sim<'a> {
     /// and — mirroring `roll_procs_ev`'s `on_crit` weighting, but exactly
     /// rather than probabilistically — whether THIS hit's sampled branch
     /// actually fired the `"crit"` event for `OnCrit` (see
-    /// [`Sim::eval_action_damage_sampled`]).
+    /// [`Sim::eval_action_damage_sampled`]), and its negation (`!is_crit`)
+    /// for `OnNonCrit`.
     ///
     /// `action` is the cast that produced this event, matched against each
     /// proc's [`crate::simdef::ProcDef::actions`] filter (see
@@ -9717,6 +9718,115 @@ mod tests {
             };
             assert_eq!(count(Some(vec!["a".into()])), 10);
             assert_eq!(count(None), 20);
+        }
+
+        // The `icd > 0` cell on the EV path. Same fixture as the weighting
+        // test (crit 0.25 → +0.75 per UNGATED hit, an ICD-gated hit banks
+        // nothing), `icd` 1.5 on 1 s casts: hits at t=1..10, a fire at
+        // acc >= 1 starts the gate (t=2 gated at 3 → blocks t=3):
+        //   t=1 .75 · t=2 1.5 fire (.5), gate to 3.5 · t=3 gated ·
+        //   t=4 1.25 fire (.25), gate to 5.5 · t=5 gated ·
+        //   t=6 1.0 fire (0), gate to 7.5 · t=7 gated ·
+        //   t=8 .75 · t=9 1.5 fire (.5), gate to 10.5 · t=10 gated → 4.
+        // Contrast: icd 0 gives 7 (the weighting test).
+        #[test]
+        fn ev_on_non_crit_respects_the_icd() {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "crit_chance": 25.0 } }"#)
+                    .unwrap();
+            let mut simdef = alternating_simdef(None, Trigger::OnNonCrit, "1");
+            simdef.procs.get_mut("spark").unwrap().icd = 1.5;
+            let r = ev_with(&plan, &build, &simdef, &only("a"), 10);
+            assert_eq!(r.proc_counts["spark"], 4);
+        }
+
+        /// `crit_proc` (`on_crit`) + `non_crit_proc` (`on_non_crit`), both
+        /// chance 1, icd 0, over `alternating_simdef`'s actions.
+        fn crit_pair_simdef() -> SimDef {
+            let mut simdef = alternating_simdef(None, Trigger::OnCrit, "1");
+            let mut crit = simdef.procs.remove("spark").unwrap();
+            let mut non_crit = crit.clone();
+            crit.trigger = Trigger::OnCrit;
+            non_crit.trigger = Trigger::OnNonCrit;
+            simdef.procs.insert("crit_proc".into(), crit);
+            simdef.procs.insert("non_crit_proc".into(), non_crit);
+            simdef
+        }
+
+        fn mc_once(plan: &Plan, build: &BuildState, simdef: &SimDef, seed: u64) -> SimReport {
+            let sim_plan = sim_compile(plan, simdef, &only("a")).unwrap();
+            run(
+                plan,
+                &sim_plan,
+                build,
+                &dummy(10),
+                Mode::MonteCarlo {
+                    iterations: 1,
+                    seed,
+                },
+            )
+            .unwrap()
+        }
+
+        // `on_non_crit` (MC): rolled from the SAME sampled crit bit as
+        // `on_crit`, so with chance 1 / icd 0 exactly one of the pair fires
+        // per cast. `iterations: 1` makes `proc_counts` exact counts. Seed
+        // 42 is kept only if both branches occur (asserted below).
+        #[test]
+        fn mc_on_crit_and_on_non_crit_are_exact_complements_per_cast() {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "crit_chance": 25.0 } }"#)
+                    .unwrap();
+            let mc = mc_once(&plan, &build, &crit_pair_simdef(), 42);
+            assert_eq!(mc.actions["a"].casts, 10);
+            assert_eq!(
+                mc.proc_counts["crit_proc"] + mc.proc_counts["non_crit_proc"],
+                10
+            );
+            assert!(
+                mc.proc_counts["non_crit_proc"] > 0 && mc.proc_counts["crit_proc"] > 0,
+                "seed 42 must exercise both branches — pick another seed if not"
+            );
+        }
+
+        // `scoped_plan()` has no crit event → no cast ever crits → every
+        // hit is a non-crit.
+        #[test]
+        fn mc_on_non_crit_fires_every_hit_without_a_crit_event() {
+            let plan = scoped_plan();
+            let simdef = alternating_simdef(None, Trigger::OnNonCrit, "1");
+            let mc = mc_once(&plan, &scoped_build(), &simdef, 42);
+            assert_eq!(mc.actions["a"].casts, 10);
+            assert_eq!(mc.proc_counts["spark"], 10);
+        }
+
+        // `per_hit` on_non_crit: one shared crit mask per cast (per-hit
+        // sampling is slice 3), so MC fires are whole multiples of the 5
+        // hits; EV is 10 casts × 5 hits × 0.75 = 37.5 → 37 fires.
+        #[test]
+        fn per_hit_on_non_crit_shares_the_cast_mask_in_mc() {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "crit_chance": 25.0 } }"#)
+                    .unwrap();
+            let mut simdef = alternating_simdef(None, Trigger::OnNonCrit, "1");
+            let mut stats = BTreeMap::new();
+            stats.insert("hits_per_use".to_string(), NumOrExpr::Num(5.0));
+            simdef
+                .actions
+                .insert("a".to_string(), damaging("1", 0.0, stats, Vec::new()));
+            simdef.procs.get_mut("spark").unwrap().rolls = Some(ProcRolls::PerHit);
+            let mc = mc_once(&plan, &build, &simdef, 42);
+            assert_eq!(mc.actions["a"].casts, 10);
+            assert_eq!(mc.proc_counts["spark"] % 5, 0);
+            assert!(
+                mc.proc_counts["spark"] > 0,
+                "a zero count is a vacuous multiple of 5"
+            );
+            let ev = ev_with(&plan, &build, &simdef, &only("a"), 10);
+            assert_eq!(ev.proc_counts["spark"], 37);
         }
 
         // A cast the filter excludes banks NOTHING in the EV accumulator —
