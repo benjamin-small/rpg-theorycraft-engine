@@ -79,7 +79,7 @@ pub struct EventDef {
     /// the first branched stage or any later stage (including a later
     /// non-branched one) is a positioned compile error, since those stages
     /// depend on this event's own outcome; `event_factors` is not readable
-    /// here either.
+    /// here either. Configs whose events read no stage are unchanged.
     pub chance: String,
     /// Expression over declared stats, conditions, buckets (with buckets
     /// refolded for this branch), and the pipeline stages BEFORE the first
@@ -90,7 +90,7 @@ pub struct EventDef {
     /// the event fires, reading the phase's prefix-stage values (stages are
     /// not recomputed per branch) and this branch's refolded buckets.
     /// INTERACTIONS: the same stage-readability rule and compile error as
-    /// `chance`.
+    /// `chance`. Configs whose events read no stage are unchanged.
     pub factor: String,
     /// Unknown keys collected at parse (P8a). `_`-prefixed keys are the
     /// annotation namespace: accepted at every nesting level and carried
