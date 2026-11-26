@@ -9819,15 +9819,66 @@ mod tests {
                 .actions
                 .insert("a".to_string(), damaging("1", 0.0, stats, Vec::new()));
             simdef.procs.get_mut("spark").unwrap().rolls = Some(ProcRolls::PerHit);
+            // Companion in the SAME run: same trigger, chance 1, icd 0, but
+            // one roll per cast. Both see the same masks, so per-hit fires
+            // are exactly 5x the per-cast fires.
+            let mut companion = simdef.procs["spark"].clone();
+            companion.rolls = Some(ProcRolls::PerCast);
+            simdef.procs.insert("spark_cast".into(), companion);
             let mc = mc_once(&plan, &build, &simdef, 42);
             assert_eq!(mc.actions["a"].casts, 10);
             assert_eq!(mc.proc_counts["spark"] % 5, 0);
             assert!(
-                mc.proc_counts["spark"] > 0,
+                mc.proc_counts["spark_cast"] > 0,
                 "a zero count is a vacuous multiple of 5"
+            );
+            assert_eq!(
+                mc.proc_counts["spark"],
+                5 * mc.proc_counts["spark_cast"],
+                "per-hit rolls share the cast's crit mask: 5 hits per qualifying cast"
             );
             let ev = ev_with(&plan, &build, &simdef, &only("a"), 10);
             assert_eq!(ev.proc_counts["spark"], 37);
+        }
+
+        // `icd` on the MC path. `scoped_plan` has no crit event, so every hit
+        // is a non-crit (deterministic). 1 s casts over 10 s: hits t=1..10; a
+        // fire at t arms the gate to t+1.5, so t+1 is gated and t+2 fires:
+        // fires at 1, 3, 5, 7, 9 → 5. Contrast: icd 0 → 10.
+        #[test]
+        fn mc_on_non_crit_respects_the_icd() {
+            let plan = scoped_plan();
+            let mut simdef = alternating_simdef(None, Trigger::OnNonCrit, "1");
+            let free = mc_once(&plan, &scoped_build(), &simdef, 42);
+            assert_eq!(free.proc_counts["spark"], 10, "contrast: icd 0");
+            simdef.procs.get_mut("spark").unwrap().icd = 1.5;
+            let gated = mc_once(&plan, &scoped_build(), &simdef, 42);
+            assert_eq!(gated.proc_counts["spark"], 5);
+        }
+
+        // MC twin of `the_actions_filter_applies_to_on_non_crit`.
+        #[test]
+        fn mc_the_actions_filter_applies_to_on_non_crit() {
+            let plan = scoped_plan();
+            let rotation = alternating_rotation();
+            let count = |filter: Option<Vec<String>>| {
+                let simdef = alternating_simdef(filter, Trigger::OnNonCrit, "1");
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                run(
+                    &plan,
+                    &sim_plan,
+                    &scoped_build(),
+                    &dummy(20),
+                    Mode::MonteCarlo {
+                        iterations: 1,
+                        seed: 3,
+                    },
+                )
+                .unwrap()
+                .proc_counts["spark"]
+            };
+            assert_eq!(count(None), 20);
+            assert_eq!(count(Some(vec!["a".into()])), 10);
         }
 
         // A cast the filter excludes banks NOTHING in the EV accumulator —
