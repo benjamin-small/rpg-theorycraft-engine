@@ -147,6 +147,11 @@ pub struct CompiledAction {
     /// consults the `defaults` block again. See [`Measure`] for what the
     /// instant governs and its interactions.
     pub measure: Measure,
+    /// The RESOLVED crit-sampling policy for this action's hits:
+    /// [`crate::simdef::ActionDef::crit_rolls`] where the config named
+    /// one, else [`crate::simdef::SimDefaults::proc_rolls`]. See the
+    /// config field for the semantics.
+    pub crit_rolls: ProcRolls,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -856,6 +861,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             damage,
             effects,
             measure: a.measure.unwrap_or(simdef.defaults.measure),
+            crit_rolls: a.crit_rolls.unwrap_or(simdef.defaults.proc_rolls),
         });
     }
 
@@ -1012,6 +1018,7 @@ mod tests {
         actions.insert(
             "fireball".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1.0 / base_aps".into(),
@@ -1029,6 +1036,7 @@ mod tests {
         actions.insert(
             "frost_nova".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "0".into(),
@@ -1628,6 +1636,53 @@ mod tests {
         assert!(e.what.contains("did you mean `when`"), "got: {}", e.what);
     }
 
+    // `crit_rolls` resolution: `action.crit_rolls ?? defaults.proc_rolls`.
+    // Four cells, one compile each; the `proc_rolls`-absent cells and the
+    // `crit_rolls`-present cells are what tell the operands apart.
+    #[test]
+    fn crit_rolls_inherits_defaults_proc_rolls_and_the_action_override_wins() {
+        let plan = toy_plan();
+        let resolved = |defaults: &str, crit_rolls: &str| {
+            let raw = format!(
+                r#"{{
+                  "defaults": {{ {defaults} }},
+                  "actions": {{ "fireball": {{ "cast_time": "1", {crit_rolls}
+                      "damage": {{ "stats": {{ "coeff_pct": 200.0 }} }} }} }},
+                  "damage_objective": "hit_after_dr"
+                }}"#
+            );
+            let def: SimDef = serde_json::from_str(&raw).unwrap();
+            let sp = compile(&plan, &def, &Rotation::default()).unwrap();
+            sp.actions[0].crit_rolls
+        };
+        let per_hit_default = r#""proc_rolls": "per_hit""#;
+        assert_eq!(resolved("", ""), ProcRolls::PerCast);
+        assert_eq!(resolved(per_hit_default, ""), ProcRolls::PerHit);
+        assert_eq!(
+            resolved(per_hit_default, r#""crit_rolls": "per_cast","#),
+            ProcRolls::PerCast
+        );
+        assert_eq!(
+            resolved("", r#""crit_rolls": "per_hit","#),
+            ProcRolls::PerHit
+        );
+    }
+
+    #[test]
+    fn crit_rolls_parses_and_is_omitted_when_absent() {
+        let with: ActionDef =
+            serde_json::from_str(r#"{ "cast_time": "1", "crit_rolls": "per_hit" }"#).unwrap();
+        assert_eq!(with.crit_rolls, Some(ProcRolls::PerHit));
+        assert!(serde_json::to_string(&with)
+            .unwrap()
+            .contains(r#""crit_rolls":"per_hit""#));
+        let without: ActionDef = serde_json::from_str(r#"{ "cast_time": "1" }"#).unwrap();
+        assert_eq!(without.crit_rolls, None);
+        assert!(!serde_json::to_string(&without)
+            .unwrap()
+            .contains("crit_rolls"));
+    }
+
     // The `_` namespace on the SimDef side: annotations at the top level
     // and on every nested entity parse, compile, AND survive a serde
     // round-trip (they re-serialize; only non-`_` unknowns are rejected).
@@ -1897,6 +1952,7 @@ mod tests {
         simdef.actions.insert(
             "basic_bolt".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),

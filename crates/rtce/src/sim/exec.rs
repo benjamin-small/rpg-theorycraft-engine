@@ -3418,6 +3418,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3519,6 +3520,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3620,6 +3622,7 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3669,6 +3672,7 @@ mod tests {
         actions.insert(
             "nova".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "0".into(),
@@ -3733,6 +3737,7 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3750,6 +3755,7 @@ mod tests {
         actions.insert(
             "generator".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3808,6 +3814,7 @@ mod tests {
         actions.insert(
             "beam".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -3917,6 +3924,7 @@ mod tests {
         actions.insert(
             "charge_gen".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "0".into(),
@@ -3931,6 +3939,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: "1".into(),
@@ -4045,6 +4054,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4145,6 +4155,7 @@ mod tests {
             actions.insert(
                 "spender".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4232,6 +4243,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -4246,6 +4258,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4374,6 +4387,7 @@ mod tests {
             actions.insert(
                 "a".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4447,6 +4461,7 @@ mod tests {
             actions.insert(
                 "instant_nop".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -4541,6 +4556,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -4555,6 +4571,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4669,6 +4686,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4738,6 +4756,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -4894,6 +4913,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5013,6 +5033,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5305,6 +5326,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5407,6 +5429,7 @@ mod tests {
                 actions.insert(
                     "spam".to_string(),
                     ActionDef {
+                        crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
                         cast_time: "1".into(),
@@ -5494,6 +5517,7 @@ mod tests {
             actions.insert(
                 "trigger".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5508,6 +5532,7 @@ mod tests {
             actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -5587,6 +5612,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5652,6 +5678,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5799,6 +5826,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -5816,6 +5844,7 @@ mod tests {
             actions.insert(
                 "ping".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -5944,6 +5973,7 @@ mod tests {
             actions.insert(
                 "strike".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -6600,6 +6630,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -6972,6 +7003,7 @@ mod tests {
             simdef.actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -7114,6 +7146,7 @@ mod tests {
                 simdef.actions.insert(
                     name.to_string(),
                     ActionDef {
+                        crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
                         cast_time: "0".into(),
@@ -7464,6 +7497,7 @@ mod tests {
             actions.insert(
                 "opener".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -7480,6 +7514,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -8490,6 +8525,7 @@ mod tests {
         /// for, and the one the D4 example's `frost_nova` now uses.
         fn utility(cast_time: &str, cooldown: f64, apply_buff: Vec<String>) -> ActionDef {
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: cast_time.into(),
@@ -8512,6 +8548,7 @@ mod tests {
             apply_buff: Vec<String>,
         ) -> ActionDef {
             ActionDef {
+                crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
                 cast_time: cast_time.into(),
@@ -10128,6 +10165,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -10145,6 +10183,7 @@ mod tests {
             actions.insert(
                 "ping".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),
@@ -12565,6 +12604,7 @@ mod tests {
             actions.insert(
                 "venom".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "0".into(),
@@ -12766,6 +12806,7 @@ mod tests {
                 simdef.actions.insert(
                     "filler".to_string(),
                     ActionDef {
+                        crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
                         cast_time: "1".into(),
@@ -12895,6 +12936,7 @@ mod tests {
             actions.insert(
                 "shout".to_string(),
                 ActionDef {
+                    crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
                     cast_time: "1".into(),

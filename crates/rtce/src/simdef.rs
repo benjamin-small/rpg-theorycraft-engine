@@ -584,6 +584,53 @@ pub struct ActionDef {
     /// firing proc's instant and is always measured live there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measure: Option<Measure>,
+    /// How this action's measured HITS are sampled for crit in
+    /// `Mode::MonteCarlo`, and how the crit-gated procs of this cast are
+    /// weighted in `Mode::Expected`. Same policy type as
+    /// [`SimDefaults::proc_rolls`] and [`ProcDef::rolls`].
+    ///
+    /// # Default
+    ///
+    /// ABSENT = inherit [`SimDefaults::proc_rolls`], whose own default is
+    /// [`ProcRolls::PerCast`]. The resolution is
+    /// `crit_rolls ?? defaults.proc_rolls ?? per_cast`; a present value
+    /// here always wins over the defaults block. Under the resolved
+    /// `per_cast` nothing changes: one crit mask per cast, shared by all
+    /// its hits.
+    ///
+    /// # Evaluation instant
+    ///
+    /// Resolved once at compile time. The hit count it samples over is the
+    /// cast's measured `hits_per_use`, read from the cast's world
+    /// snapshot at the action's [`Measure`] instant (the same value its
+    /// damage is multiplied by).
+    ///
+    /// # Interactions
+    ///
+    /// - [`SimDefaults::proc_rolls`]: this field's fallback, as above.
+    /// - [`ProcDef::rolls`]: UNCHANGED. It governs only how many rolls a
+    ///   proc is presented; this field governs how many crit samples the
+    ///   cast's damage draws. The two axes cross freely.
+    /// - Under a resolved `per_hit` in Monte Carlo each hit samples its
+    ///   OWN crit and the damage credited is the sum. A `per_hit`
+    ///   `on_crit`/`on_non_crit` proc rolls once per hit against that
+    ///   hit's own result; a `per_cast` one gates on ANY hit crit
+    ///   (`on_crit`) or ANY hit not crit (`on_non_crit`).
+    /// - In `Mode::Expected`, with `p` the crit chance and `n` the
+    ///   measured hits, a `per_cast` `on_crit` proc's weight follows as
+    ///   `1 - (1 - p)^n` (`on_non_crit`: `1 - p^n`); `icd > 0` `per_hit`
+    ///   procs fire at most once per cast, with probability
+    ///   `1 - (1 - q)^n`, `q = chance * p` (`* (1 - p)` for
+    ///   `on_non_crit`).
+    /// - `n = 1`, or a plan with no `"crit"` event, is identical to
+    ///   `per_cast`: the same draws, byte-for-byte.
+    /// - A fractional `hits_per_use` (or one over the roll limit) under a
+    ///   resolved `per_hit` is a run error, since per-hit sampling needs
+    ///   a whole count.
+    /// - Proc-fired FREE casts of this action (`cast_action`) are out of
+    ///   scope: they keep their unsampled expected damage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crit_rolls: Option<ProcRolls>,
     /// Buffs this action applies when its cast COMPLETES — one
     /// application per entry, in list order.
     ///
@@ -715,6 +762,7 @@ impl ActionDef {
         "measure",
         "apply_buff",
         "effects",
+        "crit_rolls",
     ];
 }
 
