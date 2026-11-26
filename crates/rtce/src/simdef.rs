@@ -630,8 +630,10 @@ pub struct ActionDef {
     ///   procs fire at most once per cast, with probability
     ///   `1 - (1 - q)^n`, `q = chance * p` (`* (1 - p)` for
     ///   `on_non_crit`).
-    /// - `n = 1`, or a plan with no `"crit"` event, is identical to
-    ///   `per_cast`: the same draws, byte-for-byte.
+    /// - `n = 1`, or a plan with no events at all, is identical to
+    ///   `per_cast`, byte-for-byte, BY CONSTRUCTION: the executor takes
+    ///   the `per_cast` path outright (a per-hit sum can differ from
+    ///   `damage * n` by an ulp). The whole-count rule still runs first.
     /// - A fractional `hits_per_use` (or one over the roll limit) under a
     ///   resolved `per_hit` is a run error, since per-hit sampling needs
     ///   a whole count.

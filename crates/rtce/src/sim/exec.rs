@@ -2430,27 +2430,46 @@ impl<'a> Sim<'a> {
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = if self.rng.is_some() {
-                    if self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit {
-                        // `crit_rolls` resolves per_hit: each hit is its
-                        // OWN sampled draw (hits = 1) and the damage
-                        // credited is the SUM. Only counts are kept —
-                        // never per-hit masks (zero allocation).
-                        let n = self.whole_hits(action, d, "crit_rolls resolves to per_hit")?;
-                        let mut sum = 0.0;
-                        let mut crit_hits = 0u64;
-                        for _ in 0..n {
-                            let (hit, c) =
-                                self.eval_action_damage_sampled(&s.build, &s.phase, 1.0)?;
-                            sum += hit;
-                            crit_hits += u64::from(c);
-                        }
-                        crit = CritOutcome::Counted { crit_hits, hits: n };
-                        sum
+                    // Run the whole-count rule FIRST whenever per_hit
+                    // resolves, so a fractional count fails closed even
+                    // when the shortcut below then skips the sampling.
+                    let per_hit = self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit;
+                    let n = if per_hit {
+                        Some(self.whole_hits(action, d, || {
+                            "crit_rolls resolves to per_hit".to_string()
+                        })?)
                     } else {
-                        let (dmg, c) =
-                            self.eval_action_damage_sampled(&s.build, &s.phase, d.hits)?;
-                        crit = CritOutcome::Shared(c);
-                        dmg
+                        None
+                    };
+                    match n {
+                        // Per-hit sampling matters only with events to
+                        // sample and 2+ hits (n = 0 with events: zero
+                        // damage, `Counted { 0, 0 }`). No events or
+                        // exactly one hit IS the per_cast path, by
+                        // construction: `obj * h` and `obj` summed n
+                        // times differ by an ulp for inexact `obj`, and
+                        // `h` may sit within HITS_WHOLE_EPSILON of 1.
+                        Some(n) if self.plan.has_events() && n != 1 => {
+                            // Each hit is its OWN sampled draw (hits = 1)
+                            // and the damage credited is the SUM. Only
+                            // counts are kept — never per-hit masks.
+                            let mut sum = 0.0;
+                            let mut crit_hits = 0u64;
+                            for _ in 0..n {
+                                let (hit, c) =
+                                    self.eval_action_damage_sampled(&s.build, &s.phase, 1.0)?;
+                                sum += hit;
+                                crit_hits += u64::from(c);
+                            }
+                            crit = CritOutcome::Counted { crit_hits, hits: n };
+                            sum
+                        }
+                        _ => {
+                            let (dmg, c) =
+                                self.eval_action_damage_sampled(&s.build, &s.phase, d.hits)?;
+                            crit = CritOutcome::Shared(c);
+                            dmg
+                        }
                     }
                 } else {
                     self.eval_action_damage(&s.build, &s.phase, d.hits)?
@@ -2874,10 +2893,9 @@ impl<'a> Sim<'a> {
     ) -> Result<u64, PlanError> {
         match (self.sim_plan.procs[pi].rolls, measure) {
             (ProcRolls::PerCast, _) | (ProcRolls::PerHit, None) => Ok(1),
-            (ProcRolls::PerHit, Some(m)) => {
-                let why = format!("proc `{}` rolls per_hit", self.sim_plan.procs[pi].name);
-                self.whole_hits(action, m, &why)
-            }
+            (ProcRolls::PerHit, Some(m)) => self.whole_hits(action, m, || {
+                format!("proc `{}` rolls per_hit", self.sim_plan.procs[pi].name)
+            }),
         }
     }
 
@@ -2885,7 +2903,8 @@ impl<'a> Sim<'a> {
     /// measured `hits_per_use` — a `per_hit` proc's roll count
     /// ([`Sim::proc_roll_count`]) and a `per_hit` action's crit sampling
     /// (`complete_cast`, via `ActionDef::crit_rolls`). `why` names the
-    /// caller's reason and opens the error ("proc `x` rolls per_hit" /
+    /// caller's reason (a closure, formatted only on the error path — no
+    /// allocation on the run loop) and opens the error ("proc `x` rolls per_hit" /
     /// "crit_rolls resolves to per_hit"), so the check is never copied.
     ///
     /// The error stamps `m.measured_at` — the instant the value was
@@ -2894,24 +2913,33 @@ impl<'a> Sim<'a> {
     /// cast time, and "measured X at t" must name the measurement (P8f
     /// review fix). Whole-number test tolerance is [`HITS_WHOLE_EPSILON`];
     /// the cap is [`PER_HIT_ROLL_LIMIT`].
-    fn whole_hits(&self, action: usize, m: &DamageMeasure, why: &str) -> Result<u64, PlanError> {
+    fn whole_hits(
+        &self,
+        action: usize,
+        m: &DamageMeasure,
+        why: impl FnOnce() -> String,
+    ) -> Result<u64, PlanError> {
         let h = m.hits;
         let n = h.round();
         if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
             return Err(PlanError {
                 what: format!(
-                    "{why}, but action `{}` measured hits_per_use {h} at t={} \
+                    "{}, but action `{}` measured hits_per_use {h} at t={} \
                      — per-hit rolling needs a whole number >= 0",
-                    self.sim_plan.actions[action].name, m.measured_at
+                    why(),
+                    self.sim_plan.actions[action].name,
+                    m.measured_at
                 ),
             });
         }
         if n > PER_HIT_ROLL_LIMIT {
             return Err(PlanError {
                 what: format!(
-                    "{why}, but action `{}` measured hits_per_use {h} at t={} \
+                    "{}, but action `{}` measured hits_per_use {h} at t={} \
                      — per-hit rolling is capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
-                    self.sim_plan.actions[action].name, m.measured_at
+                    why(),
+                    self.sim_plan.actions[action].name,
+                    m.measured_at
                 ),
             });
         }
@@ -12304,7 +12332,9 @@ mod tests {
                 "nc":  { "trigger": "on_non_crit", "chance": "1", "icd": 0,
                          "apply_buff": "glow", "rolls": "per_hit" },
                 "any": { "trigger": "on_crit", "chance": "1", "icd": 0,
-                         "apply_buff": "glow" } }"#;
+                         "apply_buff": "glow" },
+                "anyn": { "trigger": "on_non_crit", "chance": "1", "icd": 0,
+                          "apply_buff": "glow" } }"#;
             let r = mc_json(
                 &crit_plan(),
                 &crit_build_25(),
@@ -12322,6 +12352,12 @@ mod tests {
                 5 * any > c,
                 "any = {any}, c = {c}: equality is the shared-mask world"
             );
+            // Every cast has a crit hit or a non-crit hit (or both), so
+            // any + anyn >= 20; a first-hit-only gate would make the two
+            // exact complements (== 20), while the any-hit gate adds one
+            // for every MIXED cast.
+            let anyn = r.proc_counts["anyn"];
+            assert!(any + anyn > 20, "any = {any}, anyn = {anyn}");
         }
 
         // The per-hit path cannot matter at n = 1 (one draw either way)
@@ -12359,6 +12395,31 @@ mod tests {
                 go(&mp, &mb, "5", PER_CAST_CRIT),
                 "no events"
             );
+        }
+
+        // The shortcut pin: per_cast credits `obj * h`, a per-hit SUM
+        // credits `obj` n times — for n = 6 and a non-dyadic `obj` they
+        // differ by an ulp (652.6644790311026 x 6 = 3915.9868741866153
+        // vs 3915.9868741866158 summed). A plan with no events (or n = 1)
+        // must therefore take the per_cast path outright. ONE cast, so
+        // the ulp is not averaged away by later accumulation.
+        #[test]
+        fn per_hit_with_no_events_is_byte_identical_for_inexact_damage() {
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 652.6644790311026 } }"#).unwrap();
+            let go = |cr: &str| {
+                serde_json::to_string(&mc_json(
+                    &minimal_plan(),
+                    &build,
+                    &crit_nova("6", cr, "{}"),
+                    NOVA_ROT,
+                    &dummy(1),
+                    200,
+                    7,
+                ))
+                .unwrap()
+            };
+            assert_eq!(go(PER_HIT_CRIT), go(PER_CAST_CRIT));
         }
 
         // A resolved per_hit needs a whole hit count to SAMPLE, procs or
