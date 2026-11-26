@@ -115,8 +115,9 @@ pub struct CompiledResource {
 pub struct CompiledAction {
     /// This action's name.
     pub name: String,
-    /// Compiled `cast_time` expression.
-    pub cast_time: Program,
+    /// Compiled `cast_time` expression; `None` for a segmented action
+    /// (its cast time is the sum of its segments' durations).
+    pub cast_time: Option<Program>,
     /// Cooldown in seconds, starting when the cast begins — evaluated at
     /// cast start (see [`crate::simdef::NumOrExpr`]).
     pub cooldown: CompiledValue,
@@ -152,6 +153,30 @@ pub struct CompiledAction {
     /// one, else [`crate::simdef::SimDefaults::proc_rolls`]. See the
     /// config field for the semantics.
     pub crit_rolls: ProcRolls,
+    /// The compiled segments, in order; empty for an unsegmented action.
+    /// See [`crate::simdef::ActionDef::segments`].
+    pub segments: Vec<CompiledSegment>,
+}
+
+/// One compiled [`crate::simdef::SegmentDef`]: duration, damage and
+/// effects with references resolved, and the measurement instant
+/// RESOLVED as `segment.measure ?? action.measure ?? defaults.measure`.
+///
+/// `#[non_exhaustive]` for the same reason as [`CompiledAction`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CompiledSegment {
+    /// Seconds from the previous boundary to this landing, evaluated at
+    /// this segment's start.
+    pub duration: CompiledValue,
+    /// Compiled `damage.stats`, each evaluated at the resolved measure
+    /// instant; `None` is a wind-up segment with no hits.
+    pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
+    /// Effects executed at this segment's landing, in list order. Only
+    /// [`CompiledEffect::ApplyBuff`] can appear.
+    pub effects: Vec<CompiledEffect>,
+    /// The RESOLVED measurement instant for this segment.
+    pub measure: Measure,
 }
 
 /// One compiled [`crate::simdef::BuffDef`].
@@ -327,6 +352,8 @@ struct SimSymbols<'a> {
     plan: &'a Plan,
     time_slot: usize,
     duration_slot: usize,
+    segments_done_slot: usize,
+    segments_remain_slot: usize,
     resource_names: Vec<&'a str>,
     resource_base: usize,
     action_names: Vec<&'a str>,
@@ -350,10 +377,15 @@ impl<'a> SimSymbols<'a> {
         let buff_remaining_base = buff_base + buff_names.len();
         let casts_base = buff_remaining_base + buff_names.len();
         let stacks_base = casts_base + action_names.len();
+        // The two segment words sit AFTER the `stacks.*` range so every
+        // pre-existing slot keeps its index.
+        let segments_done_slot = stacks_base + buff_names.len();
         SimSymbols {
             plan,
             time_slot: base,
             duration_slot: base + 1,
+            segments_done_slot,
+            segments_remain_slot: segments_done_slot + 1,
             resource_names,
             resource_base,
             action_names,
@@ -371,7 +403,7 @@ impl<'a> SimSymbols<'a> {
     }
 
     fn slot_width(&self) -> usize {
-        self.stacks_base + self.buff_names.len()
+        self.segments_remain_slot + 1
     }
 }
 
@@ -382,6 +414,12 @@ impl Symbols for SimSymbols<'_> {
         }
         if name == "duration" {
             return Some(self.duration_slot as u16);
+        }
+        if name == "segments_done" {
+            return Some(self.segments_done_slot as u16);
+        }
+        if name == "segments_remain" {
+            return Some(self.segments_remain_slot as u16);
         }
         if let Some(i) = self.resource_names.iter().position(|r| *r == name) {
             return Some((self.resource_base + i) as u16);
@@ -473,6 +511,20 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 &dmg.extra,
             )?;
         }
+        for (i, seg) in a.segments.iter().enumerate() {
+            crate::config_keys::reject_unknown(
+                &format!("action `{name}` segment {i}"),
+                crate::simdef::SegmentDef::KNOWN_KEYS,
+                &seg.extra,
+            )?;
+            if let Some(dmg) = &seg.damage {
+                crate::config_keys::reject_unknown(
+                    &format!("action `{name}` segment {i} damage"),
+                    crate::simdef::ActionDamage::KNOWN_KEYS,
+                    &dmg.extra,
+                )?;
+            }
+        }
     }
     for (name, b) in &simdef.buffs {
         crate::config_keys::reject_unknown(
@@ -512,7 +564,11 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         .chain(simdef.actions.keys())
         .chain(simdef.buffs.keys())
     {
-        if name == "time" || name == "duration" {
+        if name == "time"
+            || name == "duration"
+            || name == "segments_done"
+            || name == "segments_remain"
+        {
             return Err(PlanError {
                 what: format!("`{name}` is reserved and cannot be used as a sim name"),
             });
@@ -552,6 +608,61 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
     // desugaring would have to pick where the sugar lands relative to
     // the list, and a guessed order is a silent wrong answer.
     for (name, action) in &simdef.actions {
+        // Segments: the cast time is EITHER one `cast_time` OR the sum of
+        // the segments, and damage lives on the segments — each ambiguous
+        // combination is refused rather than guessed at.
+        match (&action.cast_time, action.segments.is_empty()) {
+            (Some(_), false) => {
+                return Err(PlanError {
+                    what: format!(
+                        "action `{name}`: both `segments` and `cast_time` are set — \
+                         ambiguous cast time; a segmented action's cast time is the sum \
+                         of its segment durations, so drop `cast_time`"
+                    ),
+                });
+            }
+            (None, true) => {
+                return Err(PlanError {
+                    what: format!(
+                        "action `{name}`: neither `cast_time` nor `segments` is set — an \
+                         action needs one of them"
+                    ),
+                });
+            }
+            _ => {}
+        }
+        if !action.segments.is_empty() && action.damage.is_some() {
+            return Err(PlanError {
+                what: format!(
+                    "action `{name}`: `segments` together with action-level `damage` is \
+                     ambiguous — put the damage on the segments"
+                ),
+            });
+        }
+        for (i, seg) in action.segments.iter().enumerate() {
+            for effect in &seg.effects {
+                match effect {
+                    EffectDef::CastAction(_) => {
+                        return Err(PlanError {
+                            what: format!(
+                                "action `{name}` segment {i}: a `cast_action` effect is not \
+                                 allowed on a segment — an action free-casting an action \
+                                 reopens recursion (A→B→A)"
+                            ),
+                        });
+                    }
+                    EffectDef::ApplyBuff(b) => {
+                        if !simdef.buffs.contains_key(b) {
+                            return Err(PlanError {
+                                what: format!(
+                                    "action `{name}` segment {i}: unknown buff `{b}` in effects"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         for r in action.cost.keys().chain(action.gain.keys()) {
             if !simdef.resources.contains_key(r) {
                 return Err(PlanError {
@@ -722,6 +833,29 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 });
             }
         }
+        // A free cast has no cast window to segment: free-casting a
+        // segmented action is out of scope and refused, not approximated.
+        for a in p
+            .cast_action
+            .iter()
+            .chain(p.effects.iter().filter_map(|e| match e {
+                EffectDef::CastAction(a) => Some(a),
+                _ => None,
+            }))
+        {
+            if simdef
+                .actions
+                .get(a)
+                .is_some_and(|d| !d.segments.is_empty())
+            {
+                return Err(PlanError {
+                    what: format!(
+                        "proc `{name}`: `cast_action` names `{a}`, a segmented action — a \
+                         free cast of a segmented action is not supported"
+                    ),
+                });
+            }
+        }
         for effect in &p.effects {
             match effect {
                 EffectDef::ApplyBuff(b) => {
@@ -812,9 +946,41 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
 
     let mut actions = Vec::new();
     for (name, a) in &simdef.actions {
-        let cast_time = compile_expr(&a.cast_time, &syms).map_err(|e| PlanError {
-            what: format!("action `{name}` cast_time: {e}"),
-        })?;
+        let cast_time = match &a.cast_time {
+            Some(ct) => Some(compile_expr(ct, &syms).map_err(|e| PlanError {
+                what: format!("action `{name}` cast_time: {e}"),
+            })?),
+            None => None,
+        };
+        let action_measure = a.measure.unwrap_or(simdef.defaults.measure);
+        let mut segments = Vec::new();
+        for (i, seg) in a.segments.iter().enumerate() {
+            let duration = compile_value(&seg.duration, &syms, || {
+                format!("action `{name}` segment {i} duration")
+            })?;
+            let damage = match &seg.damage {
+                Some(d) => Some(compile_value_map(&d.stats, &syms, |k| {
+                    format!("action `{name}` segment {i} damage.stats `{k}`")
+                })?),
+                None => None,
+            };
+            let effects = seg
+                .effects
+                .iter()
+                .map(|e| match e {
+                    EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
+                    EffectDef::CastAction(_) => {
+                        unreachable!("`cast_action` on a segment rejected above")
+                    }
+                })
+                .collect();
+            segments.push(CompiledSegment {
+                duration,
+                damage,
+                effects,
+                measure: seg.measure.unwrap_or(action_measure),
+            });
+        }
         let cooldown = compile_value(&a.cooldown, &syms, || format!("action `{name}` cooldown"))?;
         let mut cost = Vec::new();
         for (r, v) in &a.cost {
@@ -860,8 +1026,9 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             gain,
             damage,
             effects,
-            measure: a.measure.unwrap_or(simdef.defaults.measure),
+            measure: action_measure,
             crit_rolls: a.crit_rolls.unwrap_or(simdef.defaults.proc_rolls),
+            segments,
         });
     }
 
@@ -1021,7 +1188,8 @@ mod tests {
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
-                cast_time: "1.0 / base_aps".into(),
+                cast_time: Some("1.0 / base_aps".into()),
+                segments: Vec::new(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost,
                 gain: BTreeMap::new(),
@@ -1039,7 +1207,8 @@ mod tests {
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
-                cast_time: "0".into(),
+                cast_time: Some("0".into()),
+                segments: Vec::new(),
                 cooldown: NumOrExpr::Num(10.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
@@ -1192,8 +1361,9 @@ mod tests {
         assert_eq!(sp.sim_base, plan.own_slot_width());
         // sim segment: time, duration, mana(1), cooldown.*(2),
         // buff.*(3), buff_remaining.*(3), casts.*(2), stacks.*(3)
-        //   = 2+1+2+3+3+2+3 = 16  (P7c appended the `stacks.*` sub-range)
-        assert_eq!(sp.slot_width, sp.sim_base + 16);
+        //   = 2+1+2+3+3+2+3 = 16  (P7c appended the `stacks.*` sub-range),
+        // + segments_done, segments_remain = 18 (slice 4, appended last)
+        assert_eq!(sp.slot_width, sp.sim_base + 18);
     }
 
     #[test]
@@ -1979,7 +2149,8 @@ mod tests {
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
-                cast_time: "1".into(),
+                cast_time: Some("1".into()),
+                segments: Vec::new(),
                 cooldown: NumOrExpr::Num(0.0),
                 cost: BTreeMap::new(),
                 gain: BTreeMap::new(),
@@ -1996,5 +2167,216 @@ mod tests {
         });
         let sp = compile(&plan, &simdef, &rotation).unwrap();
         assert!(sp.rules.last().unwrap().when.is_none());
+    }
+
+    // ==================================================================
+    // Slice 4 (#33) — segments: config surface and compile validation.
+    // ==================================================================
+
+    fn segment_compile(raw: &str) -> Result<SimPlan, PlanError> {
+        let def: SimDef = serde_json::from_str(raw).unwrap();
+        compile(&toy_plan(), &def, &Rotation::default())
+    }
+
+    #[test]
+    fn a_segmented_action_compiles_with_resolved_segment_measures() {
+        // defaults.measure cast_start: seg 0 (no override, no action
+        // measure) inherits it; seg 1's override wins.
+        let sp = segment_compile(
+            r#"{
+              "defaults": { "measure": "cast_start" },
+              "actions": { "slam": { "segments": [
+                  { "duration": 0.5, "damage": { "stats": { "coeff_pct": 100.0 } } },
+                  { "duration": "0.25", "measure": "cast_complete",
+                    "damage": { "stats": { "coeff_pct": 300.0 } } }
+              ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let a = &sp.actions[0];
+        assert!(a.cast_time.is_none(), "segmented action has no cast_time");
+        assert!(a.damage.is_none());
+        assert_eq!(a.segments.len(), 2);
+        assert_eq!(a.segments[0].measure, Measure::CastStart);
+        assert_eq!(a.segments[1].measure, Measure::CastComplete);
+        assert!(a.segments[0].damage.is_some());
+
+        // Action-level measure beats the default; segment override beats both.
+        let sp = segment_compile(
+            r#"{
+              "actions": { "slam": { "measure": "cast_start", "segments": [
+                  { "duration": 0.5 },
+                  { "duration": 0.5, "measure": "cast_complete" }
+              ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let a = &sp.actions[0];
+        assert_eq!(a.segments[0].measure, Measure::CastStart);
+        assert_eq!(a.segments[1].measure, Measure::CastComplete);
+        assert!(
+            a.segments[0].damage.is_none(),
+            "no damage = a wind-up segment"
+        );
+    }
+
+    #[test]
+    fn segments_and_cast_time_together_is_a_compile_error() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": { "cast_time": "1", "segments": [ { "duration": 1 } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("action `slam`"), "got: {}", e.what);
+        assert!(e.what.contains("segments"), "got: {}", e.what);
+        assert!(e.what.contains("cast_time"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn neither_segments_nor_cast_time_is_a_compile_error() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": { "cooldown": 1.0 } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("action `slam`"), "got: {}", e.what);
+        assert!(e.what.contains("segments"), "got: {}", e.what);
+        assert!(e.what.contains("cast_time"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn segments_with_action_level_damage_is_a_compile_error() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": {
+                  "damage": { "stats": { "coeff_pct": 100.0 } },
+                  "segments": [ { "duration": 1 } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("action `slam`"), "got: {}", e.what);
+        assert!(e.what.contains("segments"), "got: {}", e.what);
+        assert!(e.what.contains("damage"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn free_casting_a_segmented_action_is_a_compile_error() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": { "segments": [ { "duration": 1 } ] },
+                           "bolt": { "cast_time": "1" } },
+              "procs": { "echo": { "trigger": "on_hit", "chance": "1",
+                                   "effects": [ { "cast_action": "slam" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("proc `echo`"), "got: {}", e.what);
+        assert!(e.what.contains("slam"), "got: {}", e.what);
+        assert!(e.what.contains("segment"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn a_cast_action_effect_inside_a_segment_is_a_compile_error() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "bolt": { "cast_time": "1" },
+                           "slam": { "segments": [
+                  { "duration": 1 },
+                  { "duration": 1, "effects": [ { "cast_action": "bolt" } ] } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("action `slam`"), "got: {}", e.what);
+        assert!(e.what.contains("segment 1"), "got: {}", e.what);
+        assert!(e.what.contains("cast_action"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn an_unknown_segment_key_fails_with_did_you_mean() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": { "segments": [ { "duration": 1, "duraton": 1 } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            e.what.contains("unknown field `duraton`"),
+            "got: {}",
+            e.what
+        );
+        assert!(
+            e.what.contains("action `slam` segment 0"),
+            "got: {}",
+            e.what
+        );
+        assert!(
+            e.what.contains("did you mean `duration`"),
+            "got: {}",
+            e.what
+        );
+
+        // The `_` namespace stays open on a segment, and on its damage.
+        segment_compile(
+            r#"{
+              "actions": { "slam": { "segments": [
+                  { "duration": 1, "_note": "wind-up" } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn segments_done_is_reserved() {
+        for word in ["segments_done", "segments_remain"] {
+            let raw = format!(
+                r#"{{ "resources": {{ "{word}": {{ "max": "1", "regen_per_sec": "0" }} }},
+                    "damage_objective": "hit_after_dr" }}"#
+            );
+            let e = segment_compile(&raw).unwrap_err();
+            assert!(e.what.contains("reserved"), "{word}: got: {}", e.what);
+            assert!(e.what.contains(word), "{word}: got: {}", e.what);
+            // action and buff names too, like `time`/`duration`.
+            let raw = format!(
+                r#"{{ "actions": {{ "{word}": {{ "cast_time": "1" }} }},
+                    "damage_objective": "hit_after_dr" }}"#
+            );
+            assert!(segment_compile(&raw).unwrap_err().what.contains("reserved"));
+            let raw = format!(
+                r#"{{ "buffs": {{ "{word}": {{ "duration": 1.0 }} }},
+                    "damage_objective": "hit_after_dr" }}"#
+            );
+            assert!(segment_compile(&raw).unwrap_err().what.contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn segment_symbols_resolve_in_sim_expressions_to_two_new_slots() {
+        // Both words compile in a `when`, resolve to distinct slots at the
+        // END of the sim segment (after stacks.*), and widen it by 2.
+        let plan = toy_plan();
+        let def: SimDef = serde_json::from_str(
+            r#"{ "actions": { "bolt": { "cast_time": "1" } },
+                 "damage_objective": "hit_after_dr" }"#,
+        )
+        .unwrap();
+        let rotation: Rotation = serde_json::from_str(
+            r#"{ "rules": [ { "action": "bolt",
+                  "when": "and(segments_done == 0, segments_remain == 0)" } ] }"#,
+        )
+        .unwrap();
+        let sp = compile(&plan, &def, &rotation).unwrap();
+        // time, duration, cooldown.bolt, casts.bolt, + the two new words.
+        assert_eq!(sp.slot_width, sp.sim_base + 6);
     }
 }

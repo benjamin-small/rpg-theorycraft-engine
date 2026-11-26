@@ -279,7 +279,7 @@ mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
-    CompiledRule, CompiledTick, CompiledValue, SimPlan,
+    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan,
 };
 pub use exec::{run, Mode};
 pub use report::{
