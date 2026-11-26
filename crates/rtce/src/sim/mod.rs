@@ -87,12 +87,12 @@
 //! [first landing]  casts.<action> += 1
 //! [segmented]      segments_done += 1
 //!   →  measure the landing's WORLD*, evaluate its damage, credit the hit
-//!   →  [last landing] end the cast (mid_cast = false; segments_done and
-//!      segments_remain reset to 0)
+//!   →  [last landing] end the cast (mid_cast = false)
 //!   →  this segment's effects (apply_buff entries), in list order
 //!   →  [last landing, segmented] the action's effects, in list order
 //!   →  proc rolls: [first landing] on_cast, then this landing's on_hit,
 //!      on_crit, on_non_crit
+//!   →  [last landing] segments_done and segments_remain reset to 0
 //!   →  [non-last segment] start the NEXT segment: evaluate its duration,
 //!      capture its cast_start snapshot if it measures there, schedule
 //!      its landing

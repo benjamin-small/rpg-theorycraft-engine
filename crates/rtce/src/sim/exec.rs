@@ -2655,11 +2655,6 @@ impl<'a> Sim<'a> {
 
         if last {
             self.mid_cast = false;
-            // The segmented cast is over: both reserved words read 0
-            // again (idle, like an unsegmented action's), from the
-            // effects below onward.
-            self.segments_total = 0;
-            self.segments_done = 0;
         }
         // The part's OWN effects, before anything this landing merely
         // triggers — see `Sim::apply_action_buffs` for the ordering and
@@ -2728,6 +2723,16 @@ impl<'a> Sim<'a> {
                 self.roll_procs_ev(Trigger::OnCrit, on_crit, action, Some(d))?;
                 self.roll_procs_ev(Trigger::OnNonCrit, on_non_crit, action, Some(d))?;
             }
+        }
+        if last {
+            // The segmented cast is over: only NOW, after the last
+            // landing's whole transaction (effects and proc rolls read
+            // `segments_done = n`, `segments_remain = 0`), do both
+            // reserved words return to 0 — so they read 0 at the next
+            // rotation decision. Adjacent: `segments_remain` is a u32
+            // subtraction, so total never drops below done.
+            self.segments_total = 0;
+            self.segments_done = 0;
         }
         Ok(())
     }
@@ -14678,6 +14683,27 @@ mod tests {
             assert_eq!(r.proc_counts["pk"], 6, "{:?}", r.proc_counts);
             let r = try_run(&simdef(&segs(""), 10.0, procs), &b, 5.0, Mode::Expected).unwrap();
             assert_eq!(r.proc_counts["pk"], 2, "{:?}", r.proc_counts);
+        }
+
+        // --------------------------------------------------------------
+        // The segment symbols hold their LAST-landing values through that
+        // landing's whole transaction (action effects, proc rolls) and
+        // reset only afterwards. An on_hit proc (per_cast, icd 0) with
+        // chance `segments_done == 2` fires only at a cast's last
+        // landing (done = 2): weight 5 = 4 casts → 4 fires (seg 0 reads
+        // 1 → chance 0). Reset-before-procs reads 0 → 0 fires.
+        // --------------------------------------------------------------
+        #[test]
+        fn last_landing_procs_read_the_final_segment_count() {
+            let procs = r#""procs": {
+                 "ph": { "trigger": "on_hit", "chance": "segments_done == 2", "icd": 0.0,
+                         "rolls": "per_cast", "apply_buff": "blip" },
+                 "pr": { "trigger": "on_hit", "chance": "segments_remain == 0", "icd": 0.0,
+                         "rolls": "per_cast", "apply_buff": "blip" } },"#;
+            let r = ev(&simdef(&slam_with(""), 10.0, procs), 5.0);
+            assert_eq!(r.proc_counts["ph"], 4, "{:?}", r.proc_counts);
+            // remain == 0 holds at the last landing only: also 4.
+            assert_eq!(r.proc_counts["pr"], 4, "{:?}", r.proc_counts);
         }
     }
 }

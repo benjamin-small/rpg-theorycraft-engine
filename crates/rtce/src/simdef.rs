@@ -853,8 +853,9 @@ pub struct ActionDef {
     ///   landing BEFORE that landing's measure, so a segment's own
     ///   `damage.stats` sees itself counted (`1` at segment 0);
     ///   `segments_remain` is the segments not yet landed (`n -
-    ///   segments_done`). Both reset to `0` when the last segment lands
-    ///   (from that landing's effects and proc rolls onward) and are `0`
+    ///   segments_done`). At the last landing they read `n` / `0`
+    ///   through the WHOLE landing transaction (measure, effects, proc
+    ///   rolls) and reset to `0` only after its proc rolls; they are `0`
     ///   for every unsegmented action and at every rotation decision, so
     ///   a `when` reading them cannot wedge the rotation.
     /// - COST: when a segment lands (or starts, under `cast_start`) the
