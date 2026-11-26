@@ -15342,5 +15342,150 @@ mod tests {
                 e.what
             );
         }
+
+        // --------------------------------------------------------------
+        // Fix round 1: world pins for the fields whose earlier pins had
+        // overlay == plain.
+        //
+        // strike: cast_time "objective.hct", damage.stats { aps: 2 }, no
+        // haste → its world reads hct = 1/2 = 0.5. Weight 3: completions
+        // 0.5, 1.0, …, 3.0 (horizon) → casts 6, total 600.
+        // Contrast: the plain world (aps 1 → hct 1) → completions 1, 2, 3
+        // → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn cast_time_reads_its_actions_overlay_world() {
+            let sim = simdef(
+                r#""actions": { "strike": { "cast_time": "objective.hct",
+                     "damage": { "stats": { "aps": 2 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 3.0);
+            assert_eq!(
+                r.actions["strike"].casts, 6,
+                "6 = the overlay world (hct 0.5); 3 = the plain build (hct 1)"
+            );
+            assert!(
+                close(r.total.total_damage, 600.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cost { mana: "10 * objective.hct" }, strike damage.stats
+        // { aps: 0.5 } → its world reads hct 2 → cost 20 (plain: 10).
+        // mana max 30, regen 1/s, cast_time 12, weight 28:
+        //   t=0:  mana 30 ≥ 20 → cast, pay 20 → 10.
+        //   t=12: complete; mana 22 ≥ 20 → cast, pay 20 → 2.
+        //   t=24: complete; mana 14 < 20 → wake at 24 + 6 = 30 (past the
+        //         horizon); the wake branch marks mana starved from 24
+        //         (14 < 20) → finalize closes it at 28 → time_starved 4.
+        //   → casts 2, time_starved 4.
+        // Contrasts (single-site mutations to the plain world, cost 10):
+        //   - the AFFORD fill: at 24 mana 14 ≥ 10 → a third cast begins
+        //     (completes at 36, uncounted) and nothing starves → 0;
+        //   - the wake-branch REFILL: afford still says "short", but the
+        //     starvation check reads cost 10 ≤ 14 → not starved → 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn decision_time_cost_reads_its_actions_overlay_world() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "30", "regen_per_sec": "1" } },
+                   "actions": { "strike": { "cast_time": "12",
+                     "cost": { "mana": "10 * objective.hct" },
+                     "damage": { "stats": { "aps": 0.5 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 28.0);
+            assert_eq!(r.actions["strike"].casts, 2, "{:?}", r.actions);
+            assert!(
+                close(r.resources["mana"].time_starved, 4.0),
+                "time_starved {} (4 = decision-time cost read the overlay \
+                 world, cost 20; 0 = it read the plain world, cost 10)",
+                r.resources["mana"].time_starved
+            );
+        }
+
+        // --------------------------------------------------------------
+        // A segmented action's action-level fields have no overlay: its
+        // `cooldown "objective.hct"` reads the PLAIN build (hct 1) even
+        // though its one segment carries damage.stats { aps: 2 } (hct
+        // 0.5). Segment duration 0.25 (literal), weight 3: casts start
+        // 0, 1, 2 (each landing 0.25 later) → casts 3, total 300.
+        // Contrast: the segment's overlay world → cooldown 0.5 → starts
+        // 0, 0.5, …, 2.5 → casts 6.
+        // --------------------------------------------------------------
+        #[test]
+        fn segmented_action_level_fields_read_the_plain_world() {
+            let sim = simdef(
+                r#""actions": { "slam": { "cooldown": "objective.hct",
+                     "segments": [ { "duration": 0.25,
+                                     "damage": { "stats": { "aps": 2 } } } ] } },"#,
+            );
+            let r = ev(&sim, r#"{ "rules": [ { "action": "slam" } ] }"#, 3.0);
+            assert_eq!(
+                r.actions["slam"].casts, 3,
+                "3 = the plain build (cooldown 1); 6 = a segment's overlay (0.5)"
+            );
+            assert!(
+                close(r.total.total_damage, 300.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // An objective downstream of a BRANCHED stage reads its EXPECTED
+        // value in Monte Carlo too. Plan: event crit (chance 0.5, factor
+        // 2), branched `x = 100 * event_factors` → E[x] = 0.5·100 +
+        // 0.5·200 = 150 (any one sample is 100 or 200); `hit = dmg`.
+        // strike: cast_time 0.5, cooldown "objective.x / 100" = 1.5,
+        // weight 6: starts 0, 1.5, 3, 4.5 → completions 0.5 … 5.0 →
+        // casts 4, total 400 (hit is unbranched).
+        // MC (50 iterations, seed 9) must serialize byte-identically to
+        // the same MC run with the literal cooldown "1.5", and agree with
+        // EV on casts and total. A sampled read (cooldown 1 or 2 per
+        // cast → 3..6 casts per iteration) breaks both.
+        // --------------------------------------------------------------
+        #[test]
+        fn objective_reads_are_expected_values_in_monte_carlo() {
+            let gd: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "events": { "crit": { "chance": "0.5", "factor": "2" } },
+                     "pipeline": [
+                       { "name": "x", "expr": "100 * event_factors", "branched": true },
+                       { "name": "hit", "expr": "dmg" } ],
+                     "objectives": ["hit", "x"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&gd).unwrap();
+            let b: BuildState = serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let rotation: Rotation = serde_json::from_str(STRIKE).unwrap();
+            let go = |cd: &str, mode: Mode| {
+                let simdef: SimDef = serde_json::from_str(&format!(
+                    r#"{{ "actions": {{ "strike": {{ "cast_time": "0.5", "cooldown": "{cd}",
+                           "damage": {{ "stats": {{}} }} }} }},
+                         "damage_objective": "hit" }}"#
+                ))
+                .unwrap();
+                let sp = sim_compile(&plan, &simdef, &rotation).unwrap();
+                run(&plan, &sp, &b, &fight(6.0), mode).unwrap()
+            };
+            let mc = Mode::MonteCarlo {
+                iterations: 50,
+                seed: 9,
+            };
+            let ev = go("objective.x / 100", Mode::Expected);
+            assert_eq!(ev.actions["strike"].casts, 4);
+            assert!(close(ev.total.total_damage, 400.0));
+            let read = go("objective.x / 100", mc);
+            let lit = go("1.5", mc);
+            assert_eq!(
+                serde_json::to_string(&read).unwrap(),
+                serde_json::to_string(&lit).unwrap(),
+                "MC objective read must be the EXPECTED value (150)"
+            );
+            assert_eq!(read.actions["strike"].casts, ev.actions["strike"].casts);
+            assert!(close(read.total.total_damage, ev.total.total_damage));
+        }
     }
 }
