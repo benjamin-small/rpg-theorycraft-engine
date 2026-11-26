@@ -19,28 +19,30 @@ until then, per semver's "anything goes" pre-1.0 clause).
 - Under `defaults.proc_rolls: "per_hit"` (or `crit_rolls: "per_hit"` on an
   action), Monte Carlo now rolls crit independently per hit and EV
   crit-gated weights follow (#33). Only an action that resolves to
-  `per_hit` in a plan WITH events and has more than one hit moves
-  (including a plan with events but no `"crit"` event: it draws `n`
-  independent branch masks per cast instead of one, and in EV a `per_hit`
-  `on_non_crit` proc with `icd > 0` moves too, since the crit chance is 0). `"crit_rolls":
-  "per_cast"` on an action restores the old behaviour. Per-hit sampling
-  evaluates the sampled pipeline once per hit (up to 10 000 per cast),
-  allocation-free.
+  `per_hit` in a plan WITH events and measures `n != 1` hits moves
+  (`n = 0` presents no crit-gated roll at all, where `per_cast` still
+  presents one). That includes a plan with events but no `"crit"`
+  event: it draws `n` independent branch masks per cast instead of one,
+  and in EV a `per_hit` `on_non_crit` proc with `icd > 0` moves too,
+  since the crit chance is 0. `"crit_rolls": "per_cast"` on an action
+  restores the old behaviour. Per-hit sampling evaluates the sampled
+  pipeline once per hit (up to 10 000 per cast), allocation-free.
 
 ### Added
 - **`ActionDef::crit_rolls`** (`per_cast` | `per_hit`, default inherits
   `defaults.proc_rolls`) — how an action's hits are sampled for crit; a
-  `per_cast` `on_crit`/`on_non_crit` proc gates on any hit, EV weight
-  `1 - (1 - p)^n` (#33).
+  `per_cast` `on_crit` proc gates on any hit, EV weight `1 - (1 - p)^n`
+  (`on_non_crit`: `1 - p^n`) (#33).
 - Event `chance`/`factor` may read pipeline stages before the first
   branched stage (#33). A later stage is a compile error naming it. The
   sim's EV crit weight evaluates the same prefix. Configs that read no
   stage are unchanged.
 - **`on_non_crit` proc trigger** (#33) — the complement of `on_crit`.
   EV weight is `1 − crit_chance`; MC rolls when the cast's sampled crit
-  bit is clear (the same single draw `on_crit` gates on, so the pair
-  fires exactly once per cast at chance 1 and `icd` 0). Same `rolls`/`icd`/`actions`
-  semantics as `on_crit`; with no `"crit"` event every hit qualifies.
+  bit is clear (the same single draw `on_crit` gates on, so under the
+  default `per_cast` `crit_rolls` the pair fires exactly once per cast
+  at chance 1 and `icd` 0). Same `rolls`/`icd`/`actions` semantics as
+  `on_crit`; with no `"crit"` event every hit qualifies.
 
 ## [0.7.0] — 2026-11-21
 

@@ -2785,7 +2785,10 @@ impl<'a> Sim<'a> {
     /// EV mode: the accumulator method (see module docs). `weight` multiplies each
     /// qualifying roll's `chance` BEFORE accumulation — `1.0` for `OnCast`/`OnHit`
     /// (every cast/hit qualifies outright), `crit_chance` for `OnCrit` and
-    /// `1 − crit_chance` for `OnNonCrit` (its exact complement). The `OnCrit` weight is
+    /// `1 − crit_chance` for `OnNonCrit` (its exact complement) — under the
+    /// default `per_cast` [`crate::simdef::ActionDef::crit_rolls`] (one
+    /// shared mask); a resolved `per_hit` replaces these with the
+    /// `CritWeight::Independent` weights below. The `OnCrit` weight is
     /// the EV-consistent choice this task pins, since the design spec is silent on it:
     /// a hit isn't "certainly" a crit in EV mode, so an `on_crit` proc's per-hit
     /// contribution is `proc_chance × P(crit)`, not `proc_chance` outright — this is
@@ -2852,7 +2855,8 @@ impl<'a> Sim<'a> {
     /// - a `per_cast` proc: one roll at `chance × (1 − (1 − p_hit)^hits)`
     ///   — "any hit qualifies";
     /// - a `per_hit` proc with `icd > 0`: ONE accumulation of
-    ///   `1 − (1 − q)^hits`, `q = clamp(chance × p_hit, 0, 1)` — the ICD
+    ///   `1 − (1 − q)^hits`, `q = clamp(chance, 0, 1) × p_hit` (MC's
+    ///   effective per-hit probability, so `chance > 1` agrees) — the ICD
     ///   allows at most one fire per cast, so multiplying by `hits`
     ///   would double-count;
     /// - a `per_hit` proc with `icd: 0`: `hits` accumulations of
@@ -2908,7 +2912,7 @@ impl<'a> Sim<'a> {
                         // are simultaneous: at most ONE fire per cast,
                         // so ONE accumulation of P(>= 1 hit fires).
                         (ProcRolls::PerHit, true) => {
-                            let q = (base * p_hit).clamp(0.0, 1.0);
+                            let q = base.clamp(0.0, 1.0) * p_hit;
                             (1.0 - (1.0 - q).powi(n), 1)
                         }
                         // No gate: every hit accumulates, as always.
@@ -12319,8 +12323,9 @@ mod tests {
         // crit mask (simultaneous hits cannot disagree about whether the
         // cast crit), so at chance 1 / icd 0 every CRIT cast contributes
         // EXACTLY 5 fires and every non-crit cast exactly 0 — the fire
-        // count is a multiple of 5, whatever the seed. Sampling a fresh
-        // crit per HIT would break that invariant almost surely
+        // count is a multiple of 5, whatever the seed. Under the default
+        // per_cast crit_rolls; sampling a fresh crit per HIT
+        // (crit_rolls per_hit) would break that invariant almost surely
         // (binomial hits per cast), which is what this pin
         // discriminates. cc 0.5 keeps both outcomes live (the count
         // lands strictly between the 0-crit and all-crit extremes for
@@ -12796,6 +12801,54 @@ mod tests {
             );
             let m = mc_mean(PER_CAST_CRIT);
             assert!((m - 5.0).abs() / 5.0 < 0.10, "per_cast MC mean {m}");
+        }
+
+        // EV/MC agreement in the two regimes the test above does not
+        // reach, same plan (cc 0.25, nova 5 hits, 20 casts, per_hit
+        // crit sampling, 2000 iterations, seed 20261126):
+        //  (a) ICD-bound: per_hit on_crit chance 1 icd 0.5 -> ONE
+        //      accumulation of 781/1024 per cast -> EV 15; MC fires at
+        //      most once per cast with P = 781/1024 -> mean 15.25.
+        //      (Accumulating n times would make EV 20.)
+        //  (b) on_non_crit: per_cast chance 1 icd 0 -> weight
+        //      1 - 0.25^5 = 1023/1024 -> EV 19; MC mean 20 x 1023/1024
+        //      = 19.98.
+        #[test]
+        fn per_hit_crit_icd_bound_and_on_non_crit_agree_between_ev_and_mc() {
+            let mc_mean = |procs: &str, name: &str| {
+                mc_json(
+                    &crit_plan(),
+                    &crit_build_25(),
+                    &crit_nova("5", PER_HIT_CRIT, procs),
+                    NOVA_ROT,
+                    &dummy(20),
+                    2_000,
+                    20261126,
+                )
+                .proc_counts[name] as f64
+            };
+            let icd = r#"{ "hit": { "trigger": "on_crit", "chance": "1",
+                "icd": 0.5, "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, icd).proc_counts["hit"], 15);
+            let m = mc_mean(icd, "hit");
+            assert!((m - 15.25).abs() / 15.25 < 0.05, "icd-bound MC mean {m}");
+
+            let nc = r#"{ "any": { "trigger": "on_non_crit", "chance": "1",
+                "icd": 0, "apply_buff": "glow", "rolls": "per_cast" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, nc).proc_counts["any"], 19);
+            let m = mc_mean(nc, "any");
+            assert!((m - 19.98).abs() / 19.98 < 0.05, "on_non_crit MC mean {m}");
+        }
+
+        // Chance above 1: MC's effective per-hit probability is
+        // min(chance, 1) x p, so chance 2 behaves as chance 1 -> per cast
+        // 1 - 0.75^5 = 781/1024 -> EV 15 over 20 casts. (Clamping the
+        // PRODUCT, chance x p = 0.5, would give 1 - 0.5^5 -> 19.)
+        #[test]
+        fn ev_icd_proc_chance_above_one_matches_mc_under_per_hit() {
+            let procs = r#"{ "hit": { "trigger": "on_crit", "chance": "2",
+                "icd": 0.5, "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            assert_eq!(ev_crit_nova(PER_HIT_CRIT, procs).proc_counts["hit"], 15);
         }
 
         // --------------------------------------------------------------

@@ -115,8 +115,8 @@
 //!   ([`crate::simdef::ActionDef::crit_rolls`], default
 //!   [`crate::simdef::SimDefaults::proc_rolls`]). Under `per_cast` all
 //!   hits share one crit mask (EV weight `p` / `1 - p`). Under a
-//!   resolved `per_hit`, with events in the plan and `n >= 2` measured
-//!   hits, Monte Carlo draws each hit's mask independently and EV
+//!   resolved `per_hit`, with events in the plan and `n != 1` measured
+//!   hits (`n = 0`: no crit-gated roll at all), Monte Carlo draws each hit's mask independently and EV
 //!   weights follow: a `per_cast` crit-gated proc qualifies on ANY hit
 //!   (`1 - (1 - p)^n`; `on_non_crit`: `1 - p^n`), a `per_hit` proc with
 //!   `icd > 0` accumulates ONCE per cast with `1 - (1 - q)^n`, and one
