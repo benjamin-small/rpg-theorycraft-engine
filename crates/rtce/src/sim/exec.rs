@@ -1031,6 +1031,15 @@ enum Part {
     Segment(usize),
 }
 
+/// The world an `objective.<name>` read is evaluated against (see
+/// [`Sim::fill_objective_slots`]): the plain effective build, or one
+/// action's ([`Part::Whole`]) / segment's overlay build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectiveWorld {
+    Plain,
+    Part(usize, Part),
+}
+
 /// All executor state for one `run` call. Holds `&'a` references to its
 /// immutable inputs (`plan`/`sim_plan`/`build`/`scenario` are all
 /// `Copy`-able reference fields — reading one out, e.g. `let sim_plan =
@@ -1604,6 +1613,9 @@ impl<'a> Sim<'a> {
     fn apply_buff(&mut self, bi: usize, world: Option<&WorldSnapshot>) -> Result<(), PlanError> {
         let now = self.time;
         self.refresh_time_varying_slots();
+        if self.sim_plan.buffs[bi].duration.reads_objectives() {
+            self.fill_objective_slots(ObjectiveWorld::Plain, "at buff application")?;
+        }
         let duration = self.eval_quantity(&self.sim_plan.buffs[bi].duration, || {
             format!(
                 "buff `{}` duration at application (t={now})",
@@ -2264,6 +2276,9 @@ impl<'a> Sim<'a> {
             return Ok(());
         }
         self.refresh_time_varying_slots();
+        let sim_plan = self.sim_plan;
+        let gain = sim_plan.actions[action].gain.iter().map(|(_, v)| v);
+        self.fill_for_action_values(action, gain, "at cast complete")?;
         let gains = self.eval_gains(action, now)?;
         for (ri, amt) in gains {
             self.settle_resource(ri, now);
@@ -2313,10 +2328,94 @@ impl<'a> Sim<'a> {
         for bi in 0..sim_plan.buffs.len() {
             self.scratch.slots[stacks_base + bi] = self.buffs[bi].instances.len() as f64;
         }
-        // The two reserved segment words are the LAST two sim slots.
-        let end = sim_plan.slot_width;
-        self.scratch.slots[end - 2] = f64::from(self.segments_done);
-        self.scratch.slots[end - 1] = f64::from(self.segments_total - self.segments_done);
+        // The two reserved segment words. The objective region after them
+        // (`SimPlan::objective_base`) is deliberately NOT written here: it
+        // is filled only by `Sim::fill_objective_slots`, immediately
+        // before a program that reads it, and this refresh never touches
+        // it — so a refresh between a fill and its read cannot clobber
+        // the fill.
+        let done = sim_plan.segments_done_slot;
+        self.scratch.slots[done] = f64::from(self.segments_done);
+        self.scratch.slots[done + 1] = f64::from(self.segments_total - self.segments_done);
+    }
+
+    /// Write every `objective.<name>` slot for the current instant: ONE
+    /// deterministic [`Plan::evaluate_phase`] against `world` and the
+    /// effective phase (slice 6, spec §5.6). Called immediately before
+    /// evaluating a program whose `reads_objectives` is set — and ONLY
+    /// then, so every config that reads no objective takes exactly its
+    /// pre-slice-6 path (no extra Plan evaluation, no RNG change).
+    ///
+    /// - [`ObjectiveWorld::Plain`]: the effective build (base + live
+    ///   buffs' contributions) — buff `duration`, proc `chance`, rule
+    ///   `when`.
+    /// - [`ObjectiveWorld::Part`]: that action's (or segment's)
+    ///   `damage.stats` overlay folded onto the effective build, through
+    ///   the SAME construction a measured cast uses
+    ///   ([`Sim::overlay_build_for_action`] — one `BuildState` clone per
+    ///   fill, plus the overlay map's per-stat key clones), evaluated at
+    ///   THIS field's instant, not the measure instant (so `gain` sees
+    ///   `casts.<self>` one lower than the measured overlay, and a
+    ///   cost/cooldown overlay sees pre-payment resources, `cast_time`'s
+    ///   post-payment ones);
+    ///   a part with no `damage` (a utility action, a segmented action's
+    ///   action-level fields, a wind-up segment) falls back to the plain
+    ///   build. `instant` names the position for that overlay's
+    ///   positioned error.
+    ///
+    /// COST: one `evaluate_phase` per fill (zero-allocation on the
+    /// `Plain` path); a rule `when` or a `cost` reading objectives fills
+    /// once per rule per decision. A `Part` fill on a damaging action adds
+    /// the overlay clone above.
+    ///
+    /// Never sampled, never an RNG draw, in either mode: the read is the
+    /// branch-weighted EXPECTED objective by definition. A non-finite
+    /// objective is written as-is and left for the field's own
+    /// fail-closed check to report at its instant.
+    ///
+    /// No staleness can leak: the region is written as a whole at every
+    /// fill, read only by programs that are always filled for first, and
+    /// a program that does not read objectives never loads these slots
+    /// whatever they hold.
+    ///
+    /// PRECONDITION: the time-varying tail is current
+    /// ([`Sim::refresh_time_varying_slots`]) — the overlay's stat
+    /// expressions read it.
+    fn fill_objective_slots(
+        &mut self,
+        world: ObjectiveWorld,
+        instant: &'static str,
+    ) -> Result<(), PlanError> {
+        let overlay = match world {
+            ObjectiveWorld::Part(action, part) if self.part_damage(action, part).is_some() => {
+                Some(self.overlay_build_for_action(action, part, self.time, instant)?)
+            }
+            _ => None,
+        };
+        // `plan`, `effective_*` and `scratch.{eval,slots}` are DISJOINT
+        // fields of `self`, so the objective slice can be copied straight
+        // into the slot array.
+        let build = overlay.as_ref().unwrap_or(&self.effective_damage_build);
+        let objs =
+            self.plan
+                .evaluate_phase(build, &self.effective_phase, &mut self.scratch.eval)?;
+        let base = self.sim_plan.objective_base;
+        self.scratch.slots[base..base + objs.len()].copy_from_slice(objs);
+        Ok(())
+    }
+
+    /// [`Sim::fill_objective_slots`] for `action`'s action-level world,
+    /// when any of `values` reads an objective; a no-op otherwise.
+    fn fill_for_action_values(
+        &mut self,
+        action: usize,
+        values: impl IntoIterator<Item = &'a CompiledValue>,
+        instant: &'static str,
+    ) -> Result<(), PlanError> {
+        if values.into_iter().any(CompiledValue::reads_objectives) {
+            self.fill_objective_slots(ObjectiveWorld::Part(action, Part::Whole), instant)?;
+        }
+        Ok(())
     }
 
     /// Walk the rotation, chaining instant (`cast_time == 0`) casts, until
@@ -2349,12 +2448,17 @@ impl<'a> Sim<'a> {
 
             for (ridx, rule) in sim_plan.rules.iter().enumerate() {
                 if let Some(w) = &rule.when {
+                    if w.reads_objectives {
+                        self.fill_objective_slots(ObjectiveWorld::Plain, "at a rotation decision")?;
+                    }
                     if w.eval(&self.scratch.slots) == 0.0 {
                         continue;
                     }
                 }
                 let action = rule.action;
                 let cd_ready = self.actions[action].cooldown_ready_at;
+                let cost = sim_plan.actions[action].cost.iter().map(|(_, v)| v);
+                self.fill_for_action_values(action, cost, "at a rotation decision")?;
                 let afford = self.afford(action, now, "at a rotation decision")?;
                 if cd_ready <= now && afford == Afford::Now {
                     chosen = Some(action);
@@ -2399,7 +2503,11 @@ impl<'a> Sim<'a> {
                 let cd_ready = self.actions[action].cooldown_ready_at;
                 if cd_ready <= now {
                     // Cooldown isn't the blocker — whatever's short here IS
-                    // resource starvation.
+                    // resource starvation. A later rule's fill may have
+                    // overwritten the objective region since this
+                    // action's afford check, so fill again.
+                    let cost = sim_plan.actions[action].cost.iter().map(|(_, v)| v);
+                    self.fill_for_action_values(action, cost, "at a rotation decision")?;
                     let costs = self.eval_costs(action, now, "at a rotation decision")?;
                     for (ri, amt) in costs {
                         if self.resource_amount_now(ri, now) < amt {
@@ -2423,6 +2531,11 @@ impl<'a> Sim<'a> {
     fn begin_cast(&mut self, action: usize) -> Result<(), PlanError> {
         let now = self.time;
         self.refresh_time_varying_slots();
+        // `cost` and `cooldown` share the pre-payment world: one fill.
+        let sim_plan = self.sim_plan;
+        let a = &sim_plan.actions[action];
+        let start_values = a.cost.iter().map(|(_, v)| v).chain([&a.cooldown]);
+        self.fill_for_action_values(action, start_values, "at cast start")?;
         let costs = self.eval_costs(action, now, "at cast start")?;
         let cooldown = self.eval_quantity(&self.sim_plan.actions[action].cooldown, || {
             format!(
@@ -2439,7 +2552,7 @@ impl<'a> Sim<'a> {
         // included — so an all-instant cast ends with `mid_cast` false
         // and counts against the instant-chain limit like an instant
         // cast. Segment 0 starts now.
-        let Some(cast_time) = self.sim_plan.actions[action].cast_time.as_ref() else {
+        let Some(cast_time) = sim_plan.actions[action].cast_time.as_ref() else {
             self.mid_cast = true;
             self.segments_total = self.sim_plan.actions[action].segments.len() as u32;
             self.segments_done = 0;
@@ -2448,6 +2561,10 @@ impl<'a> Sim<'a> {
             }
             return Ok(());
         };
+        if cast_time.reads_objectives {
+            // After payment and the second refresh: the post-cost world.
+            self.fill_objective_slots(ObjectiveWorld::Part(action, Part::Whole), "at cast start")?;
+        }
         let ct = cast_time.eval(&self.scratch.slots);
         if !ct.is_finite() || ct < 0.0 {
             return Err(PlanError {
@@ -2500,7 +2617,14 @@ impl<'a> Sim<'a> {
     fn start_segment(&mut self, action: usize, segment: usize) -> Result<bool, PlanError> {
         let now = self.time;
         self.refresh_time_varying_slots();
-        let seg = &self.sim_plan.actions[action].segments[segment];
+        let sim_plan = self.sim_plan;
+        let seg = &sim_plan.actions[action].segments[segment];
+        if seg.duration.reads_objectives() {
+            self.fill_objective_slots(
+                ObjectiveWorld::Part(action, Part::Segment(segment)),
+                "at segment start",
+            )?;
+        }
         let d = self.eval_quantity(&seg.duration, || {
             format!(
                 "action `{}` segment {segment} duration at segment start (t={now})",
@@ -3137,6 +3261,9 @@ impl<'a> Sim<'a> {
             // `casts.*`, telling the same story). Once per CAST, not per
             // hit — see the doc comment.
             self.refresh_time_varying_slots();
+            if self.sim_plan.procs[pi].chance.reads_objectives {
+                self.fill_objective_slots(ObjectiveWorld::Plain, "at a proc roll")?;
+            }
             let base = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
             let (chance, rolls) = match weight {
                 CritWeight::Shared(w) => (base * w, rolls),
@@ -3394,6 +3521,9 @@ impl<'a> Sim<'a> {
             // Per-proc — see `roll_procs_ev` for why. Once per CAST, not
             // per hit — also see `roll_procs_ev`.
             self.refresh_time_varying_slots();
+            if self.sim_plan.procs[pi].chance.reads_objectives {
+                self.fill_objective_slots(ObjectiveWorld::Plain, "at a proc roll")?;
+            }
             let chance = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
             for _ in 0..rolls {
                 if self.procs[pi].icd_ready_at > now {
@@ -14910,6 +15040,591 @@ mod tests {
                 let r = try_run(&simdef(&slam_with(""), 10.0, &p), &b, 5.0, mc).unwrap();
                 assert_eq!(r.proc_counts["ph"], want, "icd {icd}: {:?}", r.proc_counts);
             }
+        }
+    }
+
+    // ==================================================================
+    // Slice 6: `objective.<name>` reads, evaluated at each field's
+    // instant against that field's world (see `Sim::fill_objective_slots`).
+    //
+    // Shared fixture (the plan's "Shared test fixture"): `hct = 1 / (aps
+    // * (1 + fast))`, `hit = dmg`; build aps 1, dmg 100; buff `haste`
+    // drives `fast = 1` for 10 s. So `objective.hct` reads 1.0 in the
+    // plain world, 0.5 once haste is up, and 0.5 under an overlay that
+    // sets `aps: 2`. Against the pre-slice-6 executor every objective
+    // slot reads 0, which is what each test's RED contrast names.
+    // ==================================================================
+    mod objective_reads {
+        use super::*;
+        use crate::scenario::Scenario;
+
+        fn haste_plan() -> Plan {
+            let gd: GameDef = serde_json::from_str(
+                r#"{ "stats": ["aps", "dmg"], "conditions": ["fast"],
+                     "pipeline": [
+                       { "name": "hct", "expr": "1 / (aps * (1 + fast))" },
+                       { "name": "hit", "expr": "dmg" } ],
+                     "objectives": ["hit", "hct"] }"#,
+            )
+            .unwrap();
+            plan::compile(&gd).unwrap()
+        }
+
+        fn build(aps: f64) -> BuildState {
+            serde_json::from_str(&format!(
+                r#"{{ "stats": {{ "aps": {aps}, "dmg": 100.0 }} }}"#
+            ))
+            .unwrap()
+        }
+
+        fn fight(weight: f64) -> Scenario {
+            serde_json::from_str(&format!(
+                r#"{{ "phases": [ {{ "name": "p", "weight": {weight} }} ] }}"#
+            ))
+            .unwrap()
+        }
+
+        /// `actions_and_more` is spliced in as the simdef's top-level
+        /// fields (must end with a trailing comma); `haste`, `blip` and
+        /// `damage_objective: "hit"` are always present.
+        fn simdef(actions_and_more: &str) -> String {
+            format!(
+                r#"{{ {actions_and_more}
+                     "buffs": {{
+                       "haste": {{ "duration": 10, "conditions": {{ "fast": 1.0 }} }},
+                       "blip": {{ "duration": 0.1 }} }},
+                     "damage_objective": "hit" }}"#
+            )
+        }
+
+        fn try_run(
+            sim: &str,
+            rot: &str,
+            aps: f64,
+            weight: f64,
+            mode: Mode,
+        ) -> Result<SimReport, PlanError> {
+            let plan = haste_plan();
+            let simdef: SimDef = serde_json::from_str(sim).unwrap();
+            let rotation: Rotation = serde_json::from_str(rot).unwrap();
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            run(&plan, &sim_plan, &build(aps), &fight(weight), mode)
+        }
+
+        fn ev(sim: &str, rot: &str, weight: f64) -> SimReport {
+            try_run(sim, rot, 1.0, weight, Mode::Expected).unwrap()
+        }
+
+        const STRIKE: &str = r#"{ "rules": [ { "action": "strike" } ] }"#;
+
+        // --------------------------------------------------------------
+        // strike: cast_time "objective.hct", damage (hit = dmg = 100),
+        // effects [apply_buff haste]; weight 5.5.
+        //   cast 1 starts t=0 with fast 0 → hct 1 → completes 1.0 and
+        //   applies haste (up to 11.0, refreshed every cast);
+        //   casts 2.. start with fast 1 → hct 0.5 → complete 1.5, 2.0, …,
+        //   5.5 (the horizon, drained) → 9 more.
+        //   → casts 10, total 1000.
+        // Contrast: cast_time "1" → completes 1..5 → casts 5, total 500.
+        // RED (every objective slot 0): cast_time 0 → instant livelock.
+        // --------------------------------------------------------------
+        #[test]
+        fn cast_time_follows_an_objective_the_sim_drives() {
+            let strike = |ct: &str| {
+                simdef(&format!(
+                    r#""actions": {{ "strike": {{ "cast_time": "{ct}",
+                         "damage": {{ "stats": {{}} }},
+                         "effects": [ {{ "apply_buff": "haste" }} ] }} }},"#
+                ))
+            };
+            let r = try_run(&strike("objective.hct"), STRIKE, 1.0, 5.5, Mode::Expected)
+                .expect("objective-read cast_time must run");
+            assert_eq!(r.actions["strike"].casts, 10, "{:?}", r.actions);
+            assert!(
+                close(r.total.total_damage, 1000.0),
+                "{}",
+                r.total.total_damage
+            );
+            let lit = ev(&strike("1"), STRIKE, 5.5);
+            assert_eq!(lit.actions["strike"].casts, 5);
+            assert!(close(lit.total.total_damage, 500.0));
+        }
+
+        // --------------------------------------------------------------
+        // slam: one segment, duration "objective.hct", the segment's
+        // damage.stats { aps: 2 } → its world reads hct = 1/2 = 0.5 s.
+        // Weight 2: landings 0.5, 1.0, 1.5, 2.0 (horizon) → casts 4,
+        // total 400. Under the plain build (aps 1) it would be 1.0 s →
+        // landings 1.0, 2.0 → casts 2 (the plain-world mutation).
+        // RED: duration 0 → every segment instant → instant livelock.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_segment_duration_reads_its_own_overlay_world() {
+            let sim = simdef(
+                r#""actions": { "slam": { "segments": [ { "duration": "objective.hct",
+                     "damage": { "stats": { "aps": 2 } } } ] } },"#,
+            );
+            let r = try_run(
+                &sim,
+                r#"{ "rules": [ { "action": "slam" } ] }"#,
+                1.0,
+                2.0,
+                Mode::Expected,
+            )
+            .expect("objective-read segment duration must run");
+            assert_eq!(
+                r.actions["slam"].casts, 4,
+                "4 = the overlay world (aps 2 → 0.5 s); 2 = the plain build"
+            );
+            assert!(
+                close(r.total.total_damage, 400.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        #[test]
+        fn every_legal_field_reads_its_objective_world() {
+            // Every field is checked before anything asserts, so one run
+            // names every field that reads the wrong world.
+            let mut wrong: Vec<String> = Vec::new();
+            let mut check = |field: &str, got: f64, want: f64| {
+                if !close(got, want) {
+                    wrong.push(format!("{field}: got {got}, want {want}"));
+                }
+            };
+            // ---- cooldown "objective.hct" -----------------------------
+            // strike cast_time 0.25, damage.stats { aps: 2 } → its world
+            // reads hct 0.5 → cooldown 0.5. Weight 3: starts 0, 0.5, …,
+            // 2.5 → casts 6, total 600.
+            // Contrast: plain world (hct 1) → starts 0, 1, 2 → 3; RED
+            // (0) → every 0.25 s, starts 0..2.75 → 12.
+            let sim = simdef(
+                r#""actions": { "strike": { "cast_time": "0.25", "cooldown": "objective.hct",
+                     "damage": { "stats": { "aps": 2 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 3.0);
+            check("cooldown casts", r.actions["strike"].casts as f64, 6.0);
+
+            // ---- cost { mana: "10 * objective.hct" } --------------------
+            // mana max 10, regen 1/s. strike cast_time 1, no overlay,
+            // effects [haste]. Plain world, so cost = 10 × hct.
+            //   t=0: fast 0 → cost 10, mana 10 → cast; mana 0.
+            //   t=1: completes, haste up (fast 1); mana 1. Decision:
+            //        cost NOW reads 5 → affordable at 1 + (5-1)/1 = 5.
+            //   t=5: cost 5, mana 5 → cast; completes 6 (haste → 16).
+            //   t=6: mana 1 → wake 10; t=10: cast; completes 11.
+            //   Weight 11 → casts 3 (completions 1, 6, 11), total 300.
+            // Contrast: a STALE affordability read (the cast-start value
+            // 10 reused at t=1) wakes at 10, not 5 → casts 0, 10 → 2. RED
+            // (0): cost 0 → a cast every second → 11.
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "10", "regen_per_sec": "1" } },
+                   "actions": { "strike": { "cast_time": "1",
+                     "cost": { "mana": "10 * objective.hct" },
+                     "damage": { "stats": {} },
+                     "effects": [ { "apply_buff": "haste" } ] } },"#,
+            );
+            let r = ev(&sim, STRIKE, 11.0);
+            check("cost casts", r.actions["strike"].casts as f64, 3.0);
+            check("cost total", r.total.total_damage, 300.0);
+
+            // ---- gain { mana: "10 * objective.hct" } ------------------
+            // mana max 20, regen 0; strike cast_time 1, cost 10,
+            // damage.stats { aps: 2 } → its world reads hct 0.5 → gain 5
+            // at cast complete: net −5 per cast. 20 → (pay) 10 → (gain)
+            // 15 → 5 → 10 → 0 → 5 < 10, never again → casts 3 (weight 10).
+            // Contrast: plain world (gain 10, net 0) → 10 casts; RED (gain
+            // 0, net −10) → 2.
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "0" } },
+                   "actions": { "strike": { "cast_time": "1", "cost": { "mana": 10 },
+                     "gain": { "mana": "10 * objective.hct" },
+                     "damage": { "stats": { "aps": 2 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 10.0);
+            check("gain casts", r.actions["strike"].casts as f64, 3.0);
+
+            // ---- buff duration "objective.hct" ------------------------
+            // strike cast_time 4, damage.stats { aps: 2 }, effects
+            // [mark]; mark's duration reads the PLAIN world (hct 1), not
+            // the applying cast's overlay (0.5). Weight 8: applied at 4
+            // (up to 5) and at 8 (the horizon, 0 s) → uptime 1/8 = 0.125.
+            // Contrast: the overlay world → 0.5/8 = 0.0625; RED → 0.
+            let sim = r#"{ "actions": { "strike": { "cast_time": "4",
+                       "damage": { "stats": { "aps": 2 } },
+                       "effects": [ { "apply_buff": "mark" } ] } },
+                     "buffs": { "mark": { "duration": "objective.hct" } },
+                     "damage_objective": "hit" }"#;
+            let r = ev(sim, STRIKE, 8.0);
+            check("buff duration uptime", r.buffs["mark"].uptime, 0.125);
+
+            // ---- proc chance "objective.hct / 2" ----------------------
+            // on_cast proc, plain world → chance 0.5; strike cast_time 1,
+            // damage.stats { aps: 2 }. Weight 10 → 10 casts; the EV
+            // accumulator fires at casts 2, 4, 6, 8, 10 → 5.
+            // Contrast: the cast's overlay world (0.25) → 2 (casts 4,
+            // 8); RED (0) → 0.
+            let sim = simdef(
+                r#""actions": { "strike": { "cast_time": "1",
+                     "damage": { "stats": { "aps": 2 } } } },
+                   "procs": { "p": { "trigger": "on_cast", "chance": "objective.hct / 2",
+                                     "apply_buff": "blip" } },"#,
+            );
+            let r = ev(&sim, STRIKE, 10.0);
+            check("proc chance fires", r.proc_counts["p"] as f64, 5.0);
+
+            // ---- rule when "objective.hct < 0.75" ---------------------
+            // rules [big when hct < 0.75, small]; small cast_time 1,
+            // applies haste; big cast_time 1, damage.stats { dmg: 1000,
+            // aps: 2 }. `when` reads the PLAIN world:
+            //   t=0: hct 1 → big skipped → small (100), haste at 1;
+            //   t=1, t=2: hct 0.5 → big (1000 each). Weight 3:
+            //   small 1, big 2, total 2100.
+            // Contrast: big's overlay world (hct 0.5 at t=0) or RED (0 <
+            // 0.75) → big ×3, total 3000.
+            let sim = simdef(
+                r#""actions": {
+                     "big": { "cast_time": "1", "damage": { "stats": { "dmg": 1000, "aps": 2 } } },
+                     "small": { "cast_time": "1", "damage": { "stats": {} },
+                                "effects": [ { "apply_buff": "haste" } ] } },"#,
+            );
+            let r = ev(
+                &sim,
+                r#"{ "rules": [ { "action": "big", "when": "objective.hct < 0.75" },
+                                { "action": "small" } ] }"#,
+                3.0,
+            );
+            check("when small casts", r.actions["small"].casts as f64, 1.0);
+            check("when big casts", r.actions["big"].casts as f64, 2.0);
+            check("when total", r.total.total_damage, 2100.0);
+            assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+
+        // --------------------------------------------------------------
+        // MC byte identity: cast_time "objective.hct" with haste never
+        // applied (hct = 1 throughout) vs cast_time "1"; the plan has no
+        // events (crit-free); an on_cast proc with chance 0.5 draws one
+        // RNG value per cast, so an extra draw anywhere would shift every
+        // later roll. 50 iterations, seed 9: the serialized reports must
+        // be equal byte for byte. RED: cast_time 0 → instant livelock.
+        // --------------------------------------------------------------
+        #[test]
+        fn objective_reads_consume_no_rng_draws() {
+            let sim = |ct: &str| {
+                simdef(&format!(
+                    r#""actions": {{ "strike": {{ "cast_time": "{ct}",
+                         "damage": {{ "stats": {{}} }} }} }},
+                       "procs": {{ "p": {{ "trigger": "on_cast", "chance": "0.5",
+                                         "apply_buff": "blip" }} }},"#
+                ))
+            };
+            let mc = Mode::MonteCarlo {
+                iterations: 50,
+                seed: 9,
+            };
+            let a = try_run(&sim("objective.hct"), STRIKE, 1.0, 20.0, mc)
+                .expect("objective-read cast_time must run under MC");
+            let b = try_run(&sim("1"), STRIKE, 1.0, 20.0, mc).unwrap();
+            assert_eq!(a.actions["strike"].casts, 20);
+            assert_eq!(
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&b).unwrap()
+            );
+        }
+
+        // aps 0 → hct = 1 / 0 = inf → the cast_time read fails closed with
+        // the existing cast_time error (not a NaN/inf cadence). RED: the
+        // slot reads 0 → instant livelock, a different error.
+        #[test]
+        fn a_non_finite_objective_fails_closed_at_the_field() {
+            let sim = simdef(
+                r#""actions": { "strike": { "cast_time": "objective.hct",
+                     "damage": { "stats": {} } } },"#,
+            );
+            let e = try_run(&sim, STRIKE, 0.0, 5.0, Mode::Expected).unwrap_err();
+            assert!(
+                e.what.contains(
+                    "action `strike`: cast_time evaluated to inf (must be finite and >= 0)"
+                ),
+                "got: {}",
+                e.what
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Fix round 1: world pins for the fields whose earlier pins had
+        // overlay == plain.
+        //
+        // strike: cast_time "objective.hct", damage.stats { aps: 2 }, no
+        // haste → its world reads hct = 1/2 = 0.5. Weight 3: completions
+        // 0.5, 1.0, …, 3.0 (horizon) → casts 6, total 600.
+        // Contrast: the plain world (aps 1 → hct 1) → completions 1, 2, 3
+        // → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn cast_time_reads_its_actions_overlay_world() {
+            let sim = simdef(
+                r#""actions": { "strike": { "cast_time": "objective.hct",
+                     "damage": { "stats": { "aps": 2 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 3.0);
+            assert_eq!(
+                r.actions["strike"].casts, 6,
+                "6 = the overlay world (hct 0.5); 3 = the plain build (hct 1)"
+            );
+            assert!(
+                close(r.total.total_damage, 600.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cost { mana: "10 * objective.hct" }, strike damage.stats
+        // { aps: 0.5 } → its world reads hct 2 → cost 20 (plain: 10).
+        // mana max 30, regen 1/s, cast_time 12, weight 28:
+        //   t=0:  mana 30 ≥ 20 → cast, pay 20 → 10.
+        //   t=12: complete; mana 22 ≥ 20 → cast, pay 20 → 2.
+        //   t=24: complete; mana 14 < 20 → wake at 24 + 6 = 30 (past the
+        //         horizon); the wake branch marks mana starved from 24
+        //         (14 < 20) → finalize closes it at 28 → time_starved 4.
+        //   → casts 2, time_starved 4.
+        // Contrasts (single-site mutations to the plain world, cost 10):
+        //   - the AFFORD fill: at 24 mana 14 ≥ 10 → a third cast begins
+        //     (completes at 36, uncounted) and nothing starves → 0;
+        //   - the wake-branch REFILL: afford still says "short", but the
+        //     starvation check reads cost 10 ≤ 14 → not starved → 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn decision_time_cost_reads_its_actions_overlay_world() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "30", "regen_per_sec": "1" } },
+                   "actions": { "strike": { "cast_time": "12",
+                     "cost": { "mana": "10 * objective.hct" },
+                     "damage": { "stats": { "aps": 0.5 } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 28.0);
+            assert_eq!(r.actions["strike"].casts, 2, "{:?}", r.actions);
+            assert!(
+                close(r.resources["mana"].time_starved, 4.0),
+                "time_starved {} (4 = decision-time cost read the overlay \
+                 world, cost 20; 0 = it read the plain world, cost 10)",
+                r.resources["mana"].time_starved
+            );
+        }
+
+        // --------------------------------------------------------------
+        // The wake-branch REFILL, with a LOWER rule whose `when` reads an
+        // objective: rules [strike, other when "objective.hct > 100"].
+        // Same strike as the test above (cost 10 × overlay hct 2 = 20),
+        // mana max 30, regen 1/s, cast_time 12, weight 28 → casts 2 and,
+        // at t=24, mana 14 < 20 → starved from 24 → time_starved 4.
+        // At t=24 rule 2's `when` is evaluated AFTER strike's afford
+        // check and its fill overwrites the objective region with the
+        // PLAIN world (hct 1; 1 > 100 false → skipped). The wake branch
+        // then re-prices strike's cost: with the refill 20 > 14 → starved
+        // (4); skipping it reads the plain region → cost 10 ≤ 14 → not
+        // starved → 0 (the single-rule test cannot tell: nothing
+        // overwrites the region there).
+        // --------------------------------------------------------------
+        #[test]
+        fn wake_branch_refills_after_a_later_rules_when_overwrites_the_region() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "30", "regen_per_sec": "1" } },
+                   "actions": {
+                     "strike": { "cast_time": "12",
+                       "cost": { "mana": "10 * objective.hct" },
+                       "damage": { "stats": { "aps": 0.5 } } },
+                     "other": { "cast_time": "1", "damage": { "stats": {} } } },"#,
+            );
+            let r = ev(
+                &sim,
+                r#"{ "rules": [ { "action": "strike" },
+                                { "action": "other", "when": "objective.hct > 100" } ] }"#,
+                28.0,
+            );
+            assert_eq!(r.actions["strike"].casts, 2, "{:?}", r.actions);
+            assert_eq!(r.actions["other"].casts, 0, "{:?}", r.actions);
+            assert!(
+                close(r.resources["mana"].time_starved, 4.0),
+                "time_starved {} (4 = the wake branch re-priced strike's cost \
+                 in its overlay world; 0 = it read the lower rule's plain fill)",
+                r.resources["mana"].time_starved
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cast_time reads the POST-payment world. mana max 20, regen
+        // 100/s (refills to 20 within each cast), cost { mana: 10 },
+        // strike damage.stats { aps: "mana / 10" }, cast_time
+        // "objective.hct" (hct = 1 / aps; no haste), weight 3.
+        //   Post-payment (documented): at a cast start mana is 20, the
+        //   cost leaves 10 → aps 1 → hct 1 → completions 1, 2, 3 →
+        //   casts 3, total 300.
+        // Contrast (the fill moved BEFORE payment): mana 20 → aps 2 → hct
+        // 0.5 → completions 0.5 … 3.0 → casts 6, total 600.
+        // --------------------------------------------------------------
+        #[test]
+        fn cast_time_overlay_sees_post_payment_resources() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "100" } },
+                   "actions": { "strike": { "cast_time": "objective.hct",
+                     "cost": { "mana": 10 },
+                     "damage": { "stats": { "aps": "mana / 10" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 3.0);
+            assert_eq!(
+                r.actions["strike"].casts, 3,
+                "3 = post-payment mana 10 (hct 1); 6 = pre-payment mana 20 (hct 0.5)"
+            );
+            assert!(
+                close(r.total.total_damage, 300.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cooldown reads the PRE-payment world (the cost/cooldown share
+        // one pre-payment fill; `cost` is necessarily pre-payment — its
+        // amount is what gets paid, so only `cooldown` can be told apart
+        // from a post-payment evaluation). Same resource, cost 10, cast
+        // time 0.1 (literal), cooldown "objective.hct", damage.stats
+        // { aps: "mana / 10" }, weight 2.4.
+        //   Pre-payment (documented): mana 20 → aps 2 → cooldown 0.5;
+        //   regen 100/s refills well within it → starts 0, 0.5, 1.0, 1.5,
+        //   2.0 (each completing 0.1 later, all by 2.1) → casts 5.
+        // Contrast (cooldown evaluated AFTER payment): mana 10 → aps 1 →
+        // cooldown 1 → starts 0, 1, 2 → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn cooldown_overlay_sees_pre_payment_resources() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "100" } },
+                   "actions": { "strike": { "cast_time": "0.1",
+                     "cooldown": "objective.hct",
+                     "cost": { "mana": 10 },
+                     "damage": { "stats": { "aps": "mana / 10" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 2.4);
+            assert_eq!(
+                r.actions["strike"].casts, 5,
+                "5 = pre-payment mana 20 (cooldown 0.5); 3 = post-payment mana 10 (cooldown 1)"
+            );
+        }
+
+        // --------------------------------------------------------------
+        // gain's overlay sees `casts.<self>` one LOWER than the measured
+        // overlay: gain runs before the completing cast's increment.
+        // mana max 20, regen 0 (starts full), strike cast_time 1, cost
+        // 10, gain { mana: "12 * objective.hct" }, damage.stats
+        // { aps: "1 + casts.strike" } → hct = 1 / (1 + casts), weight 10.
+        //   Pre-increment (documented): completing cast n sees casts n-1
+        //   → gain 12 / n.
+        //     c1: 20 → 10, +12 → 22 capped 20
+        //     c2: 20 → 10, +6  → 16
+        //     c3: 16 → 6,  +4  → 10
+        //     c4: 10 → 0,  +3  → 3;  3 < 10 and no regen → stop: casts 4.
+        // Contrast (gain after the increment: casts n → gain 12 / (n+1)):
+        //     c1: 10 + 6 = 16;  c2: 6 + 4 = 10;  c3: 0 + 3 = 3 → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn gain_overlay_sees_the_pre_increment_cast_count() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "0" } },
+                   "actions": { "strike": { "cast_time": "1", "cost": { "mana": 10 },
+                     "gain": { "mana": "12 * objective.hct" },
+                     "damage": { "stats": { "aps": "1 + casts.strike" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 10.0);
+            assert_eq!(
+                r.actions["strike"].casts, 4,
+                "4 = gain priced before the increment; 3 = after it"
+            );
+        }
+
+        // --------------------------------------------------------------
+        // A segmented action's action-level fields have no overlay: its
+        // `cooldown "objective.hct"` reads the PLAIN build (hct 1) even
+        // though its one segment carries damage.stats { aps: 2 } (hct
+        // 0.5). Segment duration 0.25 (literal), weight 3: casts start
+        // 0, 1, 2 (each landing 0.25 later) → casts 3, total 300.
+        // Contrast: the segment's overlay world → cooldown 0.5 → starts
+        // 0, 0.5, …, 2.5 → casts 6.
+        // --------------------------------------------------------------
+        #[test]
+        fn segmented_action_level_fields_read_the_plain_world() {
+            let sim = simdef(
+                r#""actions": { "slam": { "cooldown": "objective.hct",
+                     "segments": [ { "duration": 0.25,
+                                     "damage": { "stats": { "aps": 2 } } } ] } },"#,
+            );
+            let r = ev(&sim, r#"{ "rules": [ { "action": "slam" } ] }"#, 3.0);
+            assert_eq!(
+                r.actions["slam"].casts, 3,
+                "3 = the plain build (cooldown 1); 6 = a segment's overlay (0.5)"
+            );
+            assert!(
+                close(r.total.total_damage, 300.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // An objective downstream of a BRANCHED stage reads its EXPECTED
+        // value in Monte Carlo too. Plan: event crit (chance 0.5, factor
+        // 2), branched `x = 100 * event_factors` → E[x] = 0.5·100 +
+        // 0.5·200 = 150 (any one sample is 100 or 200); `hit = dmg`.
+        // strike: cast_time 0.5, cooldown "objective.x / 100" = 1.5,
+        // weight 6: starts 0, 1.5, 3, 4.5 → completions 0.5 … 5.0 →
+        // casts 4, total 400 (hit is unbranched).
+        // MC (50 iterations, seed 9) must serialize byte-identically to
+        // the same MC run with the literal cooldown "1.5", and agree with
+        // EV on casts and total. A sampled read (cooldown 1 or 2 per
+        // cast → 3..6 casts per iteration) breaks both.
+        // --------------------------------------------------------------
+        #[test]
+        fn objective_reads_are_expected_values_in_monte_carlo() {
+            let gd: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"],
+                     "events": { "crit": { "chance": "0.5", "factor": "2" } },
+                     "pipeline": [
+                       { "name": "x", "expr": "100 * event_factors", "branched": true },
+                       { "name": "hit", "expr": "dmg" } ],
+                     "objectives": ["hit", "x"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&gd).unwrap();
+            let b: BuildState = serde_json::from_str(r#"{ "stats": { "dmg": 100.0 } }"#).unwrap();
+            let rotation: Rotation = serde_json::from_str(STRIKE).unwrap();
+            let go = |cd: &str, mode: Mode| {
+                let simdef: SimDef = serde_json::from_str(&format!(
+                    r#"{{ "actions": {{ "strike": {{ "cast_time": "0.5", "cooldown": "{cd}",
+                           "damage": {{ "stats": {{}} }} }} }},
+                         "damage_objective": "hit" }}"#
+                ))
+                .unwrap();
+                let sp = sim_compile(&plan, &simdef, &rotation).unwrap();
+                run(&plan, &sp, &b, &fight(6.0), mode).unwrap()
+            };
+            let mc = Mode::MonteCarlo {
+                iterations: 50,
+                seed: 9,
+            };
+            let ev = go("objective.x / 100", Mode::Expected);
+            assert_eq!(ev.actions["strike"].casts, 4);
+            assert!(close(ev.total.total_damage, 400.0));
+            let read = go("objective.x / 100", mc);
+            let lit = go("1.5", mc);
+            assert_eq!(
+                serde_json::to_string(&read).unwrap(),
+                serde_json::to_string(&lit).unwrap(),
+                "MC objective read must be the EXPECTED value (150)"
+            );
+            assert_eq!(read.actions["strike"].casts, ev.actions["strike"].casts);
+            assert!(close(read.total.total_damage, ev.total.total_damage));
         }
     }
 }

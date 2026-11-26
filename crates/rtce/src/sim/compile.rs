@@ -10,6 +10,52 @@ use crate::plan::{Plan, PlanError};
 use crate::simdef::{
     EffectDef, EventOrder, Measure, NumOrExpr, ProcRolls, ReapplyPolicy, Rotation, SimDef, Trigger,
 };
+use std::cell::{Cell, RefCell};
+
+/// A compiled sim expression plus whether it reads any `objective.<name>`
+/// slot (slice 6). The executor evaluates an expression whose
+/// `reads_objectives` is `false` exactly as before — no extra Plan
+/// evaluation, no RNG change — so the flag is what keeps every existing
+/// config byte-identical.
+///
+/// Used for every field where an objective read is LEGAL: action
+/// `cast_time`, proc `chance`, rotation rule `when`, and
+/// [`CompiledValue::Expr`] (cooldown/cost/gain/segment `duration`/buff
+/// `duration`). `damage.stats` values and resource `max`/`regen_per_sec`
+/// reject the read at compile time instead.
+#[derive(Debug, PartialEq)]
+pub struct SimProgram {
+    /// The compiled expression.
+    pub program: Program,
+    /// Whether `program` loads any `objective.<name>` slot.
+    pub reads_objectives: bool,
+}
+
+/// Whether a field may read `objective.<name>`, and if not, WHY — the
+/// reason the positioned compile error names (each illegal field gets
+/// only its own reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectiveReads {
+    /// A legal field (spec §5.6's list).
+    Legal,
+    /// `damage.stats` (action or segment level): the overlay is the world
+    /// the objective is evaluated in, so the read would be circular.
+    Circular,
+    /// `damage.stats.hits_per_use`: the executor reads it directly, before
+    /// any `Plan` evaluation (it never reaches the Plan), so no objective
+    /// exists yet to read.
+    HitsPerUse,
+    /// Resource `max`/`regen_per_sec`: folded at every state-change
+    /// refold, outside any one field's evaluation instant.
+    RefoldTime,
+}
+
+impl SimProgram {
+    /// Evaluate against the combined slot array; see [`Program::eval`].
+    pub fn eval(&self, slots: &[f64]) -> f64 {
+        self.program.eval(slots)
+    }
+}
 
 /// One compiled [`NumOrExpr`]: a literal is pre-baked into a constant (no
 /// per-evaluation cost at all — the 0.2.0 fast path is unchanged), an
@@ -29,10 +75,16 @@ pub enum CompiledValue {
     /// A literal from the config, pre-baked.
     Const(f64),
     /// A compiled expression over the sim symbol space.
-    Expr(Program),
+    Expr(SimProgram),
 }
 
 impl CompiledValue {
+    /// Whether this value is an expression that reads an
+    /// `objective.<name>` slot (a literal never does).
+    pub(crate) fn reads_objectives(&self) -> bool {
+        matches!(self, CompiledValue::Expr(p) if p.reads_objectives)
+    }
+
     /// This value at the instant `slots` describes.
     ///
     /// `slots` is the executor's combined `[plan slots | sim slots]` array
@@ -62,25 +114,131 @@ fn compile_value(
 ) -> Result<CompiledValue, PlanError> {
     match v {
         NumOrExpr::Num(n) => Ok(CompiledValue::Const(*n)),
-        NumOrExpr::Expr(src) => match compile_expr(src, syms) {
-            Ok(p) => Ok(CompiledValue::Expr(p)),
-            Err(e) => Err(PlanError {
-                what: format!("{}: {e}", what()),
-            }),
-        },
+        NumOrExpr::Expr(src) => Ok(CompiledValue::Expr(compile_sim(
+            src,
+            syms,
+            what,
+            ObjectiveReads::Legal,
+        )?)),
     }
 }
 
-/// Compile a whole `name -> NumOrExpr` map (cost/gain/damage.stats),
+/// Compile one sim expression, tracking `objective.<name>` reads.
+///
+/// `objectives` is the field's legality: anything but
+/// [`ObjectiveReads::Legal`] makes an objective read a positioned compile
+/// error naming the field (`what`) and that field's one reason. An
+/// unknown `objective.<name>` is a did-you-mean error against the Plan's
+/// objective names, wherever it appears.
+fn compile_sim(
+    src: &str,
+    syms: &SimSymbols<'_>,
+    what: impl FnOnce() -> String,
+    objectives: ObjectiveReads,
+) -> Result<SimProgram, PlanError> {
+    let probe = ObjectiveProbe {
+        inner: syms,
+        read: Cell::new(false),
+        unknown: RefCell::new(None),
+    };
+    match compile_expr(src, &probe) {
+        Ok(program) => {
+            let reads_objectives = probe.read.get();
+            let reason = match objectives {
+                ObjectiveReads::Legal => None,
+                ObjectiveReads::Circular => Some(
+                    "`damage.stats` is the world the objective is evaluated in, so it \
+                     would read its own result (a circular read)",
+                ),
+                ObjectiveReads::HitsPerUse => Some(
+                    "`hits_per_use` is read by the executor before any Plan evaluation, \
+                     so no objective value exists yet to read",
+                ),
+                ObjectiveReads::RefoldTime => Some(
+                    "a resource's `max`/`regen_per_sec` is folded at every state change, \
+                     outside any one evaluation instant",
+                ),
+            };
+            if let (true, Some(reason)) = (reads_objectives, reason) {
+                return Err(PlanError {
+                    what: format!(
+                        "{}: an `objective.<name>` read is not allowed in this field — {reason}",
+                        what()
+                    ),
+                });
+            }
+            Ok(SimProgram {
+                program,
+                reads_objectives,
+            })
+        }
+        Err(e) => {
+            if let Some(name) = probe.unknown.borrow().as_deref() {
+                return Err(PlanError {
+                    what: format!(
+                        "{}: unknown objective `{name}`{}",
+                        what(),
+                        syms.objective_hint(name)
+                    ),
+                });
+            }
+            Err(PlanError {
+                what: format!("{}: {e}", what()),
+            })
+        }
+    }
+}
+
+/// Recording wrapper over [`SimSymbols`]: remembers whether any
+/// resolved slot fell inside the objective region, and the first
+/// `objective.<name>` that failed to resolve.
+struct ObjectiveProbe<'a, 'b> {
+    inner: &'b SimSymbols<'a>,
+    read: Cell<bool>,
+    unknown: RefCell<Option<String>>,
+}
+
+impl Symbols for ObjectiveProbe<'_, '_> {
+    fn slot(&self, name: &str) -> Option<u16> {
+        let slot = self.inner.slot(name);
+        match slot {
+            Some(s) if self.inner.is_objective_slot(s as usize) => self.read.set(true),
+            None => {
+                if let Some(rest) = name.strip_prefix("objective.") {
+                    let mut u = self.unknown.borrow_mut();
+                    if u.is_none() {
+                        *u = Some(rest.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        slot
+    }
+}
+
+/// Compile a whole `name -> NumOrExpr` map (damage.stats),
 /// preserving the source map's (sorted) order.
 fn compile_value_map(
     map: &std::collections::BTreeMap<String, NumOrExpr>,
     syms: &SimSymbols<'_>,
     what: impl Fn(&str) -> String,
+    objectives: ObjectiveReads,
 ) -> Result<std::collections::BTreeMap<String, CompiledValue>, PlanError> {
     let mut out = std::collections::BTreeMap::new();
     for (k, v) in map {
-        out.insert(k.clone(), compile_value(v, syms, || what(k))?);
+        let cv = match v {
+            NumOrExpr::Num(n) => CompiledValue::Const(*n),
+            NumOrExpr::Expr(src) => {
+                let field = if k == "hits_per_use" && objectives == ObjectiveReads::Circular {
+                    ObjectiveReads::HitsPerUse
+                } else {
+                    objectives
+                };
+                CompiledValue::Expr(compile_sim(src, syms, || what(k), field)?)
+            }
+        };
+        out.insert(k.clone(), cv);
     }
     Ok(out)
 }
@@ -117,7 +275,7 @@ pub struct CompiledAction {
     pub name: String,
     /// Compiled `cast_time` expression; `None` for a segmented action
     /// (its cast time is the sum of its segments' durations).
-    pub cast_time: Option<Program>,
+    pub cast_time: Option<SimProgram>,
     /// Cooldown in seconds, starting when the cast begins — evaluated at
     /// cast start (see [`crate::simdef::NumOrExpr`]).
     pub cooldown: CompiledValue,
@@ -260,7 +418,7 @@ pub struct CompiledProc {
     /// Which event this proc rolls its chance against.
     pub trigger: Trigger,
     /// Compiled `chance` expression.
-    pub chance: Program,
+    pub chance: SimProgram,
     /// Internal cooldown in seconds after firing.
     pub icd: f64,
     /// What firing this proc does: its effects, resolved to indices, in
@@ -293,7 +451,7 @@ pub struct CompiledRule {
     pub action: usize,
     /// Compiled `when` predicate, if present (absent = always eligible,
     /// subject to the executor's automatic hard gates).
-    pub when: Option<Program>,
+    pub when: Option<SimProgram>,
 }
 
 /// A `SimDef` + `Rotation` compiled once against a [`Plan`]: every
@@ -315,8 +473,24 @@ pub struct SimPlan {
     /// offset and sim state from slots at/above it.
     pub sim_base: usize,
     /// Total width of the combined `[plan slots | sim slots]` array the
-    /// executor allocates (see [`crate::sim::run`]).
+    /// executor allocates (see [`crate::sim::run`]): the plan prefix,
+    /// the sim-state words, the two segment words, and LAST the
+    /// `objective.<name>` region — so `slot_width == objective_base +`
+    /// the Plan's objective count (see the `sim` module's slot-layout
+    /// docs).
     pub slot_width: usize,
+    /// The `segments_done` word's slot; `segments_remain` is the next
+    /// one (`segments_done_slot + 1`). Both sit just before
+    /// [`SimPlan::objective_base`].
+    pub segments_done_slot: usize,
+    /// First slot of the `objective.<name>` region: one slot per Plan
+    /// objective in `Plan::objective_names()` order, appended after the
+    /// segment words. The executor writes the WHOLE region (one
+    /// deterministic `Plan::evaluate_phase` against the field's world)
+    /// immediately before evaluating any program whose
+    /// [`SimProgram::reads_objectives`] is set; nothing else reads or
+    /// writes it.
+    pub objective_base: usize,
     /// Resources, compiled, in name-sorted order — also their bare
     /// identifier's sim-slot order (`sim_base + 2 + i`).
     pub resources: Vec<CompiledResource>,
@@ -354,6 +528,8 @@ struct SimSymbols<'a> {
     duration_slot: usize,
     segments_done_slot: usize,
     segments_remain_slot: usize,
+    objective_names: Vec<&'a str>,
+    objective_base: usize,
     resource_names: Vec<&'a str>,
     resource_base: usize,
     action_names: Vec<&'a str>,
@@ -386,6 +562,8 @@ impl<'a> SimSymbols<'a> {
             duration_slot: base + 1,
             segments_done_slot,
             segments_remain_slot: segments_done_slot + 1,
+            objective_base: segments_done_slot + 2,
+            objective_names: plan.objective_names(),
             resource_names,
             resource_base,
             action_names,
@@ -402,8 +580,31 @@ impl<'a> SimSymbols<'a> {
         self.time_slot
     }
 
+    /// The objective region is appended AFTER the segment words, one slot
+    /// per Plan objective in `Plan::objective_names()` order, so every
+    /// pre-existing slot keeps its index.
     fn slot_width(&self) -> usize {
-        self.segments_remain_slot + 1
+        self.objective_base + self.objective_names.len()
+    }
+
+    fn is_objective_slot(&self, slot: usize) -> bool {
+        slot >= self.objective_base && slot < self.objective_base + self.objective_names.len()
+    }
+
+    /// Suffix for an unknown-objective error: the nearest objective name
+    /// as a did-you-mean, else the full list.
+    fn objective_hint(&self, name: &str) -> String {
+        match crate::config_keys::nearest(name, &self.objective_names) {
+            Some(best) => format!(" — did you mean `{best}`?"),
+            None => format!(
+                "; expected one of: {}",
+                self.objective_names
+                    .iter()
+                    .map(|o| format!("`{o}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
 }
 
@@ -423,6 +624,13 @@ impl Symbols for SimSymbols<'_> {
         }
         if let Some(i) = self.resource_names.iter().position(|r| *r == name) {
             return Some((self.resource_base + i) as u16);
+        }
+        if let Some(rest) = name.strip_prefix("objective.") {
+            return self
+                .objective_names
+                .iter()
+                .position(|o| *o == rest)
+                .map(|i| (self.objective_base + i) as u16);
         }
         if let Some(rest) = name.strip_prefix("cooldown.") {
             return self
@@ -931,12 +1139,20 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
 
     let mut resources = Vec::new();
     for (name, r) in &simdef.resources {
-        let max = compile_expr(&r.max, &syms).map_err(|e| PlanError {
-            what: format!("resource `{name}` max: {e}"),
-        })?;
-        let regen_per_sec = compile_expr(&r.regen_per_sec, &syms).map_err(|e| PlanError {
-            what: format!("resource `{name}` regen_per_sec: {e}"),
-        })?;
+        let max = compile_sim(
+            &r.max,
+            &syms,
+            || format!("resource `{name}` max"),
+            ObjectiveReads::RefoldTime,
+        )?
+        .program;
+        let regen_per_sec = compile_sim(
+            &r.regen_per_sec,
+            &syms,
+            || format!("resource `{name}` regen_per_sec"),
+            ObjectiveReads::RefoldTime,
+        )?
+        .program;
         resources.push(CompiledResource {
             name: name.clone(),
             max,
@@ -947,9 +1163,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
     let mut actions = Vec::new();
     for (name, a) in &simdef.actions {
         let cast_time = match &a.cast_time {
-            Some(ct) => Some(compile_expr(ct, &syms).map_err(|e| PlanError {
-                what: format!("action `{name}` cast_time: {e}"),
-            })?),
+            Some(ct) => Some(compile_sim(
+                ct,
+                &syms,
+                || format!("action `{name}` cast_time"),
+                ObjectiveReads::Legal,
+            )?),
             None => None,
         };
         let action_measure = a.measure.unwrap_or(simdef.defaults.measure);
@@ -959,9 +1178,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 format!("action `{name}` segment {i} duration")
             })?;
             let damage = match &seg.damage {
-                Some(d) => Some(compile_value_map(&d.stats, &syms, |k| {
-                    format!("action `{name}` segment {i} damage.stats `{k}`")
-                })?),
+                Some(d) => Some(compile_value_map(
+                    &d.stats,
+                    &syms,
+                    |k| format!("action `{name}` segment {i} damage.stats `{k}`"),
+                    ObjectiveReads::Circular,
+                )?),
                 None => None,
             };
             let effects = seg
@@ -993,9 +1215,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             gain.push((resource_index(r), v));
         }
         let damage = match &a.damage {
-            Some(d) => Some(compile_value_map(&d.stats, &syms, |k| {
-                format!("action `{name}` damage.stats `{k}`")
-            })?),
+            Some(d) => Some(compile_value_map(
+                &d.stats,
+                &syms,
+                |k| format!("action `{name}` damage.stats `{k}`"),
+                ObjectiveReads::Circular,
+            )?),
             None => None,
         };
         // Desugar: each `apply_buff` sugar entry is one ApplyBuff effect,
@@ -1055,9 +1280,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
 
     let mut procs = Vec::new();
     for (name, p) in &simdef.procs {
-        let chance = compile_expr(&p.chance, &syms).map_err(|e| PlanError {
-            what: format!("proc `{name}` chance: {e}"),
-        })?;
+        let chance = compile_sim(
+            &p.chance,
+            &syms,
+            || format!("proc `{name}` chance"),
+            ObjectiveReads::Legal,
+        )?;
         // `icd` is a bare literal, not a `NumOrExpr`, so its fail-closed
         // check lands here rather than at an evaluation instant. Both
         // rejected values used to fail SILENTLY, in the worst direction:
@@ -1104,9 +1332,12 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
     let mut rules = Vec::new();
     for rule in &rotation.rules {
         let when = match &rule.when {
-            Some(w) => Some(compile_expr(w, &syms).map_err(|e| PlanError {
-                what: format!("rotation rule (action `{}`) when: {e}", rule.action),
-            })?),
+            Some(w) => Some(compile_sim(
+                w,
+                &syms,
+                || format!("rotation rule (action `{}`) when", rule.action),
+                ObjectiveReads::Legal,
+            )?),
             None => None,
         };
         rules.push(CompiledRule {
@@ -1117,6 +1348,8 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
 
     Ok(SimPlan {
         sim_base: syms.sim_base(),
+        segments_done_slot: syms.segments_done_slot,
+        objective_base: syms.objective_base,
         slot_width: syms.slot_width(),
         resources,
         actions,
@@ -1363,7 +1596,7 @@ mod tests {
         // buff.*(3), buff_remaining.*(3), casts.*(2), stacks.*(3)
         //   = 2+1+2+3+3+2+3 = 16  (P7c appended the `stacks.*` sub-range),
         // + segments_done, segments_remain = 18 (slice 4, appended last)
-        assert_eq!(sp.slot_width, sp.sim_base + 18);
+        assert_eq!(sp.slot_width, sp.sim_base + 18 + 2); // + 2 objective slots (slice 6)
     }
 
     #[test]
@@ -2401,6 +2634,174 @@ mod tests {
         .unwrap();
         let sp = compile(&plan, &def, &rotation).unwrap();
         // time, duration, cooldown.bolt, casts.bolt, + the two new words.
-        assert_eq!(sp.slot_width, sp.sim_base + 6);
+        assert_eq!(sp.slot_width, sp.sim_base + 6 + 2); // + 2 objective slots (slice 6)
+    }
+
+    // ==================================================================
+    // Slice 6, Task 1: `objective.<name>` reads (compile only)
+    // ==================================================================
+
+    /// Slice-6 shared fixture: `hct = 1 / (aps * (1 + fast))`, `hit = dmg`,
+    /// objectives `["hit", "hct"]`.
+    fn haste_plan() -> Plan {
+        let gd: GameDef = serde_json::from_str(
+            r#"{ "stats": ["aps", "dmg"], "conditions": ["fast"],
+                 "pipeline": [
+                   { "name": "hct", "expr": "1 / (aps * (1 + fast))" },
+                   { "name": "hit", "expr": "dmg" } ],
+                 "objectives": ["hit", "hct"] }"#,
+        )
+        .unwrap();
+        plan::compile(&gd).unwrap()
+    }
+
+    fn haste_compile(sim: &str, rot: &str) -> Result<SimPlan, PlanError> {
+        let def: SimDef = serde_json::from_str(sim).unwrap();
+        let rotation: Rotation = serde_json::from_str(rot).unwrap();
+        compile(&haste_plan(), &def, &rotation)
+    }
+
+    const NO_RULES: &str = r#"{ "rules": [] }"#;
+
+    fn is_obj_expr(v: &CompiledValue) -> bool {
+        matches!(v, CompiledValue::Expr(p) if p.reads_objectives)
+    }
+
+    #[test]
+    fn objective_reads_compile_in_every_legal_field() {
+        let sp = haste_compile(
+            r#"{ "resources": { "mana": { "max": "100", "regen_per_sec": "0" } },
+                 "actions": {
+                   "bolt": { "cast_time": "objective.hct", "cooldown": "objective.hct",
+                             "cost": { "mana": "objective.hct" },
+                             "gain": { "mana": "objective.hct" } },
+                   "plain": { "cast_time": "1 + aps", "cooldown": "aps",
+                              "cost": { "mana": "aps" }, "gain": { "mana": "aps" } },
+                   "seg": { "segments": [ { "duration": "objective.hct" } ] } },
+                 "buffs": { "haste": { "duration": "objective.hct" },
+                            "calm": { "duration": "aps" } },
+                 "procs": { "p": { "trigger": "on_cast", "chance": "objective.hct",
+                                   "apply_buff": "haste" },
+                            "q": { "trigger": "on_cast", "chance": "aps / 10",
+                                   "apply_buff": "calm" } },
+                 "damage_objective": "hit" }"#,
+            r#"{ "rules": [ { "action": "bolt", "when": "objective.hct > 0.7" },
+                             { "action": "plain", "when": "aps > 0" } ] }"#,
+        )
+        .unwrap();
+        let a = |n: &str| sp.actions.iter().find(|a| a.name == n).unwrap();
+        // Every legal field, reading an objective -> true.
+        assert!(a("bolt").cast_time.as_ref().unwrap().reads_objectives);
+        assert!(is_obj_expr(&a("bolt").cooldown));
+        assert!(is_obj_expr(&a("bolt").cost[0].1));
+        assert!(is_obj_expr(&a("bolt").gain[0].1));
+        assert!(is_obj_expr(&a("seg").segments[0].duration));
+        let b = |n: &str| sp.buffs.iter().find(|b| b.name == n).unwrap();
+        assert!(is_obj_expr(&b("haste").duration));
+        let p = |n: &str| sp.procs.iter().find(|p| p.name == n).unwrap();
+        assert!(p("p").chance.reads_objectives);
+        assert!(sp.rules[0].when.as_ref().unwrap().reads_objectives);
+        // The same fields NOT reading one -> false.
+        assert!(!a("plain").cast_time.as_ref().unwrap().reads_objectives);
+        assert!(!matches!(&a("plain").cooldown, CompiledValue::Expr(p) if p.reads_objectives));
+        assert!(!matches!(&a("plain").cost[0].1, CompiledValue::Expr(p) if p.reads_objectives));
+        assert!(!matches!(&a("plain").gain[0].1, CompiledValue::Expr(p) if p.reads_objectives));
+        assert!(!matches!(&b("calm").duration, CompiledValue::Expr(p) if p.reads_objectives));
+        assert!(!p("q").chance.reads_objectives);
+        assert!(!sp.rules[1].when.as_ref().unwrap().reads_objectives);
+        // The objective region is appended after the segment words and is
+        // as wide as the Plan's objective count (2).
+        assert_eq!(sp.slot_width, sp.objective_base + 2);
+    }
+
+    #[test]
+    fn an_objective_read_in_damage_stats_is_a_compile_error() {
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "cast_time": "1",
+                   "damage": { "stats": { "dmg": "objective.hct" } } } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        for needle in ["bolt", "damage.stats", "objective", "circular"] {
+            assert!(e.what.contains(needle), "{needle}: got: {}", e.what);
+        }
+        // Only its own reason (Task 2 review route).
+        assert!(!e.what.contains("regen_per_sec"), "got: {}", e.what);
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "segments": [ { "duration": 1,
+                   "damage": { "stats": { "dmg": "objective.hit" } } } ] } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        for needle in ["bolt", "segment 0", "damage.stats", "objective"] {
+            assert!(e.what.contains(needle), "{needle}: got: {}", e.what);
+        }
+    }
+
+    #[test]
+    fn an_objective_read_in_hits_per_use_names_its_own_reason() {
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "cast_time": "1",
+                   "damage": { "stats": { "hits_per_use": "objective.hit" } } } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        for needle in [
+            "bolt",
+            "hits_per_use",
+            "objective",
+            "before any Plan evaluation",
+        ] {
+            assert!(e.what.contains(needle), "{needle}: got: {}", e.what);
+        }
+        assert!(!e.what.contains("circular"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn an_objective_read_in_a_resource_is_a_compile_error() {
+        for field in ["max", "regen_per_sec"] {
+            let (max, regen) = if field == "max" {
+                ("objective.hct", "0")
+            } else {
+                ("100", "objective.hct")
+            };
+            let raw = format!(
+                r#"{{ "resources": {{ "mana": {{ "max": "{max}", "regen_per_sec": "{regen}" }} }},
+                     "damage_objective": "hit" }}"#
+            );
+            let e = haste_compile(&raw, NO_RULES).unwrap_err();
+            for needle in ["mana", field, "objective", "folded at every state change"] {
+                assert!(e.what.contains(needle), "{field}/{needle}: got: {}", e.what);
+            }
+            // Only its own reason (Task 2 review route).
+            assert!(!e.what.contains("circular"), "{field}: got: {}", e.what);
+        }
+    }
+
+    #[test]
+    fn an_unknown_objective_suggests_the_nearest() {
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "cast_time": "objective.hct_" } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("hct_"), "got: {}", e.what);
+        assert!(e.what.contains("did you mean `hct`"), "got: {}", e.what);
+        // Nothing close -> lists the Plan's objectives instead.
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "cast_time": "objective.zzzzzz" } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        assert!(
+            e.what.contains("`hit`") && e.what.contains("`hct`"),
+            "got: {}",
+            e.what
+        );
     }
 }

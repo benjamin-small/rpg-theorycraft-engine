@@ -35,6 +35,39 @@
 //! - `stacks.<buff>` — `<buff>`'s live instance count as an `f64` (`0`
 //!   when inactive). The counted companion to `buff.<buff>`; see
 //!   [`crate::simdef::BuffDef`] for what a stack count scales.
+//! - `objective.<name>` — a `Plan` objective's DETERMINISTIC
+//!   `evaluate_phase` value (branch-weighted expectation, never sampled,
+//!   no RNG draw, in both modes: an objective downstream of a branched
+//!   stage reads its EXPECTED value by definition). DEFAULT: absent —
+//!   a field that reads none pays nothing and a config reading none runs
+//!   exactly as before. INSTANT: each field's own, per the
+//!   [`crate::simdef::NumOrExpr`] instants table — a read at an instant,
+//!   not a fixed point, so a buff the sim applies later changes the NEXT
+//!   read. INTERACTIONS: the world is per field. For action
+//!   `cast_time`/`cooldown`/`cost`/`gain` and segment `duration` it is
+//!   the effective build WITH that action's (or segment's)
+//!   `damage.stats` overlay, built AT THE READING FIELD'S INSTANT and not
+//!   at the action's measure instant (so `gain`'s overlay, built at cast
+//!   complete, sees `casts.<self>` one lower than the measured overlay
+//!   did; a `cost`/`cooldown` overlay is built at cast start or the
+//!   decision, on pre-payment resources, while `cast_time`'s overlay is
+//!   built after payment (cost paid, cooldown armed); and a non-finite
+//!   `damage.stats` value can fail closed "at a rotation decision" or "at
+//!   cast start", not only at the measure instant). A utility action
+//!   (no `damage`) and a segmented action's action-level fields use the
+//!   plain effective build. For buff `duration`, proc `chance` and rule
+//!   `when` it is the plain effective build. Always the effective
+//!   phase. Legal ONLY in those fields: in `damage.stats` (circular) and
+//!   resource `max`/`regen_per_sec` (refold-time) it is a compile error,
+//!   and an unknown name gets a did-you-mean. A non-finite value is
+//!   written as-is and fails closed at the reading field. Cost: one
+//!   `evaluate_phase` per read; a `when`/`cost` reading objectives pays
+//!   it per rule per decision, plus (for a damaging action's overlay
+//!   world) one `BuildState` clone and per-stat key clones. Pinned
+//!   worlds: cadence 10 casts (objective-driven `cast_time`) vs 5
+//!   (literal); segment `duration` overlay 4 casts vs 2 (plain);
+//!   `cast_time` overlay 6 vs 3; segmented action-level `cooldown`
+//!   plain 3; and the MC expected value (casts 4, total 400).
 //!
 //! A buff's [`crate::simdef::BuffDef::tick_objective`] names a `Plan`
 //! objective rather than an expression, and takes either of two shapes: a
@@ -68,9 +101,11 @@
 //! free-casting an action reopens A→B→A recursion; proc-only, see
 //! `ROADMAP.md`) — is a compile error.
 //!
-//! Pipeline STAGES and buckets are deliberately absent from this space —
-//! a sim expression referencing one is a fail-closed "unknown identifier"
-//! compile error, the same as any other unresolved name. Resource/action/
+//! Pipeline STAGES and buckets are still absent from this space — a sim
+//! expression referencing one is a fail-closed "unknown identifier"
+//! compile error, the same as any other unresolved name — but a `Plan`
+//! OBJECTIVE is readable (`objective.<name>`, above) in the legal fields,
+//! as a deterministic expected value. Resource/action/
 //! buff names join the SAME flat namespace as stats/conditions: a name
 //! colliding with an existing stat or condition, or reusing the reserved
 //! `time`/`duration`/`segments_done`/`segments_remain` words, is a
@@ -287,22 +322,29 @@
 //! The executor ([`run`]) maintains one flat `&[f64]` slot array shaped
 //! `[Plan's own slot layout | sim slots]` — [`compile::SimPlan::sim_base`]
 //! marks where the sim segment begins, [`compile::SimPlan::slot_width`]
-//! its total width. The sim segment itself is laid out in EXACTLY this
-//! order, each named sub-range sorted by name (`SimDef`'s registries are
-//! `BTreeMap`s, which already iterate sorted):
+//! its total width (ending with the objective region, which starts at
+//! [`compile::SimPlan::objective_base`]). The sim segment itself is laid
+//! out in EXACTLY this order, each named sub-range sorted by name
+//! (`SimDef`'s registries are `BTreeMap`s, which already iterate
+//! sorted):
 //!
 //! ```text
 //! [ time, duration, resources…, cooldown.<action>…, buff.<buff>…,
 //!   buff_remaining.<buff>…, casts.<action>…, stacks.<buff>…,
-//!   segments_done, segments_remain ]
+//!   segments_done, segments_remain, objective.<name>… ]
 //! ```
+//!
+//! The `objective.<name>…` region is one slot per `Plan` objective in
+//! the Plan's objective order (NOT name-sorted), and is the one region
+//! the per-instant tail refresh does not write: it is filled only
+//! immediately before a program that reads it.
 
 mod compile;
 mod exec;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
-    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan,
+    CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan, SimProgram,
 };
 pub use exec::{run, Mode};
 pub use report::{
