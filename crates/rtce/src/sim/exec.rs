@@ -2730,7 +2730,9 @@ impl<'a> Sim<'a> {
             // `segments_done = n`, `segments_remain = 0`), do both
             // reserved words return to 0 — so they read 0 at the next
             // rotation decision. Adjacent: `segments_remain` is a u32
-            // subtraction, so total never drops below done.
+            // subtraction, and no slot refresh runs between the two
+            // statements, so nothing can observe `done = 0` with a stale
+            // `total` (an underflow in `total - done`).
             self.segments_total = 0;
             self.segments_done = 0;
         }
@@ -14704,6 +14706,28 @@ mod tests {
             assert_eq!(r.proc_counts["ph"], 4, "{:?}", r.proc_counts);
             // remain == 0 holds at the last landing only: also 4.
             assert_eq!(r.proc_counts["pr"], 4, "{:?}", r.proc_counts);
+        }
+
+        // --------------------------------------------------------------
+        // The ACTION-level effects of the last landing also read the
+        // final count. `mark`'s duration is `segments_done` (2 at the
+        // last landing; 0 if the reset ran first). Weight 2: cast 1's
+        // segments land 0.5 / 1.25, its action effect applies `mark` at
+        // 1.25 for 2 s (to 3.25, past the horizon); cast 2's segment 1
+        // would land 2.5 > 2, never. Live over [1.25, 2.0] = 0.75 s of
+        // 2 → uptime 0.375, applications 1.
+        // --------------------------------------------------------------
+        #[test]
+        fn last_landing_action_effects_read_the_final_segment_count() {
+            let slam = slam_with(r#""effects": [ { "apply_buff": "mark" } ],"#);
+            let json = simdef(&slam, 10.0, "").replace(
+                r#""blip": { "duration": 0.1 }"#,
+                r#""blip": { "duration": 0.1 }, "mark": { "duration": "segments_done" }"#,
+            );
+            let r = ev(&json, 2.0);
+            let m = &r.buffs["mark"];
+            assert_eq!(m.applications, 1, "{m:?}");
+            assert!(close(m.uptime, 0.375), "got {}", m.uptime);
         }
     }
 }
