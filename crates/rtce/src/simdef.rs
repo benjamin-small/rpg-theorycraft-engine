@@ -282,9 +282,10 @@ pub enum EventOrder {
     /// scheduled, first processed. The 0.3.0 behavior, and the default.
     #[default]
     Scheduled,
-    /// Every `CastComplete` outranks every coincident buff expiry,
-    /// phase boundary, and rotation wake; within a class, scheduling
-    /// order still decides.
+    /// Every `CastComplete` — and every segment landing of a segmented
+    /// cast ([`ActionDef::segments`]), which ranks with it — outranks
+    /// every coincident buff expiry, phase boundary, and rotation wake;
+    /// within a class, scheduling order still decides.
     CompletionsFirst,
 }
 
