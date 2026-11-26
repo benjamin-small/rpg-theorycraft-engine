@@ -1620,6 +1620,30 @@ mod tests {
     }
 
     #[test]
+    fn a_typoed_crit_rolls_key_on_an_action_is_rejected_with_a_did_you_mean() {
+        let plan = toy_plan();
+        let def: SimDef = serde_json::from_str(
+            r#"{
+              "actions": { "fireball": { "cast_time": "1", "crit_roll": "per_hit" } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+        let e = compile(&plan, &def, &Rotation::default()).unwrap_err();
+        assert!(
+            e.what.contains("unknown field `crit_roll`"),
+            "got: {}",
+            e.what
+        );
+        assert!(e.what.contains("action `fireball`"), "got: {}", e.what);
+        assert!(
+            e.what.contains("did you mean `crit_rolls`"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
     fn a_typoed_key_on_a_rotation_rule_is_rejected_with_a_did_you_mean() {
         let plan = toy_plan();
         let rotation: Rotation = serde_json::from_str(

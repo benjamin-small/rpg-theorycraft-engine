@@ -97,6 +97,11 @@ pub struct SimDefaults {
     /// rule, the once-per-cast chance evaluation). Defaults to
     /// [`ProcRolls::PerCast`], the long-standing one-roll-per-cast
     /// behavior.
+    ///
+    /// This is ALSO the default for [`ActionDef::crit_rolls`] (how a
+    /// damaging cast's crit is SAMPLED in Monte Carlo): an action that
+    /// omits `crit_rolls` inherits this value, so `per_hit` here makes
+    /// every action sample its crit per hit.
     #[serde(default)]
     pub proc_rolls: ProcRolls,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
@@ -308,6 +313,9 @@ pub enum EventOrder {
 ///   either policy: EV's per-hit weight times the hit count is exactly
 ///   the expectation of MC's per-hit draws under the cast's one sampled
 ///   crit mask (see "on_crit" below).
+///   (That one-mask-per-cast statement holds under a resolved
+///   [`ActionDef::crit_rolls`] of `per_cast`; under `per_hit` each hit
+///   samples its own crit — see that field.)
 ///
 /// # Scope: which rolls this governs
 ///
@@ -1256,8 +1264,11 @@ pub enum Trigger {
     /// [`Trigger::OnHit`] — weighted by the probability the cast crit
     /// ([`crate::sim::Mode::Expected`]; under `per_hit` the weight
     /// applies per hit) or gated on whether the sampled branch actually
-    /// crit ([`crate::sim::Mode::MonteCarlo`]; ONE mask per cast — the
-    /// cast's simultaneous hits share it).
+    /// crit ([`crate::sim::Mode::MonteCarlo`]). The MC mask is ONE per
+    /// cast — the cast's simultaneous hits share it — unless the action's
+    /// resolved [`ActionDef::crit_rolls`] is `per_hit`, in which case
+    /// each hit samples its own: a `per_cast` proc then qualifies when
+    /// ANY hit crit, a `per_hit` proc rolls once per crit hit.
     OnCrit,
     /// The complement of [`Trigger::OnCrit`]: rolls once per completing
     /// cast of a damaging action by default — per measured hit under
@@ -1274,7 +1285,10 @@ pub enum Trigger {
     ///   chance is 0, so every damaging hit qualifies (weight 1.0).
     /// - **MC:** qualifies when the cast's sampled branch mask has the
     ///   crit bit CLEAR — the same single draw `OnCrit` gates on, so the
-    ///   two triggers are exact complements per cast.
+    ///   two triggers are exact complements per cast. Under a resolved
+    ///   [`ActionDef::crit_rolls`] of `per_hit` the complement is per
+    ///   hit: a `per_cast` proc qualifies when ANY hit did not crit, a
+    ///   `per_hit` proc rolls once per non-crit hit.
     /// - **Interactions:** `rolls`, `icd` and `actions` behave identically
     ///   to `OnCrit` (chance evaluated once per proc per cast; ICD is a
     ///   hard gate). A utility cast (no damage) and a proc-fired free

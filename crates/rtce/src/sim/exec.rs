@@ -942,6 +942,23 @@ struct DamageMeasure {
     measured_at: f64,
 }
 
+/// What one MC cast's crit sampling produced, as the crit-gated proc
+/// rolls ([`Sim::roll_procs_mc`]) see it.
+///
+/// - `Shared(b)`: ONE mask for the whole cast (`crit_rolls` resolved
+///   `per_cast`). `b` is the gate for the trigger being rolled —
+///   `Shared(true)` for `OnCast`/`OnHit` (every cast/hit qualifies).
+///   Exactly the pre-slice-3 `qualifies: bool`, draw order included.
+/// - `Counted`: `crit_rolls` resolved `per_hit` — `hits` independent
+///   samples of which `crit_hits` crit. A `per_cast` proc qualifies on
+///   `crit_hits > 0` (`OnCrit`) / `crit_hits < hits` (`OnNonCrit`); a
+///   `per_hit` proc rolls `crit_hits` / `hits − crit_hits` times.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CritOutcome {
+    Shared(bool),
+    Counted { crit_hits: u64, hits: u64 },
+}
+
 /// Running integral of one tracked condition's effective value over time
 /// (buff-driven while a buff is active, else the current phase's static
 /// uptime — see [`Sim::condition_value`]).
@@ -2400,7 +2417,9 @@ impl<'a> Sim<'a> {
         self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
 
-        let mut is_crit = false;
+        // What the cast's sampled crit looked like, for the crit-gated
+        // proc rolls (MC only; EV never reads it).
+        let mut crit = CritOutcome::Shared(false);
         let snap = match pending {
             Some(s) => Some(s),
             // The default instant (`cast_complete`): measure here, in the
@@ -2411,10 +2430,28 @@ impl<'a> Sim<'a> {
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = if self.rng.is_some() {
-                    let (dmg, crit) =
-                        self.eval_action_damage_sampled(&s.build, &s.phase, d.hits)?;
-                    is_crit = crit;
-                    dmg
+                    if self.sim_plan.actions[action].crit_rolls == ProcRolls::PerHit {
+                        // `crit_rolls` resolves per_hit: each hit is its
+                        // OWN sampled draw (hits = 1) and the damage
+                        // credited is the SUM. Only counts are kept —
+                        // never per-hit masks (zero allocation).
+                        let n = self.whole_hits(action, d, "crit_rolls resolves to per_hit")?;
+                        let mut sum = 0.0;
+                        let mut crit_hits = 0u64;
+                        for _ in 0..n {
+                            let (hit, c) =
+                                self.eval_action_damage_sampled(&s.build, &s.phase, 1.0)?;
+                            sum += hit;
+                            crit_hits += u64::from(c);
+                        }
+                        crit = CritOutcome::Counted { crit_hits, hits: n };
+                        sum
+                    } else {
+                        let (dmg, c) =
+                            self.eval_action_damage_sampled(&s.build, &s.phase, d.hits)?;
+                        crit = CritOutcome::Shared(c);
+                        dmg
+                    }
                 } else {
                     self.eval_action_damage(&s.build, &s.phase, d.hits)?
                 };
@@ -2440,11 +2477,17 @@ impl<'a> Sim<'a> {
         // section) and, vacuously, for a utility cast (no damage half →
         // no hit-trigger roll at all, the long-standing rule).
         if self.rng.is_some() {
-            self.roll_procs_mc(Trigger::OnCast, true, action, None)?;
+            let always = CritOutcome::Shared(true);
+            self.roll_procs_mc(Trigger::OnCast, always, action, None)?;
             if let Some(d) = damage_measure {
-                self.roll_procs_mc(Trigger::OnHit, true, action, Some(d))?;
-                self.roll_procs_mc(Trigger::OnCrit, is_crit, action, Some(d))?;
-                self.roll_procs_mc(Trigger::OnNonCrit, !is_crit, action, Some(d))?;
+                self.roll_procs_mc(Trigger::OnHit, always, action, Some(d))?;
+                self.roll_procs_mc(Trigger::OnCrit, crit, action, Some(d))?;
+                // The non-crit gate is the complement of the SAME outcome.
+                let non_crit = match crit {
+                    CritOutcome::Shared(b) => CritOutcome::Shared(!b),
+                    counted @ CritOutcome::Counted { .. } => counted,
+                };
+                self.roll_procs_mc(Trigger::OnNonCrit, non_crit, action, Some(d))?;
             }
         } else {
             self.roll_procs_ev(Trigger::OnCast, 1.0, action, None)?;
@@ -2832,41 +2875,47 @@ impl<'a> Sim<'a> {
         match (self.sim_plan.procs[pi].rolls, measure) {
             (ProcRolls::PerCast, _) | (ProcRolls::PerHit, None) => Ok(1),
             (ProcRolls::PerHit, Some(m)) => {
-                let h = m.hits;
-                let n = h.round();
-                // The error stamps `m.measured_at` — the instant the
-                // value was MEASURED (`Sim::capture_world`'s `now`), not
-                // `self.time` (the roll instant): under `measure:
-                // "cast_start"` the two differ by the cast time, and
-                // "measured X at t" must name the measurement (P8f
-                // review fix).
-                if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
-                    return Err(PlanError {
-                        what: format!(
-                            "proc `{}` rolls per_hit, but action `{}` measured \
-                             hits_per_use {h} at t={} — per-hit rolling needs a \
-                             whole number >= 0",
-                            self.sim_plan.procs[pi].name,
-                            self.sim_plan.actions[action].name,
-                            m.measured_at
-                        ),
-                    });
-                }
-                if n > PER_HIT_ROLL_LIMIT {
-                    return Err(PlanError {
-                        what: format!(
-                            "proc `{}` rolls per_hit, but action `{}` measured \
-                             hits_per_use {h} at t={} — per-hit rolling is \
-                             capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
-                            self.sim_plan.procs[pi].name,
-                            self.sim_plan.actions[action].name,
-                            m.measured_at
-                        ),
-                    });
-                }
-                Ok(n as u64)
+                let why = format!("proc `{}` rolls per_hit", self.sim_plan.procs[pi].name);
+                self.whole_hits(action, m, &why)
             }
         }
+    }
+
+    /// The whole-hit-count rule shared by every per-hit consumer of a
+    /// measured `hits_per_use` — a `per_hit` proc's roll count
+    /// ([`Sim::proc_roll_count`]) and a `per_hit` action's crit sampling
+    /// (`complete_cast`, via `ActionDef::crit_rolls`). `why` names the
+    /// caller's reason and opens the error ("proc `x` rolls per_hit" /
+    /// "crit_rolls resolves to per_hit"), so the check is never copied.
+    ///
+    /// The error stamps `m.measured_at` — the instant the value was
+    /// MEASURED (`Sim::capture_world`'s `now`), not `self.time` (the
+    /// roll instant): under `measure: "cast_start"` the two differ by the
+    /// cast time, and "measured X at t" must name the measurement (P8f
+    /// review fix). Whole-number test tolerance is [`HITS_WHOLE_EPSILON`];
+    /// the cap is [`PER_HIT_ROLL_LIMIT`].
+    fn whole_hits(&self, action: usize, m: &DamageMeasure, why: &str) -> Result<u64, PlanError> {
+        let h = m.hits;
+        let n = h.round();
+        if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
+            return Err(PlanError {
+                what: format!(
+                    "{why}, but action `{}` measured hits_per_use {h} at t={} \
+                     — per-hit rolling needs a whole number >= 0",
+                    self.sim_plan.actions[action].name, m.measured_at
+                ),
+            });
+        }
+        if n > PER_HIT_ROLL_LIMIT {
+            return Err(PlanError {
+                what: format!(
+                    "{why}, but action `{}` measured hits_per_use {h} at t={} \
+                     — per-hit rolling is capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
+                    self.sim_plan.actions[action].name, m.measured_at
+                ),
+            });
+        }
+        Ok(n as u64)
     }
 
     /// MC mode: procs ROLL exactly — `rng.next_f64() < chance`, no
@@ -2875,8 +2924,8 @@ impl<'a> Sim<'a> {
     /// the EV accumulator's carry-over, by design: each iteration is an
     /// independent sample of what actually happens, and "an ICD-gated
     /// near-miss quietly banks itself for later" is exactly the kind of
-    /// EV-only smoothing MC mode exists to NOT do). `qualifies` gates the
-    /// whole roll: `true` for `OnCast`/`OnHit` (every cast/hit qualifies),
+    /// EV-only smoothing MC mode exists to NOT do). `outcome` gates the
+    /// roll: `Shared(true)` for `OnCast`/`OnHit` (every cast/hit qualifies),
     /// and — mirroring `roll_procs_ev`'s `on_crit` weighting, but exactly
     /// rather than probabilistically — whether THIS hit's sampled branch
     /// actually fired the `"crit"` event for `OnCrit` (see
@@ -2909,21 +2958,29 @@ impl<'a> Sim<'a> {
     /// un-gated hit draws, fire or not; that is the point of the knob.
     /// Under the default `per_cast` the loop runs once and the draw
     /// stream is byte-identical to 0.3.0's — proven by the untouched
-    /// suite and the byte-identical `diablo4_rotation` MC block. For
-    /// `on_crit` procs the hits also share the cast's ONE sampled crit
-    /// mask (`qualifies` gates the whole loop): the hits are
+    /// suite and the byte-identical `diablo4_rotation` MC block.
+    ///
+    /// # Crit outcome (`crit_rolls`)
+    ///
+    /// Under a resolved `crit_rolls` of `per_cast` the outcome is
+    /// `CritOutcome::Shared`: the hits share the cast's ONE sampled crit
+    /// mask and the flag gates the whole loop — the hits are
     /// simultaneous, so they cannot disagree about whether the cast
-    /// crit — which is exactly what makes EV's per-hit `weight × hits`
+    /// crit, which is what makes EV's per-hit `weight × hits`
     /// accumulation the expectation of this path (pinned by
-    /// `ev_and_mc_agree_under_per_hit_on_crit_regression`).
+    /// `ev_and_mc_agree_under_per_hit_on_crit_regression`). Under
+    /// `per_hit` it is `CritOutcome::Counted`: each hit was its own
+    /// sample, a `per_cast` proc rolls once when ANY hit qualifies for
+    /// its trigger, and a `per_hit` proc rolls once per qualifying hit
+    /// (a count of 0 is not an event: no ICD check, no draw).
     fn roll_procs_mc(
         &mut self,
         trigger: Trigger,
-        qualifies: bool,
+        outcome: CritOutcome,
         action: usize,
         measure: Option<&DamageMeasure>,
     ) -> Result<(), PlanError> {
-        if !qualifies {
+        if outcome == CritOutcome::Shared(false) {
             return Ok(());
         }
         let now = self.time;
@@ -2935,7 +2992,29 @@ impl<'a> Sim<'a> {
                 continue;
             }
             // Before the ICD gate — see `roll_procs_ev`.
-            let rolls = self.proc_roll_count(pi, action, measure)?;
+            let rolls = match outcome {
+                CritOutcome::Shared(_) => self.proc_roll_count(pi, action, measure)?,
+                // Per-hit crit sampling: the qualifying hits are THIS
+                // trigger's own (crit hits for `OnCrit`, the rest for
+                // `OnNonCrit`) and the whole-count rule already passed
+                // in `complete_cast`. A per_cast proc qualifies on any
+                // such hit and presents one roll; a per_hit proc one
+                // roll per such hit. Zero → not an event for this proc
+                // (no ICD check, no draw).
+                CritOutcome::Counted { crit_hits, hits } => {
+                    let k = match trigger {
+                        Trigger::OnNonCrit => hits - crit_hits,
+                        _ => crit_hits,
+                    };
+                    match self.sim_plan.procs[pi].rolls {
+                        ProcRolls::PerCast => u64::from(k > 0),
+                        ProcRolls::PerHit => k,
+                    }
+                }
+            };
+            if rolls == 0 {
+                continue;
+            }
             if self.procs[pi].icd_ready_at > now {
                 continue; // hard gate — no accumulation, no memory.
             }
@@ -12143,6 +12222,167 @@ mod tests {
                 "got {fires} — cc 0.5 over 20 casts should sample both \
                  branches (0 or 100 would mean the mask never varied)"
             );
+        }
+
+        // --------------------------------------------------------------
+        // PER-HIT CRIT SAMPLING (slice 3 of #33), Monte Carlo side.
+        // `nova` = 5 hits/cast, 20 casts (t=1..20), dmg 100, cc 0.25,
+        // crit factor 1.5, `iterations: 1` so every count is exact.
+        // ONE `Counted` mask per hit when `crit_rolls` resolves per_hit.
+        // --------------------------------------------------------------
+        fn crit_nova(hits: &str, crit_rolls: &str, procs: &str) -> String {
+            format!(
+                r#"{{ "actions": {{ "nova": {{ "cast_time": "1"{crit_rolls},
+                         "damage": {{ "stats": {{ "hits_per_use": {hits} }} }} }} }},
+                     "buffs": {{ "glow": {{ "duration": 0.5 }} }},
+                     "procs": {procs},
+                     "damage_objective": "hit" }}"#
+            )
+        }
+
+        const PER_HIT_CRIT: &str = r#", "crit_rolls": "per_hit""#;
+        const PER_CAST_CRIT: &str = r#", "crit_rolls": "per_cast""#;
+
+        fn crit_build_25() -> BuildState {
+            serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "cc": 0.25 } }"#).unwrap()
+        }
+
+        // Procs: `c` on_crit per_hit chance 1 icd 0, `nc` on_non_crit
+        // per_hit chance 1 icd 0 — every hit is exactly one of the two,
+        // and each crit hit adds 50 over the 100 base. So, EXACT and
+        // seed-independent, under per-hit sampling:
+        //   c + nc == 100;  total_damage == 100 × 100 + 50 × c.
+        // Under the shared per-cast mask `c` is 5 × (crit casts), i.e.
+        // ALWAYS a multiple of 5 — so `c % 5 != 0` is the contrast.
+        // SEED: 1 — chosen by running: it yields a `c` that is not a
+        // multiple of 5 (20260726 gave c = 15, a 1-in-5 coincidence that
+        // would not discriminate; seed 2 gives 25).
+        const PER_HIT_SEED: u64 = 1;
+
+        #[test]
+        fn mc_per_hit_crit_rolls_each_hit_independently() {
+            let procs = r#"{
+                "c":  { "trigger": "on_crit", "chance": "1", "icd": 0,
+                        "apply_buff": "glow", "rolls": "per_hit" },
+                "nc": { "trigger": "on_non_crit", "chance": "1", "icd": 0,
+                        "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            let r = mc_json(
+                &crit_plan(),
+                &crit_build_25(),
+                &crit_nova("5", PER_HIT_CRIT, procs),
+                NOVA_ROT,
+                &dummy(20),
+                1,
+                PER_HIT_SEED,
+            );
+            assert_eq!(r.actions["nova"].casts, 20);
+            let (c, nc) = (r.proc_counts["c"], r.proc_counts["nc"]);
+            assert_eq!(c + nc, 100, "every hit is exactly one of crit/non-crit");
+            assert_eq!(
+                r.total.total_damage,
+                100.0 * 100.0 + 50.0 * c as f64,
+                "each crit hit adds exactly 50 (c = {c})"
+            );
+            assert_ne!(
+                c % 5,
+                0,
+                "c = {c}: a multiple of 5 means one shared mask per cast"
+            );
+        }
+
+        // Add `any` on_crit per_cast chance 1 icd 0: under per-hit
+        // sampling it fires iff >= 1 of the cast's 5 hits crit, so
+        //   any <= 20, any <= c, 5 * any >= c — and STRICTLY
+        //   5 * any > c here (equality needs every crit cast to hold
+        //   exactly one crit hit, which is exactly the shared-mask
+        //   world: there `c == 5 * any` always).
+        #[test]
+        fn mc_a_per_cast_proc_gates_on_any_hit_crit_under_per_hit_sampling() {
+            let procs = r#"{
+                "c":   { "trigger": "on_crit", "chance": "1", "icd": 0,
+                         "apply_buff": "glow", "rolls": "per_hit" },
+                "nc":  { "trigger": "on_non_crit", "chance": "1", "icd": 0,
+                         "apply_buff": "glow", "rolls": "per_hit" },
+                "any": { "trigger": "on_crit", "chance": "1", "icd": 0,
+                         "apply_buff": "glow" } }"#;
+            let r = mc_json(
+                &crit_plan(),
+                &crit_build_25(),
+                &crit_nova("5", PER_HIT_CRIT, procs),
+                NOVA_ROT,
+                &dummy(20),
+                1,
+                PER_HIT_SEED,
+            );
+            let (c, any) = (r.proc_counts["c"], r.proc_counts["any"]);
+            assert!(any <= 20, "any = {any}");
+            assert!(any <= c, "any = {any}, c = {c}");
+            assert!(5 * any >= c, "any = {any}, c = {c}");
+            assert!(
+                5 * any > c,
+                "any = {any}, c = {c}: equality is the shared-mask world"
+            );
+        }
+
+        // The per-hit path cannot matter at n = 1 (one draw either way)
+        // nor with no events in the plan (no draw at all): the WHOLE
+        // report is byte-identical to the per_cast run.
+        #[test]
+        fn mc_per_hit_sampling_is_byte_identical_when_it_cannot_matter() {
+            let procs = r#"{
+                "c": { "trigger": "on_crit", "chance": "0.5", "icd": 0,
+                       "apply_buff": "glow" },
+                "n": { "trigger": "on_hit", "chance": "0.5", "icd": 0,
+                       "apply_buff": "glow", "rolls": "per_hit" } }"#;
+            let go = |plan: &Plan, build: &BuildState, hits: &str, cr: &str| {
+                serde_json::to_string(&mc_json(
+                    plan,
+                    build,
+                    &crit_nova(hits, cr, procs),
+                    NOVA_ROT,
+                    &dummy(20),
+                    200,
+                    7,
+                ))
+                .unwrap()
+            };
+            // n = 1, branched plan with a crit event.
+            assert_eq!(
+                go(&crit_plan(), &crit_build_25(), "1", PER_HIT_CRIT),
+                go(&crit_plan(), &crit_build_25(), "1", PER_CAST_CRIT),
+                "n = 1"
+            );
+            // n = 5, no events at all.
+            let (mp, mb) = (minimal_plan(), minimal_build());
+            assert_eq!(
+                go(&mp, &mb, "5", PER_HIT_CRIT),
+                go(&mp, &mb, "5", PER_CAST_CRIT),
+                "no events"
+            );
+        }
+
+        // A resolved per_hit needs a whole hit count to SAMPLE, procs or
+        // not: fractional hits_per_use is a run error naming the knob.
+        #[test]
+        fn fractional_hits_fail_closed_under_per_hit_crit_sampling() {
+            let run_mc = |cr: &str| {
+                let sp = compile_json(&crit_plan(), &crit_nova("2.5", cr, "{}"), NOVA_ROT);
+                run(
+                    &crit_plan(),
+                    &sp,
+                    &crit_build_25(),
+                    &dummy(5),
+                    Mode::MonteCarlo {
+                        iterations: 3,
+                        seed: 1,
+                    },
+                )
+            };
+            let e = run_mc(PER_HIT_CRIT).unwrap_err().what;
+            for needle in ["crit_rolls", "per_hit", "nova", "2.5"] {
+                assert!(e.contains(needle), "missing `{needle}` in: {e}");
+            }
+            assert!(run_mc(PER_CAST_CRIT).is_ok(), "per_cast samples 2.5 fine");
         }
 
         // --------------------------------------------------------------
