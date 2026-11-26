@@ -71,6 +71,10 @@ pub struct Plan {
     bucket_folds: Vec<FoldKind>,
     events: Vec<CompiledEvent>,
     event_names: Vec<String>,
+    /// How many leading stages event `chance`/`factor` expressions may read:
+    /// the index of the first branched stage, or the stage count when none
+    /// is branched. Stages before it never depend on the event multiplier.
+    event_stage_prefix: usize,
     stages: Vec<CompiledStage>,
     /// Indexes into `stages` exported as objectives.
     objective_stages: Vec<usize>,
@@ -189,6 +193,29 @@ impl Symbols for WithEventFactors<'_> {
             return self.branched.then_some(self.slot);
         }
         None
+    }
+}
+
+/// Event expression symbol table: [`StageSymbols`] over the pre-branch stage
+/// prefix, plus a record of the first name that missed only because it names
+/// a stage at or after the first branched stage, so the compile error can say
+/// why rather than report a bare unknown identifier.
+struct EventSymbols<'a> {
+    inner: StageSymbols<'a>,
+    /// Stages outside the readable prefix.
+    unreadable: &'a [String],
+    rejected: std::cell::RefCell<Option<String>>,
+}
+
+impl Symbols for EventSymbols<'_> {
+    fn slot(&self, name: &str) -> Option<u16> {
+        let found = self.inner.slot(name);
+        if found.is_none() && self.unreadable.iter().any(|s| s == name) {
+            self.rejected
+                .borrow_mut()
+                .get_or_insert_with(|| name.to_owned());
+        }
+        found
     }
 }
 
@@ -405,22 +432,41 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         });
     }
 
-    let event_syms = StageSymbols {
-        stats: &def.stats,
-        conditions: &def.conditions,
-        buckets: &bucket_names,
-        prior_stages: &[],
+    let event_stage_prefix = def
+        .pipeline
+        .iter()
+        .position(|s| matches!(s, StageDef::Expression(e) if e.branched))
+        .unwrap_or(def.pipeline.len());
+    let event_syms = EventSymbols {
+        inner: StageSymbols {
+            stats: &def.stats,
+            conditions: &def.conditions,
+            buckets: &bucket_names,
+            prior_stages: &stage_names[..event_stage_prefix],
+        },
+        unreadable: &stage_names[event_stage_prefix..],
+        rejected: std::cell::RefCell::new(None),
+    };
+    let compile_event_expr = |event: &str, field: &str, src: &str| {
+        *event_syms.rejected.borrow_mut() = None;
+        compile_expr(src, &event_syms).map_err(|e| {
+            let what = match event_syms.rejected.borrow().as_deref() {
+                Some(stage) => format!(
+                    "event `{event}` {field}: at byte {}: stage `{stage}` is not readable \
+                     here: events may read only stages before the first branched stage `{}`",
+                    e.pos, stage_names[event_stage_prefix]
+                ),
+                None => format!("event `{event}` {field}: {e}"),
+            };
+            PlanError { what }
+        })
     };
     let mut events = Vec::new();
     let mut event_names = Vec::new();
     for (name, ev) in &def.events {
         events.push(CompiledEvent {
-            chance: compile_expr(&ev.chance, &event_syms).map_err(|e| PlanError {
-                what: format!("event `{name}` chance: {e}"),
-            })?,
-            factor: compile_expr(&ev.factor, &event_syms).map_err(|e| PlanError {
-                what: format!("event `{name}` factor: {e}"),
-            })?,
+            chance: compile_event_expr(name, "chance", &ev.chance)?,
+            factor: compile_event_expr(name, "factor", &ev.factor)?,
         });
         event_names.push(name.clone());
     }
@@ -785,6 +831,7 @@ pub fn compile(def: &GameDef) -> Result<Plan, PlanError> {
         bucket_folds: def.buckets.values().map(|b| b.fold).collect(),
         events,
         event_names,
+        event_stage_prefix,
         stages,
         objective_stages,
         n_stats,
@@ -1185,28 +1232,16 @@ impl Plan {
         // Stages in order.
         for (si, stage) in self.stages.iter().enumerate() {
             let out_slot = bucket_base + self.n_buckets + si;
-            let (program, branched) = match &stage.kind {
-                CompiledStageKind::Expression { program, branched } => (program, *branched),
-                CompiledStageKind::Solve(solve) => {
-                    scratch.slots[out_slot] =
-                        Self::eval_solve(&stage.name, solve, &mut scratch.slots)?;
-                    continue;
-                }
-                CompiledStageKind::Recurrence(recurrence) => {
-                    scratch.slots[out_slot] = Self::eval_recurrence(
-                        &stage.name,
-                        recurrence,
-                        &mut scratch.slots,
-                        &mut scratch.recurrence_next,
-                        &mut scratch.recurrence_saved,
-                    )?;
+            let program = match &stage.kind {
+                CompiledStageKind::Expression {
+                    program,
+                    branched: true,
+                } => program,
+                _ => {
+                    self.eval_unbranched_stage(si, scratch)?;
                     continue;
                 }
             };
-            if !branched {
-                scratch.slots[out_slot] = program.eval(&scratch.slots);
-                continue;
-            }
             // Chances depend only on PHASE slots (not on the branch), so
             // evaluate each event's chance once per stage rather than once
             // per mask/sample.
@@ -1281,15 +1316,43 @@ impl Plan {
         Ok((phase_trace, fired_mask_union))
     }
 
+    /// Evaluate stage `si`, which must NOT be branched (an expression,
+    /// solve, or recurrence), into its output slot in `scratch.slots`.
+    /// Shared by [`Plan::eval_phase`] (every non-branched stage) and
+    /// [`Plan::crit_chance`] (the pre-branch prefix). Requires the
+    /// stat/condition/bucket prefix and earlier stage slots to be filled.
+    /// Allocation-free; stage traces are pushed by `eval_phase`, not here.
+    fn eval_unbranched_stage(&self, si: usize, scratch: &mut EvalScratch) -> Result<(), PlanError> {
+        let stage = &self.stages[si];
+        let out_slot = self.n_stats + self.n_conditions + self.n_buckets + si;
+        scratch.slots[out_slot] = match &stage.kind {
+            CompiledStageKind::Expression { program, branched } => {
+                debug_assert!(!*branched, "eval_unbranched_stage on a branched stage");
+                program.eval(&scratch.slots)
+            }
+            CompiledStageKind::Solve(solve) => {
+                Self::eval_solve(&stage.name, solve, &mut scratch.slots)?
+            }
+            CompiledStageKind::Recurrence(recurrence) => Self::eval_recurrence(
+                &stage.name,
+                recurrence,
+                &mut scratch.slots,
+                &mut scratch.recurrence_next,
+                &mut scratch.recurrence_saved,
+            )?,
+        };
+        Ok(())
+    }
+
     /// Fill `scratch.slots[0 .. bucket_base + n_buckets]` from
     /// `scratch.stat_base` (already resolved by the caller) and `phase`:
     /// stats (base + phase override), conditions (phase uptime, clamped),
     /// and BASE bucket raw folds (event-gated contributions excluded — see
     /// [`Plan::fold_buckets`]) written into bucket slots. This is the exact
     /// prefix [`Plan::eval_phase`] then evaluates stages/branches on top
-    /// of, and the exact prefix a branched stage's own `chance`
-    /// expressions read — shared with [`Plan::crit_chance`], which reads
-    /// no further than this.
+    /// of. A branched stage's own `chance` expressions read this prefix
+    /// plus the pre-branch stage prefix; [`Plan::crit_chance`] shares this
+    /// fill and evaluates those stages on top of it.
     fn fill_prefix_slots(
         &self,
         build: &BuildState,
@@ -1719,8 +1782,15 @@ impl Plan {
 
     /// pub(crate): the probability the event literally named `"crit"`
     /// fires for one hit against `phase`, evaluated against the exact
-    /// STAT/CONDITION/base-BUCKET prefix a branched stage's own event
-    /// `chance` expressions read (see [`Plan::fill_prefix_slots`]).
+    /// STAT/CONDITION/base-BUCKET prefix plus every stage before the first
+    /// branched stage (`event_stage_prefix`, evaluated in order) — exactly
+    /// what an event `chance` expression may read (see
+    /// [`Plan::fill_prefix_slots`]).
+    ///
+    /// COST: evaluates every pre-branch stage (the whole pipeline when
+    /// nothing is branched) on each call, even if the chance reads none of
+    /// them; allocation-free.
+    ///
     /// Returns `0.0` if this Plan defines no event named `"crit"` (no crit
     /// concept in this game — fail-soft, not fail-closed, since "no crit"
     /// is a legitimate game shape, not a config error).
@@ -1746,6 +1816,9 @@ impl Plan {
         };
         self.validate_and_resolve_build_for_phase(build, phase, scratch)?;
         self.fill_prefix_slots(build, phase, scratch)?;
+        for si in 0..self.event_stage_prefix {
+            self.eval_unbranched_stage(si, scratch)?;
+        }
         Ok(self.events[ei].chance.eval(&scratch.slots).clamp(0.0, 1.0))
     }
 
@@ -1883,6 +1956,256 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    // ---- events read the pre-branch stage prefix ----
+
+    fn prefix_def() -> GameDef {
+        serde_json::from_str(
+            r#"{
+              "stats": ["crit_base"],
+              "events": { "crit": { "chance": "eff_crit / 100", "factor": "2" } },
+              "pipeline": [
+                { "name": "eff_crit", "expr": "crit_base * 2" },
+                { "name": "hit", "expr": "100 * event_factors", "branched": true }
+              ],
+              "objectives": ["hit"]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn prefix_objective(def: &GameDef) -> f64 {
+        let plan = compile(def).unwrap();
+        let build: BuildState =
+            serde_json::from_str(r#"{ "stats": { "crit_base": 10.0 } }"#).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let mut scratch = plan.scratch();
+        plan.evaluate(&build, &scenario, &mut scratch).unwrap()[0]
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    // eff_crit = 20 -> p = 0.2 -> hit = 100 * (0.8*1 + 0.2*2) = 120.
+    // Contrast (input mutation): eff_crit expr "crit_base * 1" -> p = 0.1 -> 110.
+    #[test]
+    fn an_event_chance_reads_a_stage_before_the_first_branched_stage() {
+        let got = prefix_objective(&prefix_def());
+        assert!(close(got, 120.0), "{got}");
+    }
+
+    #[test]
+    fn an_event_reading_the_first_branched_stage_is_a_compile_error() {
+        let mut def = prefix_def();
+        def.events.get_mut("crit").unwrap().chance = "hit / 1000".into();
+        let msg = compile(&def).unwrap_err().what;
+        assert!(
+            msg.contains("event `crit`") && msg.contains("`hit`"),
+            "{msg}"
+        );
+        assert!(msg.contains("first branched stage"), "{msg}");
+    }
+
+    #[test]
+    fn an_event_reading_a_stage_after_the_first_branched_stage_is_a_compile_error() {
+        let mut def = prefix_def();
+        def.pipeline
+            .push(serde_json::from_str(r#"{ "name": "dps", "expr": "hit" }"#).unwrap());
+        def.events.get_mut("crit").unwrap().chance = "dps / 1000".into();
+        let msg = compile(&def).unwrap_err().what;
+        assert!(
+            msg.contains("event `crit` chance") && msg.contains("`dps`"),
+            "{msg}"
+        );
+        assert!(msg.contains("first branched stage `hit`"), "{msg}");
+        assert!(msg.contains("at byte"), "{msg}");
+    }
+
+    #[test]
+    fn an_event_factor_reading_a_stage_names_factor_in_the_error() {
+        let mut def = prefix_def();
+        let ev = def.events.get_mut("crit").unwrap();
+        ev.chance = "0.5".into();
+        ev.factor = "hit".into();
+        let msg = compile(&def).unwrap_err().what;
+        assert!(
+            msg.contains("event `crit` factor") && msg.contains("`hit`"),
+            "{msg}"
+        );
+        assert!(msg.contains("first branched stage"), "{msg}");
+    }
+
+    // factor "1 + eff_crit / 10" (= 3 at eff_crit 20), chance 0.5:
+    // hit = 100 * (0.5*1 + 0.5*3) = 200.
+    #[test]
+    fn an_event_factor_reads_a_prefix_stage() {
+        let mut def = prefix_def();
+        let ev = def.events.get_mut("crit").unwrap();
+        ev.chance = "0.5".into();
+        ev.factor = "1 + eff_crit / 10".into();
+        let got = prefix_objective(&def);
+        assert!(close(got, 200.0), "{got}");
+    }
+
+    #[test]
+    fn without_a_branched_stage_events_may_read_every_stage() {
+        let mut def = prefix_def();
+        def.pipeline = vec![
+            serde_json::from_str(r#"{ "name": "eff_crit", "expr": "crit_base * 2" }"#).unwrap(),
+            serde_json::from_str(r#"{ "name": "total", "expr": "eff_crit + 1" }"#).unwrap(),
+        ];
+        def.objectives = vec!["total".into()];
+        def.events.get_mut("crit").unwrap().chance = "total / 100".into();
+        assert!(compile(&def).is_ok());
+    }
+
+    fn prefix_build(crit_base: f64) -> BuildState {
+        serde_json::from_str(&format!(r#"{{ "stats": {{ "crit_base": {crit_base} }} }}"#)).unwrap()
+    }
+
+    fn prefix_phase() -> Phase {
+        serde_json::from_str(r#"{ "name": "p", "weight": 1 }"#).unwrap()
+    }
+
+    // bonus fold = 0 -> s = 1 + 0/100 = 1 in every branch; the crit branch
+    // refolds bonus to 100 but the factor reads s's BASE value:
+    // hit = 100 * (0.5*1 + 0.5*1) = 100. Contrast (mutation: factor reads
+    // s recomputed from branch buckets): crit-branch s = 2 -> 150.
+    #[test]
+    fn an_event_factor_reads_the_base_value_of_a_prefix_stage() {
+        let def: GameDef = serde_json::from_str(
+            r#"{
+              "stats": [],
+              "buckets": { "bonus": { "fold": "sum" } },
+              "events": { "crit": { "chance": "0.5", "factor": "s" } },
+              "pipeline": [
+                { "name": "s", "expr": "1 + bonus / 100" },
+                { "name": "hit", "expr": "100 * event_factors", "branched": true }
+              ],
+              "objectives": ["hit"]
+            }"#,
+        )
+        .unwrap();
+        let plan = compile(&def).unwrap();
+        let build: BuildState = serde_json::from_str(
+            r#"{ "contributions": [ { "bucket": "bonus", "value": 100, "event": "crit" } ] }"#,
+        )
+        .unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let mut scratch = plan.scratch();
+        let got = plan.evaluate(&build, &scenario, &mut scratch).unwrap()[0];
+        assert!(close(got, 100.0), "{got}");
+    }
+
+    // eff_crit = 10 * 2 = 20 -> p = 0.2 on a fresh scratch (no stage slot
+    // was ever written). Contrast: without the prefix loop it reads 0.0.
+    #[test]
+    fn crit_chance_evaluates_prefix_stages() {
+        let plan = compile(&prefix_def()).unwrap();
+        let mut scratch = plan.scratch();
+        let p = plan
+            .crit_chance(&prefix_build(10.0), &prefix_phase(), &mut scratch)
+            .unwrap();
+        assert!(close(p, 0.2), "{p}");
+    }
+
+    // `evaluate` on build A (crit_base 40 -> eff_crit 80) leaves 80 in the
+    // stage slot of the SAME scratch; `crit_chance` for build B
+    // (crit_base 10) must recompute it to 0.2, not read the stale 0.8.
+    #[test]
+    fn crit_chance_does_not_read_stale_stage_slots() {
+        let plan = compile(&prefix_def()).unwrap();
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let mut scratch = plan.scratch();
+        plan.evaluate(&prefix_build(40.0), &scenario, &mut scratch)
+            .unwrap();
+        let b = plan
+            .crit_chance(&prefix_build(10.0), &prefix_phase(), &mut scratch)
+            .unwrap();
+        assert!(close(b, 0.2), "{b}");
+    }
+
+    // lin = 20 (expr) -> root = sqrt(20) (solve) -> eff_crit = root * root
+    // + n (recurrence, one transition) ~ 21 -> chance ~ 0.21. Compared with
+    // what `explain` reports for the same stages, so the solve/recurrence
+    // arms cannot silently diverge from the evaluator.
+    #[test]
+    fn crit_chance_evaluates_solve_and_recurrence_prefix_stages() {
+        let def: GameDef = serde_json::from_value(serde_json::json!({
+            "stats": ["crit_base"],
+            "events": { "crit": { "chance": "eff_crit / 100", "factor": "2" } },
+            "pipeline": [
+                { "name": "lin", "expr": "crit_base * 2" },
+                { "name": "root", "solve": {
+                    "variable": "x", "residual": "x * x - lin",
+                    "lower": "0", "upper": "100",
+                    "absolute_tolerance": 1e-9, "relative_tolerance": 1e-9,
+                    "max_iterations": 128 } },
+                { "name": "eff_crit", "recurrence": {
+                    "state": [ { "name": "n", "initial": "0", "next": "n + 1" } ],
+                    "until": "n >= 1", "result": "root * root + n",
+                    "max_iterations": 4 } },
+                { "name": "hit", "expr": "100 * event_factors", "branched": true }
+            ],
+            "objectives": ["hit"]
+        }))
+        .unwrap();
+        let plan = compile(&def).unwrap();
+        let build = prefix_build(10.0);
+        let phase = prefix_phase();
+        let mut scratch = plan.scratch();
+        let p = plan.crit_chance(&build, &phase, &mut scratch).unwrap();
+
+        let scenario: Scenario =
+            serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 1 } ] }"#).unwrap();
+        let mut explain_scratch = plan.scratch();
+        let ex = plan
+            .explain(&build, &scenario, &mut explain_scratch)
+            .unwrap();
+        let eff = ex.phases[0]
+            .stages
+            .iter()
+            .find(|(n, _)| n == "eff_crit")
+            .unwrap()
+            .1;
+        assert!(eff > 20.9 && eff < 21.1, "{eff}");
+        assert!(close(p, eff / 100.0), "{p} vs {eff}");
+    }
+
+    // pipeline [eff_crit = 20, total = eff_crit + 5], chance total / 100.
+    #[test]
+    fn crit_chance_without_a_branched_stage_evaluates_the_whole_pipeline() {
+        let mut def = prefix_def();
+        def.pipeline = vec![
+            serde_json::from_str(r#"{ "name": "eff_crit", "expr": "crit_base * 2" }"#).unwrap(),
+            serde_json::from_str(r#"{ "name": "total", "expr": "eff_crit + 5" }"#).unwrap(),
+        ];
+        def.objectives = vec!["total".into()];
+        def.events.get_mut("crit").unwrap().chance = "total / 100".into();
+        let plan = compile(&def).unwrap();
+        let mut scratch = plan.scratch();
+        let p = plan
+            .crit_chance(&prefix_build(10.0), &prefix_phase(), &mut scratch)
+            .unwrap();
+        assert!(close(p, 0.25), "{p}");
+    }
+
+    #[test]
+    fn event_factors_is_not_readable_in_an_event_chance() {
+        let mut def = toy_def();
+        def.events.get_mut("crit").unwrap().chance = "event_factors".into();
+        let e = compile(&def).unwrap_err();
+        assert!(e.what.contains("event_factors"), "got: {}", e.what);
+
+        let mut def = toy_def();
+        def.events.get_mut("crit").unwrap().chance = "event_multiplier".into();
+        let e = compile(&def).unwrap_err();
+        assert!(e.what.contains("event_multiplier"), "got: {}", e.what);
     }
 
     #[test]

@@ -13,6 +13,10 @@ until then, per semver's "anything goes" pre-1.0 clause).
   unchanged.
 
 ### Added
+- Event `chance`/`factor` may read pipeline stages before the first
+  branched stage (#33). A later stage is a compile error naming it. The
+  sim's EV crit weight evaluates the same prefix. Configs that read no
+  stage are unchanged.
 - **`on_non_crit` proc trigger** (#33) — the complement of `on_crit`.
   EV weight is `1 − crit_chance`; MC rolls when the cast's sampled crit
   bit is clear (the same single draw `on_crit` gates on, so the pair

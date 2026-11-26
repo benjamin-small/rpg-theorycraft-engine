@@ -43,8 +43,10 @@ Four things are new.
 
 **The `events` block.** An event is two expressions: a `chance` (clamped to
 0..1 by the engine) and a `factor` it contributes when it fires. Both are
-ordinary expressions over the same flat namespace as everything else — our
-`chance` reads a stat, our `factor` reads a bucket.
+ordinary expressions over the same flat namespace as everything else: stats,
+conditions, buckets, and any stage that comes earlier in the pipeline than the
+branched stage introduced below. Our `chance` reads a stat, and our `factor`
+reads a bucket.
 
 **A `crit_damage` bucket, folding `summed_group`.** Crit damage modifiers
 are the classic same-type-stacks-additively case: +50% and +50% crit damage

@@ -5377,6 +5377,104 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
+        // The EV crit weight reads `eff_crit`, a stage BEFORE the branched
+        // `hit` (eff_crit = crit_base * 2 = 50 → p = 0.5): 10 hits at
+        // weight 0.5 with a chance-1, icd-0 `on_crit` proc cross whole
+        // fires at hits 2, 4, 6, 8, 10 → exactly 5. Contrast (input
+        // mutation): chance `crit_base / 100` (p = 0.25) → exactly 2, the
+        // `ev_on_crit_weights_by_crit_probability` figure.
+        // ------------------------------------------------------------------
+        #[test]
+        fn ev_on_crit_weight_reads_a_stage_derived_crit_chance() {
+            let fires = |chance: &str| -> u64 {
+                let def: GameDef = serde_json::from_value(serde_json::json!({
+                    "stats": ["crit_base"],
+                    "events": { "crit": { "chance": chance, "factor": "2" } },
+                    "pipeline": [
+                        { "name": "eff_crit", "expr": "crit_base * 2" },
+                        { "name": "hit", "expr": "100 * event_factors", "branched": true }
+                    ],
+                    "objectives": ["hit"]
+                }))
+                .unwrap();
+                let plan = plan::compile(&def).unwrap();
+                let build: BuildState =
+                    serde_json::from_str(r#"{ "stats": { "crit_base": 25.0 } }"#).unwrap();
+                let scenario: Scenario =
+                    serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 10 } ] }"#)
+                        .unwrap();
+                let mut actions = BTreeMap::new();
+                actions.insert(
+                    "spam".to_string(),
+                    ActionDef {
+                        extra: Default::default(),
+                        measure: None,
+                        cast_time: "1".into(),
+                        cooldown: NumOrExpr::Num(0.0),
+                        cost: BTreeMap::new(),
+                        gain: BTreeMap::new(),
+                        damage: Some(ActionDamage {
+                            extra: Default::default(),
+                            stats: BTreeMap::new(),
+                        }),
+                        apply_buff: Vec::new(),
+                        effects: Vec::new(),
+                    },
+                );
+                let mut buffs = BTreeMap::new();
+                buffs.insert(
+                    "proc_buff".to_string(),
+                    BuffDef {
+                        extra: Default::default(),
+                        duration: NumOrExpr::Num(0.5),
+                        max_stacks: 1,
+                        on_reapply: ReapplyPolicy::Refresh,
+                        contributions: Vec::new(),
+                        conditions: BTreeMap::new(),
+                        tick_objective: None,
+                    },
+                );
+                let mut procs = BTreeMap::new();
+                procs.insert(
+                    "crit_proc".to_string(),
+                    ProcDef {
+                        extra: Default::default(),
+                        rolls: None,
+                        trigger: Trigger::OnCrit,
+                        chance: "1".into(),
+                        icd: 0.0,
+                        apply_buff: Some("proc_buff".into()),
+                        effects: Vec::new(),
+                        cast_action: None,
+                        actions: None,
+                    },
+                );
+                let simdef = SimDef {
+                    extra: Default::default(),
+                    defaults: Default::default(),
+                    resources: BTreeMap::new(),
+                    actions,
+                    buffs,
+                    procs,
+                    damage_objective: "hit".into(),
+                };
+                let rotation = Rotation {
+                    extra: Default::default(),
+                    rules: vec![Rule {
+                        extra: Default::default(),
+                        action: "spam".into(),
+                        when: None,
+                    }],
+                };
+                let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+                let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+                report.proc_counts["crit_proc"]
+            };
+            assert_eq!(fires("eff_crit / 100"), 5);
+            assert_eq!(fires("crit_base / 100"), 2);
+        }
+
+        // ------------------------------------------------------------------
         // `CompiledEffect::CastAction`: an `on_cast` proc (chance 1, icd 0) fires
         // a free "nuke" cast (instant, no cost/cooldown) on every one of
         // "trigger"'s 5 casts (1s cast time, 5s scenario → completions at
