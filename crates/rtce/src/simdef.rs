@@ -179,6 +179,15 @@ impl SimDefaults {
 ///   [`EventOrder`]'s question — its zero-weight-phase flip moves both
 ///   measurement and attribution together, because it reorders the
 ///   events themselves.)
+/// - **Segments** ([`ActionDef::segments`]): the instant is read PER
+///   SEGMENT, resolved `segment.measure ?? action.measure ??
+///   defaults.measure`. `cast_complete` measures at THAT segment's
+///   landing (post-`casts` increment, post-`segments_done` increment);
+///   `cast_start` at THAT segment's start — the previous landing's
+///   instant (cast start for segment 0), after the previous landing's
+///   effects and proc rolls, so a buff the previous segment applied is
+///   in its world. An instant segment (`duration` `0`) follows the
+///   instant-cast rule below.
 /// - **Instant casts** (`cast_time` `0`): an instant cast is ALWAYS
 ///   measured at the completion position, whatever `measure` says. Cast
 ///   start and cast complete share the wall-clock instant, but the
@@ -302,7 +311,11 @@ pub enum EventOrder {
 ///
 /// - [`PerCast`](ProcRolls::PerCast) (default): one roll per damaging
 ///   cast, `hits_per_use`-blind — a 5-hit cast presents the same single
-///   qualifying roll a 1-hit cast does.
+///   qualifying roll a 1-hit cast does. For a SEGMENTED action
+///   ([`ActionDef::segments`]) "per cast" reads per DAMAGING SEGMENT:
+///   each damaging landing is one qualifying event, a wind-up segment
+///   (no `damage`) presents none, and `per_hit` counts each segment's
+///   own measured hits.
 /// - [`PerHit`](ProcRolls::PerHit): one roll per HIT, where the hit
 ///   count is the cast's measured `hits_per_use` (from the cast's world
 ///   snapshot — the [`Measure`] instant, the same value its damage is
@@ -326,7 +339,8 @@ pub enum EventOrder {
 /// [`Trigger::OnCrit`], [`Trigger::OnNonCrit`]) — the ones whose event
 /// today approximates "the cast's hits" as a single roll. An
 /// [`Trigger::OnCast`] proc's event is the CAST itself, so it rolls once
-/// per cast under either setting, whatever `rolls` says (the
+/// per cast (at its first landing) under either setting, whatever
+/// `rolls` says (the
 /// [`Measure`]-on-instant-casts precedent: documented behavior, not an
 /// error — a utility cast has no hits at all, so there is nothing for
 /// `per_hit` to count there). Unchanged rules: a utility cast (no damage)
@@ -833,8 +847,22 @@ pub struct ActionDef {
     /// - The reserved sim words `segments_done` / `segments_remain` read
     ///   the segments landed and still to land while a segmented cast is
     ///   in flight, and `0` otherwise.
-    /// - COST: the per-cast overlay world is built once per SEGMENT
-    ///   rather than once per cast; allocation beyond that is unchanged.
+    /// - The reserved sim words `segments_done` / `segments_remain`
+    ///   (default `0`; evaluation instant: read live wherever a sim
+    ///   expression is evaluated). `segments_done` is incremented at each
+    ///   landing BEFORE that landing's measure, so a segment's own
+    ///   `damage.stats` sees itself counted (`1` at segment 0);
+    ///   `segments_remain` is the segments not yet landed (`n -
+    ///   segments_done`). Both reset to `0` when the last segment lands
+    ///   (from that landing's effects and proc rolls onward) and are `0`
+    ///   for every unsegmented action and at every rotation decision, so
+    ///   a `when` reading them cannot wedge the rotation.
+    /// - COST: when a segment lands (or starts, under `cast_start`) the
+    ///   per-cast overlay world — an overlay `BuildState` clone plus its
+    ///   phase clone — is built once per DAMAGING (or effect-bearing)
+    ///   SEGMENT rather than once per cast; a wind-up segment with no
+    ///   effects builds none. That is the only allocation segments add to
+    ///   the run loop, and it is paid per landing, never per hit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub segments: Vec<SegmentDef>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
@@ -1433,9 +1461,13 @@ impl Default for BuffDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
-    /// Rolls once per cast begun. Always cast-shaped: a cast is one
-    /// event whatever its hit count, so [`ProcRolls`] does not change
-    /// this trigger's roll count (see [`ProcRolls`]'s scope section).
+    /// Rolls once per cast, at the cast's FIRST landing (its completion,
+    /// for an unsegmented action; segment 0's landing for a segmented
+    /// one, [`ActionDef::segments`]) — not at cast start, and a cast
+    /// cut off before its first landing never rolls it. Always
+    /// cast-shaped: a cast is one event whatever its hit count or
+    /// segment count, so [`ProcRolls`] does not change this trigger's
+    /// roll count (see [`ProcRolls`]'s scope section).
     OnCast,
     /// Rolls once per completing cast of a DAMAGING action BY DEFAULT —
     /// not once per hit — and once per MEASURED HIT under

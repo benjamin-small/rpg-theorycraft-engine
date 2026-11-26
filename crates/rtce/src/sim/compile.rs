@@ -2337,6 +2337,30 @@ mod tests {
     }
 
     #[test]
+    fn a_segment_damage_block_rejects_unknown_keys_and_accepts_annotations() {
+        let e = segment_compile(
+            r#"{
+              "actions": { "slam": { "segments": [
+                  { "duration": 1, "damage": { "stat": { "coeff_pct": 100.0 } } } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("unknown field `stat`"), "got: {}", e.what);
+        assert!(e.what.contains("did you mean `stats`"), "got: {}", e.what);
+
+        segment_compile(
+            r#"{
+              "actions": { "slam": { "segments": [
+                  { "duration": 1, "damage": { "_note": "x",
+                                               "stats": { "coeff_pct": 100.0 } } } ] } },
+              "damage_objective": "hit_after_dr"
+            }"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn segments_done_is_reserved() {
         for word in ["segments_done", "segments_remain"] {
             let raw = format!(

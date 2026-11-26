@@ -946,6 +946,10 @@ struct DamageMeasure {
     /// surfaced (P8f review fix — the two differ exactly when the label
     /// matters most).
     measured_at: f64,
+    /// The part (whole action / segment `i`) this measurement belongs to,
+    /// so a positioned error about the measured value names the segment
+    /// ([`Sim::part_label`]).
+    part: Part,
 }
 
 /// What one MC cast's crit sampling produced, as the crit-gated proc
@@ -1044,6 +1048,15 @@ struct Sim<'a> {
     seq: u64,
     heap: BinaryHeap<QueueItem>,
     mid_cast: bool,
+    /// Segment count of the in-flight SEGMENTED cast; `0` while idle and
+    /// for every unsegmented action. Set by [`Sim::begin_cast`], cleared
+    /// with `segments_done` at the last landing. Feeds the reserved sim
+    /// word `segments_remain` (`segments_total - segments_done`).
+    segments_total: u32,
+    /// Segments landed so far in the in-flight segmented cast (`0` while
+    /// idle / unsegmented). Incremented at each landing BEFORE that
+    /// landing's measure; feeds the reserved sim word `segments_done`.
+    segments_done: u32,
     /// The [`WorldSnapshot`] captured at cast START for the single
     /// in-flight cast, when its resolved measure is
     /// [`Measure::CastStart`] — set by [`Sim::begin_cast`] when it
@@ -1051,8 +1064,9 @@ struct Sim<'a> {
     /// [`Sim::complete_cast`]. For a segmented cast it holds the
     /// in-flight SEGMENT's start-of-segment capture instead (set by
     /// [`Sim::start_segment`], consumed by that segment's landing) —
-    /// still one at a time, since segments land in sequence. `None` while no cast is in flight, for
-    /// every `cast_complete`-measured action, and for instant casts
+    /// still one at a time, since segments land in sequence. `None`
+    /// while no cast is in flight, for every `cast_complete`-measured
+    /// action, and for instant casts
     /// (which always measure in the completion transaction — the two
     /// instants coincide there, see [`Measure`]). At most one cast is
     /// ever in flight (`mid_cast` gates the rotation) and nothing that
@@ -1137,6 +1151,8 @@ impl<'a> Sim<'a> {
             seq: 0,
             heap: BinaryHeap::new(),
             mid_cast: false,
+            segments_total: 0,
+            segments_done: 0,
             pending_snapshot: None,
             actions: (0..n_actions)
                 .map(|_| ActionRt {
@@ -2297,6 +2313,10 @@ impl<'a> Sim<'a> {
         for bi in 0..sim_plan.buffs.len() {
             self.scratch.slots[stacks_base + bi] = self.buffs[bi].instances.len() as f64;
         }
+        // The two reserved segment words are the LAST two sim slots.
+        let end = sim_plan.slot_width;
+        self.scratch.slots[end - 2] = f64::from(self.segments_done);
+        self.scratch.slots[end - 1] = f64::from(self.segments_total - self.segments_done);
     }
 
     /// Walk the rotation, chaining instant (`cast_time == 0`) casts, until
@@ -2421,6 +2441,8 @@ impl<'a> Sim<'a> {
         // cast. Segment 0 starts now.
         let Some(cast_time) = self.sim_plan.actions[action].cast_time.as_ref() else {
             self.mid_cast = true;
+            self.segments_total = self.sim_plan.actions[action].segments.len() as u32;
+            self.segments_done = 0;
             if !self.start_segment(action, 0)? {
                 self.land_segment(action, 0)?;
             }
@@ -2536,9 +2558,9 @@ impl<'a> Sim<'a> {
     /// Cost: the overlay `BuildState` clone in [`Sim::capture_world`]
     /// happens once per damaging LANDING, so once per segment for a
     /// segmented cast instead of once per cast — the only allocation
-    /// segments add to the run loop. The
-    /// next segment's start (duration, `cast_start` capture, schedule)
-    /// follows in [`Sim::land_segment`].
+    /// segments add to the run loop. The next segment's start (duration,
+    /// `cast_start` capture, schedule) follows in [`Sim::land_segment`],
+    /// AFTER this transaction's proc rolls.
     fn land(&mut self, action: usize, part: Part) -> Result<(), PlanError> {
         let now = self.time;
         let (first, last) = match part {
@@ -2564,6 +2586,10 @@ impl<'a> Sim<'a> {
         }
         if first {
             self.actions[action].casts += 1;
+        }
+        if part != Part::Whole {
+            // BEFORE the measure: the landing being measured counts.
+            self.segments_done += 1;
         }
 
         // What the part's sampled crit looked like, for the crit-gated
@@ -2629,6 +2655,11 @@ impl<'a> Sim<'a> {
 
         if last {
             self.mid_cast = false;
+            // The segmented cast is over: both reserved words read 0
+            // again (idle, like an unsegmented action's), from the
+            // effects below onward.
+            self.segments_total = 0;
+            self.segments_done = 0;
         }
         // The part's OWN effects, before anything this landing merely
         // triggers — see `Sim::apply_action_buffs` for the ordering and
@@ -2840,6 +2871,7 @@ impl<'a> Sim<'a> {
                     hits,
                     crit_chance,
                     measured_at: now,
+                    part,
                 }),
             )
         } else {
@@ -3223,10 +3255,10 @@ impl<'a> Sim<'a> {
         if !h.is_finite() || n < 0.0 || (h - n).abs() > HITS_WHOLE_EPSILON {
             return Err(PlanError {
                 what: format!(
-                    "{}, but action `{}` measured hits_per_use {h} at t={} \
+                    "{}, but {} measured hits_per_use {h} at t={} \
                      — per-hit rolling needs a whole number >= 0",
                     why(),
-                    self.sim_plan.actions[action].name,
+                    self.part_label(action, m.part),
                     m.measured_at
                 ),
             });
@@ -3234,10 +3266,10 @@ impl<'a> Sim<'a> {
         if n > PER_HIT_ROLL_LIMIT {
             return Err(PlanError {
                 what: format!(
-                    "{}, but action `{}` measured hits_per_use {h} at t={} \
+                    "{}, but {} measured hits_per_use {h} at t={} \
                      — per-hit rolling is capped at {PER_HIT_ROLL_LIMIT} rolls per cast",
                     why(),
-                    self.sim_plan.actions[action].name,
+                    self.part_label(action, m.part),
                     m.measured_at
                 ),
             });
@@ -14374,6 +14406,278 @@ mod tests {
                 "got {}",
                 r.total.total_damage
             );
+        }
+
+        // --------------------------------------------------------------
+        // The NEXT segment starts AFTER the landing segment's proc rolls
+        // (Global Constraints order: effects → procs → next start). An
+        // on_hit proc (per_cast, chance 1, icd 0) applies `fury`
+        // (duration 10) at seg 0's landing (0.5); seg 1's duration is
+        // `0.75 + 0.25 * buff.fury`. Weight 1.25, one cast:
+        //   correct order: the proc fires first → fury live when seg 1's
+        //     duration is evaluated → 1.0 → lands 1.5, past the horizon,
+        //     never lands → total 100 (seg 0 measured before its own
+        //     proc), on_hit fires 1.
+        //   next-start BEFORE the proc rolls: duration 0.75 → lands 1.25
+        //     (the drained horizon) with fury live from seg 0's proc →
+        //     300 × 1.5 = 450 → total 550, on_hit fires 2.
+        // --------------------------------------------------------------
+        #[test]
+        fn the_next_segment_starts_after_this_segments_proc_rolls() {
+            let slam = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 100 } } },
+                 { "duration": "0.75 + 0.25 * buff.fury",
+                   "damage": { "stats": { "dmg": 300 } } } ] }"#;
+            let procs = r#""procs": {
+                 "ph": { "trigger": "on_hit", "chance": "1", "icd": 0.0,
+                         "rolls": "per_cast", "apply_buff": "fury" } },"#;
+            let r = ev(&simdef(slam, 10.0, procs), 1.25);
+            assert_eq!(r.proc_counts["ph"], 1, "{:?}", r.proc_counts);
+            assert!(
+                close(r.total.total_damage, 100.0),
+                "got {}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // A per_hit proc over a FRACTIONAL measured hits_per_use fails
+        // closed, and on a segment the error names the segment too.
+        // seg 1 hits_per_use 2.5 → "action `slam` segment 1 ... 2.5".
+        // The same for crit_rolls per_hit (MC, which samples). An
+        // unsegmented action keeps naming only "action `slam`".
+        // --------------------------------------------------------------
+        #[test]
+        fn a_fractional_hit_count_error_names_the_segment() {
+            let slam = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 100 } } },
+                 { "duration": 0.75,
+                   "damage": { "stats": { "dmg": 300, "hits_per_use": 2.5 } } } ] }"#;
+            let procs = r#""procs": {
+                 "ph": { "trigger": "on_hit", "chance": "1", "rolls": "per_hit",
+                         "apply_buff": "blip" } },"#;
+            let e = try_run(
+                &simdef(slam, 10.0, procs),
+                &seg_build(0.0),
+                5.0,
+                Mode::Expected,
+            )
+            .unwrap_err();
+            assert!(
+                e.what.contains("action `slam` segment 1"),
+                "got: {}",
+                e.what
+            );
+            assert!(e.what.contains("2.5"), "got: {}", e.what);
+
+            let crit = r#"{ "crit_rolls": "per_hit", "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 100 } } },
+                 { "duration": 0.75,
+                   "damage": { "stats": { "dmg": 300, "hits_per_use": 2.5 } } } ] }"#;
+            let mc = Mode::MonteCarlo {
+                iterations: 1,
+                seed: 1,
+            };
+            let e = try_run(&simdef(crit, 10.0, ""), &seg_build(0.25), 5.0, mc).unwrap_err();
+            assert!(
+                e.what.contains("action `slam` segment 1"),
+                "got: {}",
+                e.what
+            );
+
+            let whole = r#"{ "cast_time": "1",
+                 "damage": { "stats": { "dmg": 300, "hits_per_use": 2.5 } } }"#;
+            let e = try_run(
+                &simdef(whole, 10.0, procs),
+                &seg_build(0.0),
+                5.0,
+                Mode::Expected,
+            )
+            .unwrap_err();
+            assert!(e.what.contains("action `slam` measured"), "got: {}", e.what);
+            assert!(!e.what.contains("segment"), "got: {}", e.what);
+        }
+
+        // --------------------------------------------------------------
+        // A one-segment action measured `cast_start` (action-level, and
+        // via the segment override) is byte-identical to its unsegmented
+        // `cast_start` twin, EV and MC: the segment's own start IS the
+        // cast start. cc 0.25, an on_hit proc (chance 0.5) applying
+        // `fury` so the world MOVES between start and landing.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_one_segment_cast_start_action_is_identical_to_its_unsegmented_twin() {
+            let procs = r#""procs": {
+                 "pc": { "trigger": "on_cast", "chance": "1", "apply_buff": "fury" },
+                 "ph": { "trigger": "on_hit", "chance": "0.5", "apply_buff": "blip" } },"#;
+            let twin = simdef(
+                r#"{ "cast_time": "1.25", "measure": "cast_start",
+                     "damage": { "stats": { "dmg": 400 } } }"#,
+                0.5,
+                procs,
+            );
+            let b = seg_build(0.25);
+            for seg in [
+                r#"{ "measure": "cast_start", "segments": [
+                     { "duration": 1.25, "damage": { "stats": { "dmg": 400 } } } ] }"#,
+                r#"{ "segments": [ { "duration": 1.25, "measure": "cast_start",
+                     "damage": { "stats": { "dmg": 400 } } } ] }"#,
+            ] {
+                let one = simdef(seg, 0.5, procs);
+                for mode in [
+                    Mode::Expected,
+                    Mode::MonteCarlo {
+                        iterations: 50,
+                        seed: 3,
+                    },
+                ] {
+                    let a = try_run(&one, &b, 10.0, mode).unwrap();
+                    let t = try_run(&twin, &b, 10.0, mode).unwrap();
+                    assert!(a.total.total_damage > 0.0);
+                    assert_eq!(
+                        serde_json::to_string(&a).unwrap(),
+                        serde_json::to_string(&t).unwrap(),
+                        "{mode:?}"
+                    );
+                }
+            }
+        }
+
+        // --------------------------------------------------------------
+        // fury (duration 0.5) applied by seg 0's effects at 0.5 expires
+        // at 1.0; seg 1 lands 1.25. Weight 1.25 (one cast, drained):
+        //   (i)   defaults                                   100 + 300 = 400
+        //   (ii)  seg 1 measure cast_start (at 0.5, fury)    100 + 450 = 550
+        //   (iii) action cast_start, no seg override: seg 0 at the cast
+        //         start (100), seg 1 at 0.5 (fury) → 450     = 550
+        //   (iv)  action cast_start, seg 1 override
+        //         cast_complete (fury gone at 1.25)          = 400
+        // --------------------------------------------------------------
+        #[test]
+        fn per_segment_measure_resolution_cells() {
+            let segs = |action_measure: &str, seg1_measure: &str| {
+                format!(
+                    r#"{{ {action_measure}
+                       "segments": [
+                         {{ "duration": 0.5, "damage": {{ "stats": {{ "dmg": 100 }} }},
+                            "effects": [ {{ "apply_buff": "fury" }} ] }},
+                         {{ "duration": 0.75, {seg1_measure}
+                            "damage": {{ "stats": {{ "dmg": 300 }} }} }} ] }}"#
+                )
+            };
+            let cs = r#""measure": "cast_start","#;
+            let cc = r#""measure": "cast_complete","#;
+            for (name, slam, want) in [
+                ("(i) defaults", segs("", ""), 400.0),
+                ("(ii) seg 1 cast_start", segs("", cs), 550.0),
+                ("(iii) action cast_start", segs(cs, ""), 550.0),
+                (
+                    "(iv) action cast_start, seg 1 cast_complete",
+                    segs(cs, cc),
+                    400.0,
+                ),
+            ] {
+                let r = ev(&simdef(&slam, 0.5, ""), 1.25);
+                assert!(
+                    close(r.total.total_damage, want),
+                    "{name}: got {} want {want}",
+                    r.total.total_damage
+                );
+            }
+        }
+
+        // --------------------------------------------------------------
+        // `segments_done` is incremented at each landing BEFORE its
+        // measure: seg 0 dmg `100 * segments_done` reads 1 → 100; seg 1
+        // reads 2 → 200; total 300 (weight 1.25). Contrast (incremented
+        // after the measure): 0 + 100 = 100.
+        // --------------------------------------------------------------
+        #[test]
+        fn segments_done_counts_the_landing_being_measured() {
+            let slam = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": "100 * segments_done" } } },
+                 { "duration": 0.75, "damage": { "stats": { "dmg": "100 * segments_done" } } } ] }"#;
+            let r = ev(&simdef(slam, 10.0, ""), 1.25);
+            assert!(
+                close(r.total.total_damage, 300.0),
+                "got {}",
+                r.total.total_damage
+            );
+        }
+
+        // `100 * segments_remain` at each landing: seg 0 → 1 still to
+        // land → 100; seg 1 → 0 → 0. Total 100 (weight 1.25).
+        #[test]
+        fn segments_remain_counts_segments_still_to_land() {
+            let slam = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": "100 * segments_remain" } } },
+                 { "duration": 0.75, "damage": { "stats": { "dmg": "100 * segments_remain" } } } ] }"#;
+            let r = ev(&simdef(slam, 10.0, ""), 1.25);
+            assert!(
+                close(r.total.total_damage, 100.0),
+                "got {}",
+                r.total.total_damage
+            );
+        }
+
+        // Both symbols are 0 whenever the rotation decides (idle), so a
+        // `when` reading them cannot wedge it: weight 5 → 4 casts. Also
+        // 0 for an unsegmented action even mid-landing: its damage
+        // `100 + segments_done + segments_remain` stays 100 (4 × 100).
+        #[test]
+        fn the_segment_symbols_read_zero_at_a_rotation_decision() {
+            let rot = r#"{ "rules": [ { "action": "slam",
+                  "when": "and(segments_done == 0, segments_remain == 0)" } ] }"#;
+            let plan = seg_plan();
+            let sd: SimDef = serde_json::from_str(&simdef(&slam_with(""), 10.0, "")).unwrap();
+            let rotation: Rotation = serde_json::from_str(rot).unwrap();
+            let sp = sim_compile(&plan, &sd, &rotation).unwrap();
+            let r = run(&plan, &sp, &seg_build(0.0), &fight(5.0), Mode::Expected).unwrap();
+            assert_eq!(r.actions["slam"].casts, 4);
+
+            let whole = r#"{ "cast_time": "1.25", "damage": { "stats": {
+                 "dmg": "100 + segments_done + segments_remain" } } }"#;
+            let r = ev(&simdef(whole, 10.0, ""), 5.0);
+            assert!(
+                close(r.total.total_damage, 400.0),
+                "got {}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // crit_rolls applies to EACH segment's own hits. cc 0.25, both
+        // segments hits_per_use 5, crit_rolls per_hit, a per_cast
+        // on_crit proc (chance 1, icd 0); weight 5 (4 casts, 8 damaging
+        // landings): each landing weighs 1 − 0.75^5 = 781/1024, so
+        // 8 × 781/1024 = 6.1015625 → 6 fires. Contrast crit_rolls
+        // per_cast: 8 × 0.25 = 2.
+        // --------------------------------------------------------------
+        #[test]
+        fn crit_rolls_applies_to_each_segments_own_hits() {
+            let segs = |crit: &str| {
+                format!(
+                    r#"{{ {crit} "segments": [
+                       {{ "duration": 0.5,
+                          "damage": {{ "stats": {{ "dmg": 100, "hits_per_use": 5 }} }} }},
+                       {{ "duration": 0.75,
+                          "damage": {{ "stats": {{ "dmg": 300, "hits_per_use": 5 }} }} }} ] }}"#
+                )
+            };
+            let procs = r#""procs": {
+                 "pk": { "trigger": "on_crit", "chance": "1", "icd": 0.0,
+                         "rolls": "per_cast", "apply_buff": "blip" } },"#;
+            let b = seg_build(0.25);
+            let r = try_run(
+                &simdef(&segs(r#""crit_rolls": "per_hit","#), 10.0, procs),
+                &b,
+                5.0,
+                Mode::Expected,
+            )
+            .unwrap();
+            assert_eq!(r.proc_counts["pk"], 6, "{:?}", r.proc_counts);
+            let r = try_run(&simdef(&segs(""), 10.0, procs), &b, 5.0, Mode::Expected).unwrap();
+            assert_eq!(r.proc_counts["pk"], 2, "{:?}", r.proc_counts);
         }
     }
 }
