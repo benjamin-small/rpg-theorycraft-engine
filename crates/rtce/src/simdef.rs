@@ -372,6 +372,39 @@ pub enum EventOrder {
 /// the cast's [`Measure`] snapshot, which feeds only `Plan` evaluations
 /// (damage, `hits_per_use`, crit weight, tick captures).
 ///
+/// # Objective reads
+///
+/// `objective.<name>` (a `Plan` objective's deterministic, branch-weighted
+/// EXPECTED value; never sampled, no RNG, in both modes) is legal in
+/// exactly the fields above except `damage.stats` (circular), plus action
+/// `cast_time` (evaluated at cast start, after payment), proc `chance` and
+/// rotation rule `when`; it is a compile error in `damage.stats` (all of
+/// it, `hits_per_use` included) and in resource `max`/`regen_per_sec`. DEFAULT: absent,
+/// and a config reading none is unchanged. It is evaluated at the reading
+/// field's instant (the table's column), against that field's world:
+///
+/// | Field | World |
+/// |---|---|
+/// | [`ActionDef::cast_time`], [`ActionDef::cooldown`], [`ActionDef::cost`], [`ActionDef::gain`], [`SegmentDef::duration`] | the effective build WITH the action's (segment's) `damage.stats` overlay, built at THAT field's instant (`gain`, `cost`, `cooldown`, `cast_time` here mean an UNSEGMENTED damaging action; a segmented action's are action-level, see the next row) |
+/// | the same fields on a utility action (no `damage`), and ALL of a segmented action's action-level fields (`cooldown`, `cost`, `gain`) | the plain effective build |
+/// | [`BuffDef::duration`], proc `chance`, rule `when` | the plain effective build |
+///
+/// The overlay is built at the field's instant, NOT at the measure
+/// instant: `gain`'s overlay (cast complete) sees `casts.<self>` one lower
+/// than the measured overlay did; the `cost`/`cooldown` overlay sees
+/// pre-payment resources, while `cast_time`'s overlay sees post-payment
+/// ones (cost paid, cooldown armed); and a non-finite `damage.stats`
+/// value can therefore fail closed "at a rotation decision" or "at cast
+/// start". Every world includes the effective phase. A buff applied later
+/// changes the NEXT read. Pinned: an objective-driven `cast_time` casts 10
+/// vs 5 for a literal; a segment `duration` overlay 4 vs 2 (plain build);
+/// a `cast_time` overlay 6 vs 3; a segmented action's action-level
+/// `cooldown` reads the plain world (3 casts, not 6).
+///
+/// Cost: one `evaluate_phase` per read, so a `when` or `cost` reading
+/// objectives pays one per rule per decision; a damaging action's overlay
+/// world adds one `BuildState` clone (plus per-stat key clones) per read.
+///
 /// # Fail-closed
 ///
 /// `per_hit` rolls a literal count, so the measured `hits_per_use` must
@@ -439,38 +472,6 @@ pub enum ProcRolls {
 /// | [`ActionDef::gain`] values | at cast complete (the last landing of a segmented action) |
 /// | [`SegmentDef::duration`] | at the segment's start (the previous landing, or cast start for segment 0) |
 /// | [`ActionDamage::stats`] values | at the action's MEASURED instant — cast complete by default, cast start under [`Measure::CastStart`] |
-///
-/// # Objective reads
-///
-/// `objective.<name>` (a `Plan` objective's deterministic, branch-weighted
-/// EXPECTED value; never sampled, no RNG, in both modes) is legal in
-/// exactly the fields above except `damage.stats` (circular), plus proc
-/// `chance` and rotation rule `when`; it is a compile error in
-/// `damage.stats` and in resource `max`/`regen_per_sec`. DEFAULT: absent,
-/// and a config reading none is unchanged. It is evaluated at the reading
-/// field's instant (the table's column), against that field's world:
-///
-/// | Field | World |
-/// |---|---|
-/// | [`ActionDef::cast_time`], [`ActionDef::cooldown`], [`ActionDef::cost`], [`ActionDef::gain`], [`SegmentDef::duration`] | the effective build WITH the action's (segment's) `damage.stats` overlay, built at THAT field's instant (`gain`, `cost`, `cooldown`, `cast_time` here mean an UNSEGMENTED damaging action; a segmented action's are action-level, see the next row) |
-/// | the same fields on a utility action (no `damage`), and ALL of a segmented action's action-level fields (`cooldown`, `cost`, `gain`) | the plain effective build |
-/// | [`BuffDef::duration`], proc `chance`, rule `when` | the plain effective build |
-///
-/// The overlay is built at the field's instant, NOT at the measure
-/// instant: `gain`'s overlay (cast complete) sees `casts.<self>` one lower
-/// than the measured overlay did; the `cost`/`cooldown` overlay sees
-/// pre-payment resources, while `cast_time`'s overlay sees post-payment
-/// ones (cost paid, cooldown armed); and a non-finite `damage.stats`
-/// value can therefore fail closed "at a rotation decision" or "at cast
-/// start". Every world includes the effective phase. A buff applied later
-/// changes the NEXT read. Pinned: an objective-driven `cast_time` casts 10
-/// vs 5 for a literal; a segment `duration` overlay 4 vs 2 (plain build);
-/// a `cast_time` overlay 6 vs 3; a segmented action's action-level
-/// `cooldown` reads the plain world (3 casts, not 6).
-///
-/// Cost: one `evaluate_phase` per read, so a `when` or `cost` reading
-/// objectives pays one per rule per decision; a damaging action's overlay
-/// world adds one `BuildState` clone (plus per-stat key clones) per read.
 ///
 /// A cost expression is therefore RE-CHECKED at each decision point, never
 /// PREDICTED: the executor's resource-affordability wake time is solved

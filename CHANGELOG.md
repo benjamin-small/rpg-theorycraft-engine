@@ -15,7 +15,7 @@ until then, per semver's "anything goes" pre-1.0 clause).
   JSON is unchanged for every config that names it; Rust struct literals
   change `cast_time: "1".into()` to `cast_time: Some("1".into())`. An
   action naming neither `cast_time` nor `segments` is a compile error.
-  `CompiledAction::cast_time` is `Option<Program>` (`None` when
+  `CompiledAction::cast_time` is `Option<SimProgram>` (`None` when
   segmented).
 - **New reserved words `segments_done` and `segments_remain`.** A
   stat, condition, resource, action or buff already using either name now
@@ -54,8 +54,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
   unchanged. Cost: one `evaluate_phase` per read (per rule per decision
   for `when`/`cost`), plus an overlay `BuildState` clone for a damaging
   action.
-- Public API: `SimPlan::segments_done_slot` (pub) and the `SimProgram`
-  re-export from `rtce::sim`.
+- Public API: `SimPlan::segments_done_slot` and `SimPlan::objective_base`
+  (pub) and the `SimProgram` re-export from `rtce::sim`;
+  `CompiledValue::Expr` now holds a `SimProgram`.
 - **Segmented actions** (`ActionDef::segments`, `SegmentDef`) — a
   multi-landing cast (channel, combo string, wind-up then slam) with a
   per-segment `duration`, `damage`, `effects` and `measure`

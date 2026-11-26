@@ -41,6 +41,10 @@ enum ObjectiveReads {
     /// `damage.stats` (action or segment level): the overlay is the world
     /// the objective is evaluated in, so the read would be circular.
     Circular,
+    /// `damage.stats.hits_per_use`: the executor reads it directly, before
+    /// any `Plan` evaluation (it never reaches the Plan), so no objective
+    /// exists yet to read.
+    HitsPerUse,
     /// Resource `max`/`regen_per_sec`: folded at every state-change
     /// refold, outside any one field's evaluation instant.
     RefoldTime,
@@ -146,6 +150,10 @@ fn compile_sim(
                     "`damage.stats` is the world the objective is evaluated in, so it \
                      would read its own result (a circular read)",
                 ),
+                ObjectiveReads::HitsPerUse => Some(
+                    "`hits_per_use` is read by the executor before any Plan evaluation, \
+                     so no objective value exists yet to read",
+                ),
                 ObjectiveReads::RefoldTime => Some(
                     "a resource's `max`/`regen_per_sec` is folded at every state change, \
                      outside any one evaluation instant",
@@ -222,7 +230,12 @@ fn compile_value_map(
         let cv = match v {
             NumOrExpr::Num(n) => CompiledValue::Const(*n),
             NumOrExpr::Expr(src) => {
-                CompiledValue::Expr(compile_sim(src, syms, || what(k), objectives)?)
+                let field = if k == "hits_per_use" && objectives == ObjectiveReads::Circular {
+                    ObjectiveReads::HitsPerUse
+                } else {
+                    objectives
+                };
+                CompiledValue::Expr(compile_sim(src, syms, || what(k), field)?)
             }
         };
         out.insert(k.clone(), cv);
@@ -2725,6 +2738,26 @@ mod tests {
         for needle in ["bolt", "segment 0", "damage.stats", "objective"] {
             assert!(e.what.contains(needle), "{needle}: got: {}", e.what);
         }
+    }
+
+    #[test]
+    fn an_objective_read_in_hits_per_use_names_its_own_reason() {
+        let e = haste_compile(
+            r#"{ "actions": { "bolt": { "cast_time": "1",
+                   "damage": { "stats": { "hits_per_use": "objective.hit" } } } },
+                 "damage_objective": "hit" }"#,
+            NO_RULES,
+        )
+        .unwrap_err();
+        for needle in [
+            "bolt",
+            "hits_per_use",
+            "objective",
+            "before any Plan evaluation",
+        ] {
+            assert!(e.what.contains(needle), "{needle}: got: {}", e.what);
+        }
+        assert!(!e.what.contains("circular"), "got: {}", e.what);
     }
 
     #[test]

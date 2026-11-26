@@ -15415,6 +15415,136 @@ mod tests {
         }
 
         // --------------------------------------------------------------
+        // The wake-branch REFILL, with a LOWER rule whose `when` reads an
+        // objective: rules [strike, other when "objective.hct > 100"].
+        // Same strike as the test above (cost 10 × overlay hct 2 = 20),
+        // mana max 30, regen 1/s, cast_time 12, weight 28 → casts 2 and,
+        // at t=24, mana 14 < 20 → starved from 24 → time_starved 4.
+        // At t=24 rule 2's `when` is evaluated AFTER strike's afford
+        // check and its fill overwrites the objective region with the
+        // PLAIN world (hct 1; 1 > 100 false → skipped). The wake branch
+        // then re-prices strike's cost: with the refill 20 > 14 → starved
+        // (4); skipping it reads the plain region → cost 10 ≤ 14 → not
+        // starved → 0 (the single-rule test cannot tell: nothing
+        // overwrites the region there).
+        // --------------------------------------------------------------
+        #[test]
+        fn wake_branch_refills_after_a_later_rules_when_overwrites_the_region() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "30", "regen_per_sec": "1" } },
+                   "actions": {
+                     "strike": { "cast_time": "12",
+                       "cost": { "mana": "10 * objective.hct" },
+                       "damage": { "stats": { "aps": 0.5 } } },
+                     "other": { "cast_time": "1", "damage": { "stats": {} } } },"#,
+            );
+            let r = ev(
+                &sim,
+                r#"{ "rules": [ { "action": "strike" },
+                                { "action": "other", "when": "objective.hct > 100" } ] }"#,
+                28.0,
+            );
+            assert_eq!(r.actions["strike"].casts, 2, "{:?}", r.actions);
+            assert_eq!(r.actions["other"].casts, 0, "{:?}", r.actions);
+            assert!(
+                close(r.resources["mana"].time_starved, 4.0),
+                "time_starved {} (4 = the wake branch re-priced strike's cost \
+                 in its overlay world; 0 = it read the lower rule's plain fill)",
+                r.resources["mana"].time_starved
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cast_time reads the POST-payment world. mana max 20, regen
+        // 100/s (refills to 20 within each cast), cost { mana: 10 },
+        // strike damage.stats { aps: "mana / 10" }, cast_time
+        // "objective.hct" (hct = 1 / aps; no haste), weight 3.
+        //   Post-payment (documented): at a cast start mana is 20, the
+        //   cost leaves 10 → aps 1 → hct 1 → completions 1, 2, 3 →
+        //   casts 3, total 300.
+        // Contrast (the fill moved BEFORE payment): mana 20 → aps 2 → hct
+        // 0.5 → completions 0.5 … 3.0 → casts 6, total 600.
+        // --------------------------------------------------------------
+        #[test]
+        fn cast_time_overlay_sees_post_payment_resources() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "100" } },
+                   "actions": { "strike": { "cast_time": "objective.hct",
+                     "cost": { "mana": 10 },
+                     "damage": { "stats": { "aps": "mana / 10" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 3.0);
+            assert_eq!(
+                r.actions["strike"].casts, 3,
+                "3 = post-payment mana 10 (hct 1); 6 = pre-payment mana 20 (hct 0.5)"
+            );
+            assert!(
+                close(r.total.total_damage, 300.0),
+                "{}",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // cooldown reads the PRE-payment world (the cost/cooldown share
+        // one pre-payment fill; `cost` is necessarily pre-payment — its
+        // amount is what gets paid, so only `cooldown` can be told apart
+        // from a post-payment evaluation). Same resource, cost 10, cast
+        // time 0.1 (literal), cooldown "objective.hct", damage.stats
+        // { aps: "mana / 10" }, weight 2.4.
+        //   Pre-payment (documented): mana 20 → aps 2 → cooldown 0.5;
+        //   regen 100/s refills well within it → starts 0, 0.5, 1.0, 1.5,
+        //   2.0 (each completing 0.1 later, all by 2.1) → casts 5.
+        // Contrast (cooldown evaluated AFTER payment): mana 10 → aps 1 →
+        // cooldown 1 → starts 0, 1, 2 → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn cooldown_overlay_sees_pre_payment_resources() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "100" } },
+                   "actions": { "strike": { "cast_time": "0.1",
+                     "cooldown": "objective.hct",
+                     "cost": { "mana": 10 },
+                     "damage": { "stats": { "aps": "mana / 10" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 2.4);
+            assert_eq!(
+                r.actions["strike"].casts, 5,
+                "5 = pre-payment mana 20 (cooldown 0.5); 3 = post-payment mana 10 (cooldown 1)"
+            );
+        }
+
+        // --------------------------------------------------------------
+        // gain's overlay sees `casts.<self>` one LOWER than the measured
+        // overlay: gain runs before the completing cast's increment.
+        // mana max 20, regen 0 (starts full), strike cast_time 1, cost
+        // 10, gain { mana: "12 * objective.hct" }, damage.stats
+        // { aps: "1 + casts.strike" } → hct = 1 / (1 + casts), weight 10.
+        //   Pre-increment (documented): completing cast n sees casts n-1
+        //   → gain 12 / n.
+        //     c1: 20 → 10, +12 → 22 capped 20
+        //     c2: 20 → 10, +6  → 16
+        //     c3: 16 → 6,  +4  → 10
+        //     c4: 10 → 0,  +3  → 3;  3 < 10 and no regen → stop: casts 4.
+        // Contrast (gain after the increment: casts n → gain 12 / (n+1)):
+        //     c1: 10 + 6 = 16;  c2: 6 + 4 = 10;  c3: 0 + 3 = 3 → casts 3.
+        // --------------------------------------------------------------
+        #[test]
+        fn gain_overlay_sees_the_pre_increment_cast_count() {
+            let sim = simdef(
+                r#""resources": { "mana": { "max": "20", "regen_per_sec": "0" } },
+                   "actions": { "strike": { "cast_time": "1", "cost": { "mana": 10 },
+                     "gain": { "mana": "12 * objective.hct" },
+                     "damage": { "stats": { "aps": "1 + casts.strike" } } } },"#,
+            );
+            let r = ev(&sim, STRIKE, 10.0);
+            assert_eq!(
+                r.actions["strike"].casts, 4,
+                "4 = gain priced before the increment; 3 = after it"
+            );
+        }
+
+        // --------------------------------------------------------------
         // A segmented action's action-level fields have no overlay: its
         // `cooldown "objective.hct"` reads the PLAIN build (hct 1) even
         // though its one segment carries damage.stats { aps: 2 } (hct
