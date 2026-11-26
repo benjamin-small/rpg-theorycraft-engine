@@ -2454,6 +2454,7 @@ impl<'a> Sim<'a> {
                 );
                 self.roll_procs_ev(Trigger::OnHit, 1.0, action, Some(d))?;
                 self.roll_procs_ev(Trigger::OnCrit, crit_chance, action, Some(d))?;
+                self.roll_procs_ev(Trigger::OnNonCrit, 1.0 - crit_chance, action, Some(d))?;
             }
         }
         Ok(())
@@ -2683,7 +2684,9 @@ impl<'a> Sim<'a> {
 
     /// EV mode: the accumulator method (see module docs). `weight`
     /// multiplies each qualifying roll's `chance` BEFORE accumulation —
-    /// `1.0` for `OnCast`/`OnHit` (every cast/hit qualifies outright), and
+    /// `1.0` for `OnCast`/`OnHit` (every cast/hit qualifies outright),
+    /// `1 − crit_chance` for `OnNonCrit` (the exact complement of
+    /// `OnCrit`'s weight), and
     /// (the EV-consistent choice this task pins, since the design spec is
     /// silent on it) `crit_chance` for `OnCrit`: a hit isn't "certainly" a
     /// crit in EV mode, so an `on_crit` proc's per-hit contribution is
@@ -9627,6 +9630,93 @@ mod tests {
                      would mean the filter is wired into `on_cast` alone"
                 );
             }
+        }
+
+        // ------------------------------------------------------------------
+        // `on_non_crit` (EV): the complement of `on_crit`. Same fixture shape
+        // as `ev_on_crit_weights_by_crit_probability` (crit 0.25, one 1 s
+        // damaging action, 10 s, chance 1, icd 0): weight 1 − 0.25 = 0.75 per
+        // hit (exact in binary); acc crosses at hits 2,3,4,6,7,8,10 → 7
+        // fires. `on_crit` on the same fixture gives 2 (0.25 × 10 = 2.5).
+        // ------------------------------------------------------------------
+        #[test]
+        fn ev_on_non_crit_weights_by_one_minus_crit_probability() {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "crit_chance": 25.0 } }"#)
+                    .unwrap();
+            let count = |trigger| {
+                ev_with(
+                    &plan,
+                    &build,
+                    &alternating_simdef(None, trigger, "1"),
+                    &only("a"),
+                    10,
+                )
+                .proc_counts["spark"]
+            };
+            assert_eq!(count(Trigger::OnNonCrit), 7);
+            assert_eq!(count(Trigger::OnCrit), 2);
+        }
+
+        // `scoped_plan()` has no "crit" event → crit_chance 0 → weight 1.0.
+        #[test]
+        fn ev_on_non_crit_fires_every_hit_without_a_crit_event() {
+            let r = ev(
+                &scoped_plan(),
+                &alternating_simdef(None, Trigger::OnNonCrit, "1"),
+                &only("a"),
+                10,
+            );
+            assert_eq!(r.actions["a"].casts, 10);
+            assert_eq!(r.proc_counts["spark"], 10);
+        }
+
+        // A utility cast (damage: None) presents no hit-trigger roll. The MC
+        // half (iterations 1) passes vacuously until MC rolling lands.
+        #[test]
+        fn a_utility_cast_presents_no_on_non_crit_roll() {
+            let plan = scoped_plan();
+            let mut simdef = alternating_simdef(None, Trigger::OnNonCrit, "1");
+            simdef
+                .actions
+                .insert("a".to_string(), utility("1", 0.0, Vec::new()));
+            let rotation = only("a");
+            let r = ev(&plan, &simdef, &rotation, 10);
+            assert_eq!(r.actions["a"].casts, 10);
+            assert_eq!(r.proc_counts["spark"], 0, "EV");
+
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            let mc = run(
+                &plan,
+                &sim_plan,
+                &scoped_build(),
+                &dummy(10),
+                Mode::MonteCarlo {
+                    iterations: 1,
+                    seed: 3,
+                },
+            )
+            .unwrap();
+            assert_eq!(mc.actions["a"].casts, 10);
+            assert_eq!(mc.proc_counts["spark"], 0, "MC");
+        }
+
+        #[test]
+        fn the_actions_filter_applies_to_on_non_crit() {
+            let plan = scoped_plan();
+            let rotation = alternating_rotation();
+            let count = |filter: Option<Vec<String>>| {
+                ev(
+                    &plan,
+                    &alternating_simdef(filter, Trigger::OnNonCrit, "1"),
+                    &rotation,
+                    20,
+                )
+                .proc_counts["spark"]
+            };
+            assert_eq!(count(Some(vec!["a".into()])), 10);
+            assert_eq!(count(None), 20);
         }
 
         // A cast the filter excludes banks NOTHING in the EV accumulator —

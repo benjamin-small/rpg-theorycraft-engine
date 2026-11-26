@@ -312,13 +312,13 @@ pub enum EventOrder {
 /// # Scope: which rolls this governs
 ///
 /// The knob governs the HIT-driven triggers ([`Trigger::OnHit`],
-/// [`Trigger::OnCrit`]) — the ones whose event today approximates "the
+/// [`Trigger::OnCrit`], [`Trigger::OnNonCrit`]) — the ones whose event today approximates "the
 /// cast's hits" as a single roll. An [`Trigger::OnCast`] proc's event is
 /// the CAST itself, so it rolls once per cast under either setting,
 /// whatever `rolls` says (the [`Measure`]-on-instant-casts precedent:
 /// documented behavior, not an error — a utility cast has no hits at
 /// all, so there is nothing for `per_hit` to count there). Unchanged
-/// rules: a utility cast (no damage) presents no `on_hit`/`on_crit`
+/// rules: a utility cast (no damage) presents no `on_hit`/`on_crit`/`on_non_crit`
 /// roll under either policy, and a proc-triggered FREE cast rolls no
 /// procs at all (P7d), so its hits are never counted by anyone.
 ///
@@ -1210,6 +1210,28 @@ pub enum Trigger {
     /// crit ([`crate::sim::Mode::MonteCarlo`]; ONE mask per cast — the
     /// cast's simultaneous hits share it).
     OnCrit,
+    /// The complement of [`Trigger::OnCrit`]: rolls once per completing
+    /// cast of a damaging action by default — per measured hit under
+    /// [`ProcRolls::PerHit`] — in the same proc batch, immediately AFTER
+    /// the `OnCrit` roll (cast-complete order: `on_cast`, `on_hit`,
+    /// `on_crit`, `on_non_crit`).
+    ///
+    /// - **Evaluation instant:** the cast's completion, exactly as
+    ///   `OnCrit` (under `measure: "cast_start"` it reads the same
+    ///   snapshot).
+    /// - **EV weight:** `1 − crit_chance` per roll
+    ///   ([`crate::sim::Mode::Expected`]); under `per_hit` the weight
+    ///   applies per hit. With no `"crit"` event in the game def the crit
+    ///   chance is 0, so every damaging hit qualifies (weight 1.0).
+    /// - **MC:** qualifies when the cast's sampled branch mask has the
+    ///   crit bit CLEAR — the same single draw `OnCrit` gates on, so the
+    ///   two triggers are exact complements per cast.
+    /// - **Interactions:** `rolls`, `icd` and `actions` behave identically
+    ///   to `OnCrit` (chance evaluated once per proc per cast; ICD is a
+    ///   hard gate). A utility cast (no damage) and a proc-fired free
+    ///   cast present no roll.
+    /// - **Default:** none; the trigger must be named explicitly.
+    OnNonCrit,
 }
 
 /// One effect of an action completing or a proc firing. Externally tagged:
@@ -1533,6 +1555,13 @@ mod tests {
       { "action": "fireball",   "when": "mana >= 40" },
       { "action": "basic_bolt" }
     ]}"#;
+
+    #[test]
+    fn on_non_crit_trigger_parses() {
+        let t: Trigger = serde_json::from_str(r#""on_non_crit""#).unwrap();
+        assert_eq!(t, Trigger::OnNonCrit);
+        assert_eq!(serde_json::to_string(&t).unwrap(), r#""on_non_crit""#);
+    }
 
     #[test]
     fn simdef_round_trips_the_spec_example_verbatim() {

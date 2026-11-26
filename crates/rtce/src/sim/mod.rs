@@ -80,7 +80,7 @@
 //! apply `gain`  →  casts.<action> += 1
 //!   →  measure the cast's WORLD*, evaluate its damage, credit the hit
 //!   →  the action's effects (apply_buff entries), in list order
-//!   →  proc rolls: on_cast, then on_hit, then on_crit
+//!   →  proc rolls: on_cast, then on_hit, then on_crit, then on_non_crit
 //! ```
 //!
 //! *Under the default `measure: "cast_complete"`. An action measured at
