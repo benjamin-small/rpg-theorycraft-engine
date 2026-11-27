@@ -1170,6 +1170,25 @@ pub enum ReapplyPolicy {
     Strongest,
 }
 
+/// Whether a buff's uptime is tracked as a discrete binary window or, in
+/// EV mode, as an expected PROBABILITY of being up — see
+/// [`BuffDef::ev_uptime`].
+///
+/// `Discrete` is the default and rtce's behavior to date.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvUptime {
+    /// The buff is a binary window: active or not, opened when the EV
+    /// accumulator crosses a whole application. The default.
+    #[default]
+    Discrete,
+    /// In EV mode the buff carries a probability `P` of being up, built
+    /// from the exact log of its application rolls, instead of a binary
+    /// window. Fail-closed constraints apply — see [`BuffDef::ev_uptime`].
+    /// MC mode ignores the knob (it still checks the constraints).
+    Expected,
+}
+
 /// Which `Plan` objective a buff DoT-ticks, and HOW each instance samples
 /// that objective's rate.
 ///
@@ -1467,6 +1486,106 @@ pub struct BuffDef {
     /// [`ReapplyPolicy`]. Defaults to [`ReapplyPolicy::Refresh`].
     #[serde(default)]
     pub on_reapply: ReapplyPolicy,
+    /// How EV mode tracks this buff's uptime — see [`EvUptime`]. Defaults
+    /// to [`EvUptime::Discrete`]: the binary window every earlier release
+    /// builds, so absent means unchanged.
+    ///
+    /// With [`EvUptime::Expected`], EV mode keeps a probability `P` that
+    /// the buff is up (from the exact log of its application rolls)
+    /// instead of a binary window, which removes the accumulator's
+    /// whole-application artifact for high-uptime procs. MC mode IGNORES
+    /// the knob — it realizes real windows either way — but every
+    /// constraint below is still checked, so a config valid in one mode is
+    /// valid in both.
+    ///
+    /// # Evaluation instant
+    ///
+    /// `q` — the probability that the application happens at least once
+    /// during one cast event — is taken at each roll, the same instant the
+    /// accumulator adds its mass; the duration `D` is evaluated at that
+    /// application exactly as [`BuffDef::duration`] documents today.
+    ///
+    /// # What reads `P`
+    ///
+    /// | Reader | `discrete` (binary active) | `expected` |
+    /// |---|---|---|
+    /// | condition `c = v` | `v` while active, else static uptime | `P·v + (1 − P)·static` |
+    /// | contribution value | `value × stacks` (1) | `value × P` |
+    /// | live `tick_objective` | `rate × stacks` | `rate × P` |
+    /// | `BuffReport.uptime` | ∫active / duration | ∫P / duration |
+    /// | `BuffReport.avg_stacks` | ∫stacks / duration | ∫P / duration (max one stack) |
+    /// | `condition_uptime` | ∫value | ∫(blended value) |
+    /// | `applications` count | discrete applications | number of rolls |
+    ///
+    /// The condition row is the expectation of the precedence rule (an
+    /// active buff wins, else the static uptime), assuming the roll
+    /// outcome is independent of the static uptime. The contribution row
+    /// scales linearly, which is exact for one buff by linearity of
+    /// expectation. Note the LINEARIZATION: a `Plan` objective is not
+    /// linear in a buff's value, so feeding it `P·value` is the
+    /// expectation of the INPUT, not of the objective; the same
+    /// reading `stacks` scaling and EV-averaged conditions already use.
+    ///
+    /// # Constraints (fail closed at `sim::compile`, naming this buff)
+    ///
+    /// An `expected` buff must:
+    ///
+    /// 1. have [`ReapplyPolicy::Refresh`] and `max_stacks: 1` — stacking
+    ///    needs a distribution over stack counts, not one `P`;
+    /// 2. have no SNAPSHOT [`BuffDef::tick_objective`] (a live one is
+    ///    fine);
+    /// 3. not be applied by any proc with `icd > 0` — gated rolls are not
+    ///    independent;
+    /// 4. not be applied by a free cast (an action reached through a
+    ///    proc's `cast_action`) — apply it from the proc directly;
+    /// 5. not be read as `buff.<name>`, `buff_remaining.<name>` or
+    ///    `stacks.<name>` by ANY sim expression (a probability read as a
+    ///    boolean would silently diverge from MC);
+    /// 6. not drive a condition that any sim expression reads (under EV
+    ///    that condition is a blend, e.g. 0.96, so `recently >= 1` would
+    ///    never fire where MC fires 96% of the time). `objective.<name>`
+    ///    reads stay legal;
+    /// 7. not share a driven condition with any other buff — the
+    ///    name-order precedence rule has no exact fractional form.
+    /// 8. not gate one of its own [`Contribution::condition`]s on a
+    ///    condition it drives in [`BuffDef::conditions`] — under EV that
+    ///    gate reads the blend, so the contribution would count
+    ///    `P × blend` where MC counts `P × v` (shape (ii) below).
+    ///
+    /// A proc applying an `expected` buff alongside other effects stays
+    /// legal: its other effects keep firing discretely.
+    ///
+    /// # When `P` is exact
+    ///
+    /// `P` is exact only when the applying procs' `q` (their `chance`,
+    /// and the crit chance it conditions on) and the duration `D` do NOT
+    /// depend on this buff's own state. Two shapes break that:
+    ///
+    /// - (i) the buff feeds its own applying proc: it contributes to
+    ///   something that feeds that proc's crit chance, `chance` or `D`
+    ///   (e.g. "on crit, gain X: +crit chance"), or an applying proc's
+    ///   `chance` / `D` reads an `objective.<name>` that depends on it.
+    ///   MC's rolls are then positively correlated with the buff being
+    ///   up, and EV's `P` is a mean-field approximation (likely slightly
+    ///   high). This is NOT rejected — detecting it needs a
+    ///   `Plan`-dependency analysis (ROADMAP open debt).
+    /// - (ii) a contribution gated on a condition the buff itself drives:
+    ///   rejected at compile (constraint 8).
+    ///
+    /// # Differences from `discrete` worth knowing
+    ///
+    /// - `D` is evaluated at EVERY considered cast (each roll's weight
+    ///   needs its end time), including casts on which discrete EV would
+    ///   not fire. A duration expression that errors can therefore
+    ///   surface under `expected` where `discrete` never hits it.
+    /// - The condition blend `P·v + (1 − P)·static` reaches the `Plan`
+    ///   UNCLAMPED, while `condition_uptime` reports the value clamped to
+    ///   `[0, 1]` — the same split active buffs already have.
+    /// - Expected buffs' contributions fold AFTER the active buffs', not
+    ///   in buff-index order, so a `sum` bucket shared with an active
+    ///   buff can differ from discrete by a ULP.
+    #[serde(default)]
+    pub ev_uptime: EvUptime,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this buff (the
@@ -1487,6 +1606,7 @@ impl BuffDef {
         "tick_objective",
         "max_stacks",
         "on_reapply",
+        "ev_uptime",
     ];
 }
 
@@ -1511,6 +1631,7 @@ impl Default for BuffDef {
             tick_objective: None,
             max_stacks: default_max_stacks(),
             on_reapply: ReapplyPolicy::default(),
+            ev_uptime: EvUptime::default(),
             extra: BTreeMap::new(),
         }
     }

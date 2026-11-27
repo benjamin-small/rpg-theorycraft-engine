@@ -7,6 +7,37 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **`ev_uptime: "expected"` on a buff** (#33 item 4). In EV mode the buff
+  carries a probability `P` of being up, built from the exact log of its
+  proc application rolls, instead of a binary window opened when the
+  accumulator crosses a whole application. For a buff applied by a
+  high-chance `on_crit` proc (crit 0.23, 0.33 s casts, duration 4) EV
+  `discrete` reports 0.9945 where MC says 0.9538; `expected` reports
+  0.9538. `P` feeds conditions (`P·v + (1 − P)·static`), contributions
+  (`value × P`), live `tick_objective` rates (`rate × P`) and the uptime
+  and `avg_stacks` columns (`∫P / duration`). Defaults to `discrete`, so
+  every config that omits it is byte-identical; MC ignores the field.
+  Fail-closed at compile: needs `refresh` with `max_stacks: 1`, no
+  snapshot tick, no proc with `icd > 0` applying it, no free-cast
+  application, no `buff.` / `buff_remaining.` / `stacks.` reads of it, and
+  no driven condition that a sim expression reads or another buff shares,
+  and no contribution of its own gated (`condition`) on a condition it
+  drives. `P` is exact only when the applying procs' chance (and the crit
+  chance it conditions on) and the duration do not depend on the buff's
+  own state; a buff that feeds its own proc (e.g. "on crit, gain X" where
+  X grants crit chance, or a proc chance/duration reading an
+  `objective.<o>` that depends on X) gets a mean-field `P`, likely
+  slightly high against MC. That shape is not rejected (ROADMAP open
+  debt). Design: `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`.
+  Guide: chapter 7, "Buffs that depend on luck".
+
+### Upgrade notes
+- Rust `BuffDef` struct literals need `ev_uptime: Default::default()`
+  (= `EvUptime::Discrete`): `BuffDef` is an exhaustive pub struct with no
+  `Default` impl, so the new field breaks every Rust literal of it and
+  the next release is a minor bump (0.9.0). JSON configs are unchanged.
+
 ## [0.8.0] — 2026-11-26
 
 **Hit-level casts, first half.** Version 0.8.0 lets a timeline derive

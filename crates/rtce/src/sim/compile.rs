@@ -8,9 +8,11 @@ use crate::build::Contribution;
 use crate::expr::{compile as compile_expr, Program, Symbols};
 use crate::plan::{Plan, PlanError};
 use crate::simdef::{
-    EffectDef, EventOrder, Measure, NumOrExpr, ProcRolls, ReapplyPolicy, Rotation, SimDef, Trigger,
+    EffectDef, EvUptime, EventOrder, Measure, NumOrExpr, ProcRolls, ReapplyPolicy, Rotation,
+    SimDef, Trigger,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 /// A compiled sim expression plus whether it reads any `objective.<name>`
 /// slot (slice 6). The executor evaluates an expression whose
@@ -140,9 +142,22 @@ fn compile_sim(
         inner: syms,
         read: Cell::new(false),
         unknown: RefCell::new(None),
+        forbidden: RefCell::new(None),
     };
     match compile_expr(src, &probe) {
         Ok(program) => {
+            if let Some((read, buff)) = probe.forbidden.borrow().as_ref() {
+                return Err(PlanError {
+                    what: format!(
+                        "{} reads `{read}`, which buff `{buff}` (`ev_uptime: expected`) \
+                         carries as a probability, not a state: under EV the buff is up \
+                         with probability P, so a boolean read of it (or of a condition \
+                         it drives, which becomes a blend) would silently diverge from MC \
+                         — read an `objective.<name>` instead, or drop `ev_uptime`",
+                        what()
+                    ),
+                });
+            }
             let reads_objectives = probe.read.get();
             let reason = match objectives {
                 ObjectiveReads::Legal => None,
@@ -196,11 +211,20 @@ struct ObjectiveProbe<'a, 'b> {
     inner: &'b SimSymbols<'a>,
     read: Cell<bool>,
     unknown: RefCell<Option<String>>,
+    /// The first read of a name an `ev_uptime: expected` buff forbids:
+    /// (name read, the buff).
+    forbidden: RefCell<Option<(String, String)>>,
 }
 
 impl Symbols for ObjectiveProbe<'_, '_> {
     fn slot(&self, name: &str) -> Option<u16> {
         let slot = self.inner.slot(name);
+        if let Some(buff) = self.inner.forbidden.get(name) {
+            let mut f = self.forbidden.borrow_mut();
+            if f.is_none() {
+                *f = Some((name.to_string(), buff.clone()));
+            }
+        }
         match slot {
             Some(s) if self.inner.is_objective_slot(s as usize) => self.read.set(true),
             None => {
@@ -370,6 +394,11 @@ pub struct CompiledBuff {
     /// implies a snapshot `tick_objective` and `max_stacks == 1` —
     /// [`compile`] rejects it otherwise.
     pub on_reapply: ReapplyPolicy,
+    /// How EV mode tracks this buff's uptime (see
+    /// [`crate::simdef::BuffDef::ev_uptime`]). [`EvUptime::Expected`]
+    /// reaching here implies every compile-time constraint listed there
+    /// held — [`compile`] rejects the config otherwise.
+    pub ev_uptime: EvUptime,
 }
 
 /// One compiled [`crate::simdef::TickObjective`]: the objective RESOLVED
@@ -438,6 +467,10 @@ pub struct CompiledProc {
     /// consults the `defaults` block again. See [`ProcRolls`] for what
     /// the policy means.
     pub rolls: ProcRolls,
+    /// Indices into [`SimPlan::buffs`] of the [`EvUptime::Expected`]
+    /// buffs this proc's `effects` apply: deduped (a buff named twice is
+    /// one event), in index order. Empty for a proc applying none.
+    pub expected_buffs: Vec<usize>,
 }
 
 /// One compiled [`crate::simdef::Rule`]: the action index it casts and its
@@ -503,6 +536,10 @@ pub struct SimPlan {
     /// Procs, compiled, in name-sorted order, with resolved effect
     /// targets.
     pub procs: Vec<CompiledProc>,
+    /// Condition name → index into [`SimPlan::buffs`] of the
+    /// [`EvUptime::Expected`] buff that drives it. [`compile`] guarantees
+    /// at most one driver per such condition.
+    pub condition_expected: BTreeMap<String, usize>,
     /// Rotation rules, compiled, in priority (source) order, with
     /// resolved action indices.
     pub rules: Vec<CompiledRule>,
@@ -539,6 +576,10 @@ struct SimSymbols<'a> {
     buff_remaining_base: usize,
     casts_base: usize,
     stacks_base: usize,
+    /// Names no sim expression may read: for each `ev_uptime: expected`
+    /// buff, its `buff.`/`buff_remaining.`/`stacks.` words and every
+    /// condition it drives, each mapped to that buff's name.
+    forbidden: BTreeMap<String, String>,
 }
 
 impl<'a> SimSymbols<'a> {
@@ -556,7 +597,19 @@ impl<'a> SimSymbols<'a> {
         // The two segment words sit AFTER the `stacks.*` range so every
         // pre-existing slot keeps its index.
         let segments_done_slot = stacks_base + buff_names.len();
+        let mut forbidden = BTreeMap::new();
+        for (name, b) in &simdef.buffs {
+            if b.ev_uptime == EvUptime::Expected {
+                for prefix in ["buff.", "buff_remaining.", "stacks."] {
+                    forbidden.insert(format!("{prefix}{name}"), name.clone());
+                }
+                for c in b.conditions.keys() {
+                    forbidden.insert(c.clone(), name.clone());
+                }
+            }
+        }
         SimSymbols {
+            forbidden,
             plan,
             time_slot: base,
             duration_slot: base + 1,
@@ -1111,6 +1164,109 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
+    // `ev_uptime: expected` constraints (see `BuffDef::ev_uptime`). The
+    // two READ constraints (buff words, driven conditions) are enforced
+    // where every sim expression compiles (`compile_sim`'s probe).
+    for (name, buff) in &simdef.buffs {
+        if buff.ev_uptime != EvUptime::Expected {
+            continue;
+        }
+        if buff.on_reapply != ReapplyPolicy::Refresh || buff.max_stacks != 1 {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{name}`: `ev_uptime: expected` requires on_reapply `refresh` \
+                     and max_stacks 1 (got {:?}, max_stacks {}) — stacking needs a \
+                     distribution over stack counts, not one probability",
+                    buff.on_reapply, buff.max_stacks
+                ),
+            });
+        }
+        if buff.tick_objective.as_ref().is_some_and(|t| t.snapshot) {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{name}`: `ev_uptime: expected` cannot have a snapshot \
+                     tick_objective — a rate captured per instance has no expected-state \
+                     reading (a live tick_objective is fine)"
+                ),
+            });
+        }
+        for c in buff.conditions.keys() {
+            if let Some(other) = simdef
+                .buffs
+                .iter()
+                .find(|(n, b)| *n != name && b.conditions.contains_key(c))
+                .map(|(n, _)| n)
+            {
+                return Err(PlanError {
+                    what: format!(
+                        "buff `{name}`: `ev_uptime: expected` cannot share its driven \
+                         condition `{c}` with buff `{other}` — the name-order precedence \
+                         rule has no exact fractional form"
+                    ),
+                });
+            }
+        }
+        for (i, c) in buff.contributions.iter().enumerate() {
+            if let Some(cond) = c.condition.as_deref() {
+                if buff.conditions.contains_key(cond) {
+                    return Err(PlanError {
+                        what: format!(
+                            "buff `{name}`: `ev_uptime: expected` cannot gate its \
+                             contribution {i} (bucket `{}`) on condition `{cond}`, which \
+                             this buff drives — under EV the gate reads the blended \
+                             P·v + (1 − P)·static, so the contribution would count \
+                             P × blend where MC counts it only while up (P × v): a \
+                             self-correlation with no exact expected form",
+                            c.bucket
+                        ),
+                    });
+                }
+            }
+        }
+        for (pname, p) in &simdef.procs {
+            let applies = |b: &str| {
+                p.apply_buff.as_deref() == Some(b)
+                    || p.effects
+                        .iter()
+                        .any(|e| matches!(e, EffectDef::ApplyBuff(x) if x == b))
+            };
+            if p.icd > 0.0 && applies(name) {
+                return Err(PlanError {
+                    what: format!(
+                        "buff `{name}`: `ev_uptime: expected` cannot be applied by proc \
+                         `{pname}`, which has icd {} > 0 — gated rolls are not \
+                         independent, so the product formula would not be exact",
+                        p.icd
+                    ),
+                });
+            }
+            for a in p
+                .cast_action
+                .iter()
+                .chain(p.effects.iter().filter_map(|e| match e {
+                    EffectDef::CastAction(a) => Some(a),
+                    _ => None,
+                }))
+            {
+                let free_applies = simdef.actions.get(a).is_some_and(|d| {
+                    d.apply_buff.iter().any(|b| b == name)
+                        || d.effects
+                            .iter()
+                            .any(|e| matches!(e, EffectDef::ApplyBuff(x) if x == name))
+                });
+                if free_applies {
+                    return Err(PlanError {
+                        what: format!(
+                            "buff `{name}`: `ev_uptime: expected` cannot be applied by a \
+                             free cast: proc `{pname}` free-casts action `{a}`, which \
+                             applies it — apply it from the proc directly"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     // Every cross-reference is validated — build the extended sim symbol
     // table and compile every expression.
     let syms = SimSymbols::new(plan, simdef);
@@ -1275,6 +1431,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             tick_objective,
             max_stacks: b.max_stacks,
             on_reapply: b.on_reapply,
+            ev_uptime: b.ev_uptime,
         });
     }
 
@@ -1315,6 +1472,17 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 })
                 .collect()
         };
+        let mut expected_buffs: Vec<usize> = effects
+            .iter()
+            .filter_map(|e| match e {
+                CompiledEffect::ApplyBuff(i) if buffs[*i].ev_uptime == EvUptime::Expected => {
+                    Some(*i)
+                }
+                _ => None,
+            })
+            .collect();
+        expected_buffs.sort_unstable();
+        expected_buffs.dedup();
         procs.push(CompiledProc {
             name: name.clone(),
             trigger: p.trigger,
@@ -1326,6 +1494,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .as_ref()
                 .map(|list| list.iter().map(|a| action_index(a)).collect()),
             rolls: p.rolls.unwrap_or(simdef.defaults.proc_rolls),
+            expected_buffs,
         });
     }
 
@@ -1346,7 +1515,17 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         });
     }
 
+    let mut condition_expected = BTreeMap::new();
+    for (i, b) in buffs.iter().enumerate() {
+        if b.ev_uptime == EvUptime::Expected {
+            for c in b.conditions.keys() {
+                condition_expected.insert(c.clone(), i);
+            }
+        }
+    }
+
     Ok(SimPlan {
+        condition_expected,
         sim_base: syms.sim_base(),
         segments_done_slot: syms.segments_done_slot,
         objective_base: syms.objective_base,
@@ -1458,6 +1637,7 @@ mod tests {
             "vuln_window".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(4.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -1470,6 +1650,7 @@ mod tests {
             "combustion".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(8.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -1487,6 +1668,7 @@ mod tests {
             "burning".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(6.0),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -2803,5 +2985,300 @@ mod tests {
             "got: {}",
             e.what
         );
+    }
+    // ---- ev_uptime (#33 item 4, task 1): field + fail-closed constraints ----
+
+    use crate::simdef::EvUptime;
+
+    /// The fixture with `combustion` opted in, legal on every axis: no
+    /// ICD on its proc, `vuln_window` (the fixture's only condition
+    /// driver) kept, and a rotation that reads no buff words.
+    fn ev_simdef() -> SimDef {
+        let mut sd = valid_simdef();
+        sd.buffs.get_mut("combustion").unwrap().ev_uptime = EvUptime::Expected;
+        sd.procs.get_mut("conflagrate").unwrap().icd = 0.0;
+        sd
+    }
+
+    fn ev_rotation(when: &str) -> Rotation {
+        Rotation {
+            extra: Default::default(),
+            rules: vec![Rule {
+                extra: Default::default(),
+                action: "fireball".into(),
+                when: Some(when.into()),
+            }],
+        }
+    }
+
+    fn ev_err(sd: &SimDef, rot: &Rotation) -> String {
+        compile(&toy_plan(), sd, rot).unwrap_err().what
+    }
+
+    fn assert_names(e: &str, needles: &[&str]) {
+        for n in needles {
+            assert!(e.contains(n), "expected `{n}` in: {e}");
+        }
+    }
+
+    #[test]
+    fn ev_uptime_parses_and_defaults() {
+        let absent: BuffDef = serde_json::from_str(r#"{ "duration": 4 }"#).unwrap();
+        assert_eq!(absent.ev_uptime, EvUptime::Discrete);
+        let exp: BuffDef =
+            serde_json::from_str(r#"{ "duration": 4, "ev_uptime": "expected" }"#).unwrap();
+        assert_eq!(exp.ev_uptime, EvUptime::Expected);
+        let back = serde_json::to_string(&exp).unwrap();
+        assert!(back.contains(r#""ev_uptime":"expected""#), "{back}");
+        let again: BuffDef = serde_json::from_str(&back).unwrap();
+        assert_eq!(again.ev_uptime, EvUptime::Expected);
+        // A typo is a serde error, not a silent Discrete.
+        assert!(
+            serde_json::from_str::<BuffDef>(r#"{ "duration": 4, "ev_uptime": "expectd" }"#)
+                .is_err()
+        );
+        // And the key is known, so it is not an unknown-key error.
+        assert!(BuffDef::KNOWN_KEYS.contains(&"ev_uptime"));
+    }
+
+    #[test]
+    fn ev_uptime_expected_compiles_for_a_legal_buff() {
+        let mut sd = ev_simdef();
+        // X drives its own condition; the fixture's other driver moves off it.
+        sd.buffs
+            .get_mut("combustion")
+            .unwrap()
+            .conditions
+            .insert("vulnerable".into(), 1.0);
+        sd.buffs.get_mut("vuln_window").unwrap().conditions.clear();
+        // X named twice in one proc's effects.
+        let p = sd.procs.get_mut("conflagrate").unwrap();
+        p.apply_buff = None;
+        p.effects = vec![
+            EffectDef::ApplyBuff("combustion".into()),
+            EffectDef::ApplyBuff("vuln_window".into()),
+            EffectDef::ApplyBuff("combustion".into()),
+        ];
+        // `objective.<o>` reads stay legal.
+        let sp = compile(&toy_plan(), &sd, &ev_rotation("objective.hit_after_dr > 0")).unwrap();
+        // BTreeMap order: burning 0, combustion 1, vuln_window 2.
+        assert_eq!(sp.buffs[1].ev_uptime, EvUptime::Expected);
+        assert_eq!(sp.buffs[0].ev_uptime, EvUptime::Discrete);
+        assert_eq!(sp.procs[0].expected_buffs, vec![1]);
+        assert_eq!(
+            sp.condition_expected,
+            BTreeMap::from([("vulnerable".to_string(), 1usize)])
+        );
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_stacking() {
+        for policy in [ReapplyPolicy::AddIndependent, ReapplyPolicy::AddRefreshAll] {
+            let mut sd = ev_simdef();
+            let b = sd.buffs.get_mut("combustion").unwrap();
+            b.max_stacks = 3;
+            b.on_reapply = policy;
+            let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+            assert_names(
+                &e,
+                &["buff `combustion`", "ev_uptime", "refresh", "max_stacks"],
+            );
+        }
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_snapshot_tick() {
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("combustion").unwrap().tick_objective =
+            Some(TickObjective::snapshot("dot_dps"));
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(&e, &["buff `combustion`", "ev_uptime", "snapshot"]);
+        // A live one is fine.
+        sd.buffs.get_mut("combustion").unwrap().tick_objective =
+            Some(TickObjective::live("dot_dps"));
+        compile(&toy_plan(), &sd, &ev_rotation("mana >= 40")).unwrap();
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_icd_proc() {
+        let mut sd = ev_simdef();
+        sd.procs.get_mut("conflagrate").unwrap().icd = 2.0;
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &[
+                "buff `combustion`",
+                "ev_uptime",
+                "proc `conflagrate`",
+                "icd",
+            ],
+        );
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_free_cast_application() {
+        let mut sd = ev_simdef();
+        sd.actions.get_mut("frost_nova").unwrap().apply_buff = vec!["combustion".into()];
+        let mut p = sd.procs["conflagrate"].clone();
+        p.apply_buff = None;
+        p.cast_action = Some("frost_nova".into());
+        sd.procs.insert("freecast".into(), p);
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &[
+                "buff `combustion`",
+                "ev_uptime",
+                "proc `freecast`",
+                "frost_nova",
+                "free cast",
+            ],
+        );
+        // Same through the explicit `effects` list on the action.
+        let a = sd.actions.get_mut("frost_nova").unwrap();
+        a.apply_buff.clear();
+        a.effects = vec![EffectDef::ApplyBuff("combustion".into())];
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(&e, &["buff `combustion`", "frost_nova", "free cast"]);
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_buff_word_reads() {
+        for word in [
+            "buff.combustion",
+            "buff_remaining.combustion",
+            "stacks.combustion",
+        ] {
+            // Rule `when`.
+            let sd = ev_simdef();
+            let e = ev_err(&sd, &ev_rotation(&format!("{word} > 0")));
+            assert_names(
+                &e,
+                &[
+                    "rotation rule",
+                    "when",
+                    word,
+                    "buff `combustion`",
+                    "ev_uptime",
+                ],
+            );
+            // Proc `chance`.
+            let mut sd = ev_simdef();
+            sd.procs.get_mut("conflagrate").unwrap().chance = format!("{word} * 0.1");
+            let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+            assert_names(
+                &e,
+                &["proc `conflagrate` chance", word, "buff `combustion`"],
+            );
+            // Another buff's `duration`.
+            let mut sd = ev_simdef();
+            sd.buffs.get_mut("burning").unwrap().duration = NumOrExpr::Expr(format!("2 + {word}"));
+            let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+            assert_names(&e, &["buff `burning` duration", word, "buff `combustion`"]);
+        }
+        // The buff's OWN duration reading itself is forbidden too.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("combustion").unwrap().duration =
+            NumOrExpr::Expr("min(12, buff_remaining.combustion + 8)".into());
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &["buff `combustion` duration", "buff_remaining.combustion"],
+        );
+        // A DISCRETE buff's words stay readable.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("combustion").unwrap().ev_uptime = EvUptime::Discrete;
+        compile(&toy_plan(), &sd, &ev_rotation("buff.combustion > 0")).unwrap();
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_driven_condition_reads() {
+        // vuln_window drives `vulnerable`.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("vuln_window").unwrap().ev_uptime = EvUptime::Expected;
+        let e = ev_err(&sd, &ev_rotation("vulnerable >= 1"));
+        assert_names(
+            &e,
+            &[
+                "rotation rule",
+                "vulnerable",
+                "buff `vuln_window`",
+                "ev_uptime",
+            ],
+        );
+        // Also in a proc chance.
+        sd.procs.get_mut("conflagrate").unwrap().chance = "vulnerable * 0.5".into();
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(&e, &["proc `conflagrate` chance", "vulnerable"]);
+        // `objective.<o>` reads stay legal even though the objective may
+        // depend on the condition.
+        sd.procs.get_mut("conflagrate").unwrap().chance = "0.3".into();
+        compile(&toy_plan(), &sd, &ev_rotation("objective.hit_after_dr > 0")).unwrap();
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_contribution_gated_on_own_condition() {
+        // combustion drives `vulnerable` (vuln_window moved off it) and
+        // gates its own contribution on it: under EV the gate reads the
+        // blend P·1 + (1 − P)·static, so the contribution counts P × blend
+        // where MC counts P × 1 — a self-correlation with no exact form.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("vuln_window").unwrap().conditions.clear();
+        let x = sd.buffs.get_mut("combustion").unwrap();
+        x.conditions.insert("vulnerable".into(), 1.0);
+        x.contributions[0].condition = Some("vulnerable".into());
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &[
+                "buff `combustion`",
+                "ev_uptime",
+                "bucket `indep`",
+                "condition `vulnerable`",
+                "drives",
+            ],
+        );
+        // Gating on a condition ANOTHER (discrete) buff drives stays legal.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("combustion").unwrap().contributions[0].condition =
+            Some("vulnerable".into());
+        compile(&toy_plan(), &sd, &ev_rotation("mana >= 40")).unwrap();
+        // And a Discrete buff gating on its own condition is untouched.
+        let mut sd = valid_simdef();
+        let v = sd.buffs.get_mut("vuln_window").unwrap();
+        v.contributions.push(Contribution {
+            bucket: "indep".into(),
+            value: 10.0,
+            event: None,
+            condition: Some("vulnerable".into()),
+        });
+        compile(&toy_plan(), &sd, &ev_rotation("mana >= 40")).unwrap();
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_shared_condition() {
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("vuln_window").unwrap().ev_uptime = EvUptime::Expected;
+        sd.buffs
+            .get_mut("combustion")
+            .unwrap()
+            .conditions
+            .insert("vulnerable".into(), 1.0);
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &[
+                "vulnerable",
+                "vuln_window",
+                "combustion",
+                "ev_uptime",
+                "share",
+            ],
+        );
+        // Sharing with a Discrete buff is equally refused (X is the one
+        // that opted in).
+        sd.buffs.get_mut("combustion").unwrap().ev_uptime = EvUptime::Discrete;
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(&e, &["vulnerable", "vuln_window", "combustion", "share"]);
     }
 }

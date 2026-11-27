@@ -193,6 +193,12 @@ pub struct BuffReport {
     /// replacement, and a weaker application rejected by `strongest`. In
     /// Monte Carlo mode this is the rounded arithmetic mean across runs,
     /// matching action cast and proc count reporting.
+    ///
+    /// For an `ev_uptime: expected` buff in EV mode it is the number of
+    /// ROLLS logged instead: one per cast event (landing) in which some
+    /// proc could apply it with nonzero probability, plus one per
+    /// guaranteed action-path application — not an expected application
+    /// count. In MC the knob does nothing and this is the plain count.
     pub applications: u64,
     /// Damage integrated from this buff's `tick_objective` over the whole
     /// simulation. Zero for a buff without a tick objective.
@@ -204,12 +210,18 @@ pub struct BuffReport {
     /// live instance (`active_seconds / total duration`). A 3-stack buff
     /// and a 1-stack buff both read `1.0` here — `avg_stacks` is where
     /// the count shows up.
+    ///
+    /// For an `ev_uptime: expected` buff in EV mode: `∫ P(up) dt / total
+    /// duration`, P being the roll log's probability the buff is up.
     pub uptime: f64,
     /// TIME-INTEGRATED mean stack count over the sim's total duration
     /// (`∫ stacks dt / total duration`), integrated the same way as
     /// `uptime` and over the same whole-sim window — not per phase, and
     /// not conditioned on the buff being up, so seconds at zero stacks
     /// drag the mean down exactly as they should.
+    ///
+    /// For an `ev_uptime: expected` buff in EV mode this equals `uptime`
+    /// (at most one stack: `∫ P dt / total duration`).
     pub avg_stacks: f64,
 }
 
