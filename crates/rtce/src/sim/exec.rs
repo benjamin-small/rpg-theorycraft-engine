@@ -4509,6 +4509,8 @@ mod tests {
         Rotation {
             extra: Default::default(),
             rules: vec![Rule {
+                interrupt: None,
+                interrupt_if: None,
                 extra: Default::default(),
                 action: "filler".into(),
                 when: None,
@@ -4624,6 +4626,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -4699,6 +4703,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spender".into(),
                     when: None,
@@ -4750,6 +4756,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "nova".into(),
                     when: None,
@@ -4833,11 +4841,15 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "spender".into(),
                         when: None,
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "generator".into(),
                         when: None,
@@ -4895,6 +4907,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "beam".into(),
                     when: None,
@@ -5059,11 +5073,15 @@ mod tests {
             extra: Default::default(),
             rules: vec![
                 Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "charge_gen".into(),
                     when: None,
                 },
                 Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -5138,6 +5156,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spam".into(),
                     when: None,
@@ -5240,6 +5260,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spender".into(),
                     when: None,
@@ -5380,11 +5402,15 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "empower".into(),
                         when: None,
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -5477,6 +5503,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "a".into(),
                     when: Some("buff.x == 1".into()),
@@ -5549,6 +5577,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "instant_nop".into(),
                     when: None,
@@ -5696,11 +5726,15 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "empower".into(),
                         when: None,
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -5781,6 +5815,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spam".into(),
                     when: None,
@@ -5867,6 +5903,8 @@ mod tests {
                 Rotation {
                     extra: Default::default(),
                     rules: vec![Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -6011,6 +6049,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -6132,6 +6172,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -6455,6 +6497,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spam".into(),
                     when: None,
@@ -6560,6 +6604,8 @@ mod tests {
                 let rotation = Rotation {
                     extra: Default::default(),
                     rules: vec![Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "spam".into(),
                         when: None,
@@ -6652,6 +6698,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "trigger".into(),
                     when: None,
@@ -6718,6 +6766,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spam".into(),
                     when: None,
@@ -6785,6 +6835,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spam".into(),
                     when: None,
@@ -6994,6 +7046,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -7142,6 +7196,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "strike".into(),
                     when: None,
@@ -7773,6 +7829,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -7879,6 +7937,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "spend".into(),
                     when: None,
@@ -8220,16 +8280,22 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "charge_gen".into(),
                         when: None,
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "nuke".into(),
                         when: Some("stacks.charge >= 3".into()),
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -8362,6 +8428,8 @@ mod tests {
                 );
             }
             let probe = |action: &str| Rule {
+                interrupt: None,
+                interrupt_if: None,
                 extra: Default::default(),
                 action: action.into(),
                 when: Some("time >= 2".into()),
@@ -8370,6 +8438,8 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "charge_gen".into(),
                         when: None,
@@ -8377,6 +8447,8 @@ mod tests {
                     probe("probe_remaining"),
                     probe("probe_flag"),
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -8775,11 +8847,15 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "opener".into(),
                         when: None,
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "filler".into(),
                         when: None,
@@ -9703,6 +9779,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: action.into(),
                     when: None,
@@ -10885,11 +10963,15 @@ mod tests {
                 extra: Default::default(),
                 rules: vec![
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "a".into(),
                         when: Some("casts.a == casts.b".into()),
                     },
                     Rule {
+                        interrupt: None,
+                        interrupt_if: None,
                         extra: Default::default(),
                         action: "b".into(),
                         when: None,
@@ -11455,6 +11537,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "filler".into(),
                     when: None,
@@ -14360,6 +14444,8 @@ mod tests {
             Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "venom".into(),
                     when: None,
@@ -14571,11 +14657,15 @@ mod tests {
                     extra: Default::default(),
                     rules: vec![
                         Rule {
+                            interrupt: None,
+                            interrupt_if: None,
                             extra: Default::default(),
                             action: "venom".into(),
                             when: None,
                         },
                         Rule {
+                            interrupt: None,
+                            interrupt_if: None,
                             extra: Default::default(),
                             action: "filler".into(),
                             when: None,
@@ -14679,6 +14769,8 @@ mod tests {
             let rotation = Rotation {
                 extra: Default::default(),
                 rules: vec![Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "shout".into(),
                     when: None,

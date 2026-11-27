@@ -1972,6 +1972,57 @@ pub struct Rule {
     /// always willing (subject to hard gates).
     #[serde(default)]
     pub when: Option<String>,
+    /// Whether a cast started by this rule is a player-cancellable cast:
+    /// at each NON-LAST segment boundary the player may drop it for a
+    /// higher-priority rule.
+    ///
+    /// - **Default:** absent, which means `false` unless `interrupt_if` is
+    ///   present, which implies `true`. (An `Option` so an explicit
+    ///   `false` is distinguishable from absent: explicit `false`
+    ///   together with `interrupt_if` is a compile error, a
+    ///   contradiction, never guessed.)
+    /// - **Instant:** the boundary: after that landing's whole
+    ///   transaction (damage, effects, proc rolls, `casts`,
+    ///   `segments_done`; `gain` is last-landing-only so it never fires at
+    ///   a non-last boundary), before the next segment starts. Evaluated
+    ///   on the plain effective build and phase. Deterministic: EV and MC
+    ///   behave identically.
+    /// - **Interactions:** only meaningful for a segmented action with at
+    ///   least 2 segments (otherwise there is no non-last boundary): any
+    ///   other action is a positioned compile error. Only rules ranked
+    ///   ABOVE this one (lower index) may cancel, each tested with the
+    ///   normal decision logic (`when`, then cooldown ready, then
+    ///   affordable now); the first eligible one wins, begins at the same
+    ///   instant, and the cancelled action's `cancelled` count rises.
+    ///   Same-rule and lower rules never cancel; a higher rule naming the
+    ///   same action is a different rule and may. Cost already paid and
+    ///   the cooldown armed at cast start stay; landed segments keep their
+    ///   damage, effects and proc rolls; unlanded segments contribute
+    ///   nothing, and action-level `gain` and `effects` (last-landing-only)
+    ///   are NOT applied. A boundary at the horizon instant does not cancel
+    ///   (the replacement could not begin).
+    /// - **No cast-id guard (yet):** a cancel happens before the next
+    ///   segment landing is scheduled, so no stale landing event can
+    ///   exist; the staleness guard is needed only once outside
+    ///   interruptions can land mid-segment (a later slice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt: Option<bool>,
+    /// Optional predicate gating the cancel: the rule's cast is
+    /// cancellable at a boundary only when this is truthy there.
+    ///
+    /// - **Default:** absent = always willing at every non-last boundary
+    ///   (when `interrupt` is true). Present implies `interrupt: true`.
+    /// - **Instant:** the segment boundary, after the landing's
+    ///   transaction, on the plain effective build and phase; reads
+    ///   `segments_done` / `segments_remain` as of that boundary (for
+    ///   example `segments_done` is 1 after the first landing). May read
+    ///   `objective.<name>` (the same legality as `when`, so the
+    ///   `ev_uptime` forbidden-read check applies).
+    /// - **Interactions:** same constraints as `interrupt` (segmented,
+    ///   at least 2 segments); a falsy value means no cancel at that
+    ///   boundary, and the cast simply continues. EV = MC.
+    #[serde(default)]
+    pub interrupt_if: Option<String>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this rule's position
@@ -1984,7 +2035,8 @@ impl Rule {
     /// The declared field names, for `sim::compile`'s unknown-key walk.
     /// Staleness here only degrades the did-you-mean, never
     /// correctness — see `config_keys`' module docs ("Staleness").
-    pub(crate) const KNOWN_KEYS: &'static [&'static str] = &["action", "when"];
+    pub(crate) const KNOWN_KEYS: &'static [&'static str] =
+        &["action", "when", "interrupt", "interrupt_if"];
 }
 
 /// Verbatim from docs/superpowers/specs/2026-07-22-p6-sequencing-design.md
