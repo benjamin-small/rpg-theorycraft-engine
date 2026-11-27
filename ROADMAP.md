@@ -130,7 +130,10 @@
   covers `on_non_crit`, event chances reading pre-branch stages,
   per-hit crit sampling (`crit_rolls`), `ActionDef::segments` with
   `SegmentLand` events and the generalized landing order, and
-  `objective.<name>` reads in sim timing fields.
+  `objective.<name>` reads in sim timing fields. #33 item 4 —
+  per-buff `ev_uptime: "expected"` (EV tracks P(up) from the exact roll
+  log) — is DONE (Unreleased; design:
+  `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`).
 - [ ] **Hit-level casts, second half** (design §6 slices 5, 7 and 8).
   Open debt, deliberately not yet built:
   - **Player cancels:** `Rule::interrupt` / `interrupt_if` at segment
@@ -150,7 +153,26 @@
     applies at t=1, the next settle at t=2 gives 50 where the true value
     is 60. The pin `resource_max_expr_refolds_against_the_applying_buff`
     passes only by coincidence (a cap increase from a full pool). Not
-    fixed here.
+    fixed here. `ev_uptime: "expected"` widens its reach: an expected
+    buff refolds at every P step (each roll and each age-out), so a
+    time-varying resource max/regen is re-sampled more often than under
+    `discrete`, and flipping the knob on one buff can move an UNRELATED
+    resource's numbers.
+  - **`ev_uptime` self-feeding is not rejected (Unreleased).** `P` is
+    exact only when the applying procs' q (chance, crit chance) and D do
+    not depend on the buff's own state. Shape (ii) (a contribution gated
+    on a condition the buff drives) fails closed at compile; shape (i)
+    (X → Plan → its own proc's crit chance / chance / D, e.g. "on crit,
+    gain X: +crit chance", or a proc chance reading an `objective.<o>`
+    that depends on X) is only documented — detecting it needs a
+    Plan-dependency analysis. EV's P is then mean-field, likely slightly
+    high against MC.
+  - **`ev_uptime` per-cast allocation on the EV loop (Unreleased).** An
+    expected buff costs about two full refolds per cast (the roll, then
+    its age-out), each cloning the effective `BuildState` / phase maps
+    (BTreeMap / Vec clones in `refresh_effective_state`). Opt-in, but it
+    breaks the zero-allocation hot-path rule for configs that use it;
+    fold in place into scratch if a bench asks.
   - A `when`/`cost` that reads an objective on a damaging action clones
     the overlay `BuildState` on every decision. It is opt-in and
     documented; memoize per (instant, world), or build the overlay

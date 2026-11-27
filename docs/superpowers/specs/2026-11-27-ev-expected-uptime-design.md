@@ -37,6 +37,23 @@ gives a static uptime and its blended crit damage, so it is not a new
 approximation. But it is stated on the field's rustdoc, so it is not a
 silent one. The convergence regression asserts uptime, not damage.
 
+**Where P itself stops being exact (call, after final review).** P is
+exact only when the applying procs' q (their chance and the crit chance
+it conditions on) and the duration D do NOT depend on X's own state. Two
+shapes break that:
+
+- (i) X feeds its own applying proc: X contributes to something that
+  feeds that proc's crit chance, chance or D (e.g. "on crit, gain X: +crit
+  chance"), or an applying proc's chance/D reads an `objective.<o>` that
+  depends on X. MC's rolls are then positively correlated with X being
+  up, and EV's P is a mean-field approximation (likely slightly high).
+  This is documented, not rejected: detecting it in general needs a
+  Plan-dependency analysis (ROADMAP open debt).
+- (ii) an X contribution whose `condition` is a condition X itself
+  drives. EV would count it as P × blend where MC counts P × v. This one
+  is local to the buff's own definition, so `sim::compile` rejects it
+  (constraint 6, below).
+
 ## Non-goals
 
 - MC is unchanged. The knob is EV-only and MC ignores it. MC already
@@ -215,6 +232,10 @@ An `ev_uptime: "expected"` buff must:
 5. not share a driven condition with any other buff. The name-order
    precedence rule has no exact fractional form, and fail-closed beats
    an independence guess.
+6. not gate one of its own contributions (`Contribution::condition`) on
+   a condition it drives (shape (ii) under Goals; added after final
+   review). The error names the buff, the contribution's bucket and the
+   condition.
 
 Under MC, all of these are still checked, so a config valid in one mode is
 valid in both. The knob itself does nothing in MC.

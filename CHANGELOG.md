@@ -21,9 +21,22 @@ until then, per semver's "anything goes" pre-1.0 clause).
   Fail-closed at compile: needs `refresh` with `max_stacks: 1`, no
   snapshot tick, no proc with `icd > 0` applying it, no free-cast
   application, no `buff.` / `buff_remaining.` / `stacks.` reads of it, and
-  no driven condition that a sim expression reads or another buff shares.
-  Design: `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`.
+  no driven condition that a sim expression reads or another buff shares,
+  and no contribution of its own gated (`condition`) on a condition it
+  drives. `P` is exact only when the applying procs' chance (and the crit
+  chance it conditions on) and the duration do not depend on the buff's
+  own state; a buff that feeds its own proc (e.g. "on crit, gain X" where
+  X grants crit chance, or a proc chance/duration reading an
+  `objective.<o>` that depends on X) gets a mean-field `P`, likely
+  slightly high against MC. That shape is not rejected (ROADMAP open
+  debt). Design: `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`.
   Guide: chapter 7, "Buffs that depend on luck".
+
+### Upgrade notes
+- Rust `BuffDef` struct literals need `ev_uptime: Default::default()`
+  (= `EvUptime::Discrete`): `BuffDef` is an exhaustive pub struct with no
+  `Default` impl, so the new field breaks every Rust literal of it and
+  the next release is a minor bump (0.9.0). JSON configs are unchanged.
 
 ## [0.8.0] — 2026-11-26
 

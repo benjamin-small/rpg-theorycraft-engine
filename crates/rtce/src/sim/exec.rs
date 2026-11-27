@@ -16294,6 +16294,116 @@ mod tests {
         }
 
         // --------------------------------------------------------------
+        // The ACTION path (`apply_buff` → a q = 1 log entry), q = 1 being
+        // binary: the same fixture as `..._q_one_equals_discrete` with the
+        // proc removed and `a` applying `x` itself, through BOTH spellings
+        // (`apply_buff: [..]` and `effects: [{apply_buff}]`). The whole
+        // serialized report must match discrete under both EventOrders;
+        // the discrete damage again proves the D = 2 window from `a`@k is
+        // coincident with `a`@(k+2)'s completion (same 2000 / 2800).
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_expected_action_path_q_one_equals_discrete() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"], "conditions": ["c"],
+                     "buckets": { "bonus": { "fold": "sum" } },
+                     "pipeline": [ { "name": "hit",
+                                     "expr": "dmg * (1 + c) * (1 + bonus / 100)" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let rot = r#"{ "rules": [ { "action": "a" }, { "action": "b" } ] }"#;
+            let simdef = |expected: bool, order: &str, applies: &str| {
+                format!(
+                    r#"{{ "defaults": {{ "event_order": "{order}" }},
+                         "actions": {{
+                           "a": {{ "cast_time": "1", "cooldown": 2, "damage": {{ "stats": {{}} }},
+                                   {applies} }},
+                           "b": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                         "buffs": {{ "x": {{ "duration": 2, "conditions": {{ "c": 1.0 }},
+                                         "contributions": [ {{ "bucket": "bonus", "value": 50.0 }} ]{} }} }},
+                         "damage_objective": "hit" }}"#,
+                    knob(expected)
+                )
+            };
+            for applies in [
+                r#""apply_buff": ["x"]"#,
+                r#""effects": [ { "apply_buff": "x" } ]"#,
+            ] {
+                let mut discrete_damage = Vec::new();
+                for order in ["scheduled", "completions_first"] {
+                    let exp = run_json(
+                        &plan,
+                        &simdef(true, order, applies),
+                        rot,
+                        10.0,
+                        Mode::Expected,
+                    );
+                    let dis = run_json(
+                        &plan,
+                        &simdef(false, order, applies),
+                        rot,
+                        10.0,
+                        Mode::Expected,
+                    );
+                    assert_eq!(dis.actions["a"].casts, 5, "{applies} {order}");
+                    assert_eq!(dis.buffs["x"].applications, 5, "{applies} {order}");
+                    assert_eq!(
+                        serde_json::to_string(&exp).unwrap(),
+                        serde_json::to_string(&dis).unwrap(),
+                        "{applies} {order}: the whole report"
+                    );
+                    discrete_damage.push(dis.total.total_damage);
+                }
+                assert_eq!(discrete_damage, [2000.0, 2800.0], "{applies}");
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Latest-wins ORDER on one landing: the action's own application
+        // (q = 1) is logged BEFORE the landing's proc rolls. `a` (1 s,
+        // cd 100: cast once, completes at t=1) applies `x` and is the
+        // only action `boost`/`spark` roll on (`b` is a utility filler).
+        // x's D = `4 - 3 * buff.y`:
+        //   1. `a`'s effect applies x with y down → D = 4, entry t_end 5,
+        //      q = 1;
+        //   2. on_cast `boost` (chance 1, discrete) applies y (100 s);
+        //   3. on_hit `spark` (chance 0.5) rolls x with y up → D = 1,
+        //      entry t_end 2, q = 0.5 — the LATER entry, so the action
+        //      entry's weight drops to 1 × (1 − 0.5) = 0.5.
+        // P = 1 on [1,2), 0.5 on [2,5), 0 after → ∫P = 1 + 1.5 = 2.5 over
+        // 10 s: uptime 0.25, two rolls. (Mutation contrasts: applying the
+        // action's effects AFTER the proc block reads y up for both, D = 1,
+        // → 0.1; deleting `apply_buff`'s expected branch → 0.05.)
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_action_entry_precedes_same_landing_proc_entry() {
+            let plan = minimal_plan();
+            let simdef = r#"{ "actions": {
+                   "a": { "cast_time": "1", "cooldown": 100, "damage": { "stats": {} },
+                          "apply_buff": ["x"] },
+                   "b": { "cast_time": "1" } },
+                 "buffs": { "x": { "duration": "4 - 3 * buff.y", "ev_uptime": "expected" },
+                            "y": { "duration": 100 } },
+                 "procs": {
+                   "boost": { "trigger": "on_cast", "chance": "1", "actions": ["a"],
+                              "apply_buff": "y" },
+                   "spark": { "trigger": "on_hit", "chance": "0.5", "actions": ["a"],
+                              "apply_buff": "x" } },
+                 "damage_objective": "hit" }"#;
+            let rot = r#"{ "rules": [ { "action": "a" }, { "action": "b" } ] }"#;
+            let r = run_json(&plan, simdef, rot, 10.0, Mode::Expected);
+            assert_eq!(r.actions["a"].casts, 1);
+            assert_eq!(r.buffs["x"].applications, 2, "action entry + proc entry");
+            assert!(
+                close(r.buffs["x"].uptime, 0.25),
+                "action entry first, proc entry latest: got {}",
+                r.buffs["x"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
         // Review Focus 1: only the expected buff's application leaves
         // the accumulator's crossing. `spark` applies `x` AND free-casts
         // `surge` (+1 mana); `strike` costs 1 mana from a 3-mana pool
@@ -17121,6 +17231,31 @@ mod tests {
                 (expected - steady).abs() < 0.01 && expected < steady,
                 "expected {expected} should sit just under the steady state {steady}"
             );
+            // The guide's derived figures, read off the DISCRETE EV report:
+            // one application every 4.35 casts (1 / 0.23), every 1.43 s
+            // (× 0.33 s), and 4 / 0.33 = 12.1 rolls live in a window.
+            let dis = run(
+                &plan,
+                &compile_json(&plan, &regression_simdef(false), rot),
+                &build,
+                &fight,
+                Mode::Expected,
+            )
+            .unwrap();
+            let casts = dis.actions["shot"].casts as f64;
+            let apps = dis.buffs["buff"].applications as f64;
+            let per_app = casts / apps;
+            assert!(
+                (per_app - 4.35).abs() < 0.01,
+                "one application per ~4.35 casts, got {per_app} ({casts}/{apps})"
+            );
+            assert!(
+                (per_app * 0.33 - 1.43).abs() < 0.01,
+                "~1.43 s between applications, got {}",
+                per_app * 0.33
+            );
+            let live: f64 = 4.0 / 0.33;
+            assert!((live - 12.1).abs() < 0.05, "~12.1 live rolls, got {live}");
         }
     }
 }

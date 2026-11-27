@@ -109,8 +109,8 @@ window whenever the accumulator crosses a whole application: a crit proc at
 chance 1 with a 23% crit rate adds 0.23 of an application per cast, so
 discrete EV applies the buff once every 4.35 casts. With 0.33-second casts
 and a 4-second duration that is every 1.43 seconds, always inside the
-previous window, and the buff reads as up the whole fight. The ceiling is
-`0.9945` over a 300-second fight.
+previous window, and the buff reads as up the whole fight: discrete
+reports `0.9945` over a 300-second fight.
 
 Monte Carlo disagrees, correctly. About `4 / 0.33 = 12.1` casts are live at
 any moment and the buff is down only if every one of them missed, so the
@@ -123,11 +123,24 @@ within three standard errors. The same arithmetic on ten 1-second casts at
 50% with a 2.5-second duration gives `0.69375` where discrete reports
 `0.8`. Use it for a high-uptime buff applied by a chance-based proc, when
 you read its uptime or its contributions in EV. It forbids what cannot be
-a probability (stacking, snapshot ticks, ICD procs, reading it as
-`buff.<name>`); the compiler names the offending line if you try. MC is
+a probability: stacking, snapshot ticks, ICD procs, applying it from a
+free cast (`cast_action`; apply it from the proc directly), reading it as
+`buff.<name>` / `buff_remaining.<name>` / `stacks.<name>`, reading a
+condition it drives from any sim expression, sharing a driven condition
+with another buff, and gating one of its own contributions on a condition
+it drives. The compiler names the offending buff if you try. MC is
 unaffected by the field. All of the numbers above are asserted by
 `ev_and_mc_agree_on_expected_uptime_regression` and
 `ev_uptime_expected_hand_worked_uptime`.
+
+One caveat on "exact": P is exact only when the applying procs' chance
+(and the crit chance it rides on) and the duration don't depend on the
+buff itself. A buff that feeds its own proc — "on crit, gain X", where X
+grants crit chance, or a proc chance or duration reading an
+`objective.<name>` that X moves — makes MC's rolls correlated with X being
+up, and EV's P becomes a mean-field approximation, likely a little high.
+The compiler does not catch that shape; keep such a buff `discrete` or
+check it against MC.
 
 ## When to use which
 

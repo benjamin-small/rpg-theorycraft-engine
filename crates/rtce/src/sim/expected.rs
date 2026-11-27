@@ -316,6 +316,18 @@ mod tests {
     }
 
     #[test]
+    fn q_independent_on_crit_and_on_non_crit_per_cast_c_ne_d() {
+        // C = 0.5 (on_crit per_cast miss), D = 0.8 (on_non_crit per_cast
+        // miss), k ~ Bin(2, 0.25): k=0 (0.5625) misses only the
+        // non-crit roll → 0.45; k=1 (0.375) both → 0.15; k=2 (0.0625)
+        // only the crit roll → 0.03125. no-fire 0.63125.
+        let mut nf = NoFire::ONE;
+        nf.add(Trigger::OnCrit, ProcRolls::PerCast, 0.5, 2);
+        nf.add(Trigger::OnNonCrit, ProcRolls::PerCast, 0.2, 2);
+        close(q_of(&nf, CritModel::Independent { p: 0.25, n: 2 }), 0.36875);
+    }
+
+    #[test]
     fn q_independent_n_one_matches_shared() {
         let mut nf = NoFire::ONE;
         nf.add(Trigger::OnCrit, ProcRolls::PerCast, 0.5, 1);

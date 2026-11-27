@@ -539,7 +539,7 @@ pub struct SimPlan {
     /// Condition name → index into [`SimPlan::buffs`] of the
     /// [`EvUptime::Expected`] buff that drives it. [`compile`] guarantees
     /// at most one driver per such condition.
-    pub condition_expected: std::collections::BTreeMap<String, usize>,
+    pub condition_expected: BTreeMap<String, usize>,
     /// Rotation rules, compiled, in priority (source) order, with
     /// resolved action indices.
     pub rules: Vec<CompiledRule>,
@@ -1204,6 +1204,23 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                          rule has no exact fractional form"
                     ),
                 });
+            }
+        }
+        for (i, c) in buff.contributions.iter().enumerate() {
+            if let Some(cond) = c.condition.as_deref() {
+                if buff.conditions.contains_key(cond) {
+                    return Err(PlanError {
+                        what: format!(
+                            "buff `{name}`: `ev_uptime: expected` cannot gate its \
+                             contribution {i} (bucket `{}`) on condition `{cond}`, which \
+                             this buff drives — under EV the gate reads the blended \
+                             P·v + (1 − P)·static, so the contribution would count \
+                             P × blend where MC counts it only while up (P × v): a \
+                             self-correlation with no exact expected form",
+                            c.bucket
+                        ),
+                    });
+                }
             }
         }
         for (pname, p) in &simdef.procs {
@@ -3197,6 +3214,45 @@ mod tests {
         // depend on the condition.
         sd.procs.get_mut("conflagrate").unwrap().chance = "0.3".into();
         compile(&toy_plan(), &sd, &ev_rotation("objective.hit_after_dr > 0")).unwrap();
+    }
+
+    #[test]
+    fn ev_uptime_expected_rejects_contribution_gated_on_own_condition() {
+        // combustion drives `vulnerable` (vuln_window moved off it) and
+        // gates its own contribution on it: under EV the gate reads the
+        // blend P·1 + (1 − P)·static, so the contribution counts P × blend
+        // where MC counts P × 1 — a self-correlation with no exact form.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("vuln_window").unwrap().conditions.clear();
+        let x = sd.buffs.get_mut("combustion").unwrap();
+        x.conditions.insert("vulnerable".into(), 1.0);
+        x.contributions[0].condition = Some("vulnerable".into());
+        let e = ev_err(&sd, &ev_rotation("mana >= 40"));
+        assert_names(
+            &e,
+            &[
+                "buff `combustion`",
+                "ev_uptime",
+                "bucket `indep`",
+                "condition `vulnerable`",
+                "drives",
+            ],
+        );
+        // Gating on a condition ANOTHER (discrete) buff drives stays legal.
+        let mut sd = ev_simdef();
+        sd.buffs.get_mut("combustion").unwrap().contributions[0].condition =
+            Some("vulnerable".into());
+        compile(&toy_plan(), &sd, &ev_rotation("mana >= 40")).unwrap();
+        // And a Discrete buff gating on its own condition is untouched.
+        let mut sd = valid_simdef();
+        let v = sd.buffs.get_mut("vuln_window").unwrap();
+        v.contributions.push(Contribution {
+            bucket: "indep".into(),
+            value: 10.0,
+            event: None,
+            condition: Some("vulnerable".into()),
+        });
+        compile(&toy_plan(), &sd, &ev_rotation("mana >= 40")).unwrap();
     }
 
     #[test]

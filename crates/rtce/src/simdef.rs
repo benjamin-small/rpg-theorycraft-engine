@@ -1547,9 +1547,30 @@ pub struct BuffDef {
     ///    reads stay legal;
     /// 7. not share a driven condition with any other buff — the
     ///    name-order precedence rule has no exact fractional form.
+    /// 8. not gate one of its own [`Contribution::condition`]s on a
+    ///    condition it drives in [`BuffDef::conditions`] — under EV that
+    ///    gate reads the blend, so the contribution would count
+    ///    `P × blend` where MC counts `P × v` (shape (ii) below).
     ///
     /// A proc applying an `expected` buff alongside other effects stays
     /// legal: its other effects keep firing discretely.
+    ///
+    /// # When `P` is exact
+    ///
+    /// `P` is exact only when the applying procs' `q` (their `chance`,
+    /// and the crit chance it conditions on) and the duration `D` do NOT
+    /// depend on this buff's own state. Two shapes break that:
+    ///
+    /// - (i) the buff feeds its own applying proc: it contributes to
+    ///   something that feeds that proc's crit chance, `chance` or `D`
+    ///   (e.g. "on crit, gain X: +crit chance"), or an applying proc's
+    ///   `chance` / `D` reads an `objective.<name>` that depends on it.
+    ///   MC's rolls are then positively correlated with the buff being
+    ///   up, and EV's `P` is a mean-field approximation (likely slightly
+    ///   high). This is NOT rejected — detecting it needs a
+    ///   `Plan`-dependency analysis (ROADMAP open debt).
+    /// - (ii) a contribution gated on a condition the buff itself drives:
+    ///   rejected at compile (constraint 8).
     ///
     /// # Differences from `discrete` worth knowing
     ///
