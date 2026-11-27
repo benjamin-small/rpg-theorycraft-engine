@@ -7,6 +7,13 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-27
+
+A bug-fix release: when a resource's `max` or `regen_per_sec` changes
+mid-fight, the new value no longer applies to the time before the
+change. Configs whose resource max/regen never changes mid-fight are
+byte-identical, and so are both consumers' numbers.
+
 ### Fixed
 - **A resource's new `max`/`regen_per_sec` no longer applies
   retroactively.** When a state change (a buff applied or expired, a
