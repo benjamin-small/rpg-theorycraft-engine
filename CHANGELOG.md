@@ -7,6 +7,16 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-27
+
+**Player cancels.** Version 0.10.0 lets a rotation rule allow a
+higher-priority rule to cancel its segmented cast at a segment boundary
+(design slice 5). This is the Rolling Slam shape: cancellable after the
+first hit. Each action's report gains a `cancelled` count. Every number
+for a config that doesn't use `interrupt` is unchanged. The new `Rule`
+fields change Rust struct literals (see Upgrade notes), so this is a
+minor release.
+
 ### Added
 - **Player cancels** (#33, design slice 5). `Rule::interrupt` (default
   false) lets a higher-priority rule cancel a segmented cast at a segment

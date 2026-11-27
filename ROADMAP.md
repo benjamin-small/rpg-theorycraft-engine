@@ -134,7 +134,7 @@
   per-buff `ev_uptime: "expected"` (EV tracks P(up) from the exact roll
   log) — is DONE (0.9.0; design:
   `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`).
-- **Player cancels, DONE (Unreleased).** `Rule::interrupt` /
+- **Player cancels, DONE (0.10.0).** `Rule::interrupt` /
   `interrupt_if` at segment boundaries and the `ActionReport.cancelled`
   column (design §6 slice 5; plan
   `docs/superpowers/plans/2026-11-27-slice5-player-cancels.md`).
@@ -179,7 +179,7 @@
   - Free-casting a segmented action, which is a compile error today.
   - SimC-style `chain` / `early_chain_if`.
   - Refund-on-cancel knobs.
-  - Open debt from player cancels (Unreleased): `interrupt_if` is pinned
+  - Open debt from player cancels (0.10.0): `interrupt_if` is pinned
     for `segments_done` and `objective.<name>` reads, but not for
     `segments_remain`. `when` on a higher rule reads the boundary's
     `segments_done`, not 0 (documented on `Rule::interrupt` and
@@ -196,7 +196,7 @@
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
       actually touches `crates/rtce-testkit/`.
-- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, 0.8.0, 0.9.0, and 0.9.1 are
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, 0.8.0, 0.9.0, 0.9.1, and 0.10.0 are
       also live; the tag-driven trusted-publishing workflow verifies the tag,
       changelog, formatting, clippy, tests, and package contents before it
       publishes missing crate versions.
