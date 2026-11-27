@@ -249,6 +249,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::compile::{CompiledEffect, CompiledValue, SimPlan};
+use super::expected::{q_of, CritModel, NoFire, RollLog};
 use super::report::{
     ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
 };
@@ -256,7 +257,7 @@ use crate::build::BuildState;
 use crate::plan::{EvalScratch, Plan, PlanError};
 use crate::rng::{mix_seed, Pcg32};
 use crate::scenario::{Phase, Scenario};
-use crate::simdef::{EventOrder, Measure, ProcRolls, ReapplyPolicy, Trigger};
+use crate::simdef::{EvUptime, EventOrder, Measure, ProcRolls, ReapplyPolicy, Trigger};
 
 /// Execution fidelity for [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -701,6 +702,14 @@ enum Event {
     /// bumps it, making this event stale — processed as a no-op; see
     /// [`Sim::handle_buff_expire`]).
     BuffExpire { buff: usize, generation: u64 },
+    /// EV only: the earliest live entry of `ev_uptime: expected` buff
+    /// `buff`'s roll log ages out at this time, IF the buff's
+    /// `age_generation` still equals `generation` (a reschedule since
+    /// bumps it — see [`Sim::handle_expected_age_out`]). Pushed with the
+    /// STORED seq of the entry it ages out, so it orders against a
+    /// coincident event exactly as that roll's discrete `BuffExpire`
+    /// would.
+    ExpectedAgeOut { buff: usize, generation: u64 },
     /// The scenario crosses into phase index `phase` at this time.
     PhaseBoundary { phase: usize },
     /// Nothing inherently happens — this entry exists purely to force a
@@ -741,7 +750,13 @@ fn class_rank(event: &Event, order: EventOrder) -> u8 {
             // A segment landing is a (partial) completion: it ranks
             // with `CastComplete`.
             Event::CastComplete { .. } | Event::SegmentLand { .. } => 0,
-            Event::BuffExpire { .. } | Event::PhaseBoundary { .. } | Event::Wake => 1,
+            // An expected buff's age-out is the EV twin of its discrete
+            // `BuffExpire`: the same class, so the two realizations order
+            // identically against a coincident completion.
+            Event::BuffExpire { .. }
+            | Event::ExpectedAgeOut { .. }
+            | Event::PhaseBoundary { .. }
+            | Event::Wake => 1,
         },
     }
 }
@@ -882,6 +897,51 @@ struct BuffRt {
     stack_seconds: f64,
     /// Start of the span `stack_seconds` has not yet absorbed.
     stack_since: f64,
+    /// EV + `ev_uptime: expected` only (empty and unread otherwise): the
+    /// live roll log whose weights sum to [`BuffRt::p`]. Such a buff has
+    /// no `instances` and never enters `active_buff_set` — it is not
+    /// binary.
+    log: RollLog,
+    /// The cached P(up) right now — `log.p_at(now)` as of the last
+    /// change, clamped to `[0, 1]`. Changes only inside a
+    /// `flush_before_change` / `refresh_after_change` transaction
+    /// ([`Sim::set_expected_p`]), so every integrator sees a
+    /// piecewise-constant value.
+    p: f64,
+    /// `∫ P dt` over every span already absorbed — the expected buff's
+    /// report `uptime` and `avg_stacks` numerator.
+    p_seconds: f64,
+    /// Start of the span `p_seconds` has not yet absorbed.
+    p_since: f64,
+    /// Bumped on every age-out RESCHEDULE, so a superseded
+    /// [`Event::ExpectedAgeOut`] recognizes itself as stale.
+    age_generation: u64,
+    /// `(t_end, seq)` of the live (non-stale) age-out on the heap, if
+    /// any — so a roll that does not move the log's earliest entry
+    /// pushes nothing.
+    age_scheduled: Option<(f64, u64)>,
+}
+
+/// One expected buff's per-cast-event accumulator in the EV roll block
+/// ([`Sim::land`]): the no-fire products over every proc that considered
+/// this cast, the duration captured at the first of them, and the
+/// measured hit count a `per_hit` crit-gated proc rolled. Reset after
+/// the block logs it — preallocated per buff, never per cast.
+#[derive(Clone, Copy)]
+struct ExpectedRoll {
+    touched: bool,
+    nf: NoFire,
+    duration: f64,
+    hits: u32,
+}
+
+impl ExpectedRoll {
+    const IDLE: ExpectedRoll = ExpectedRoll {
+        touched: false,
+        nf: NoFire::ONE,
+        duration: 0.0,
+        hits: 1,
+    };
 }
 
 /// Per-proc runtime state. `acc` is EV-accumulator-only (untouched in MC
@@ -1119,6 +1179,20 @@ struct Sim<'a> {
     condition_accum: BTreeMap<String, CondAccum>,
 
     total_damage: f64,
+
+    /// `ev_expected[bi]`: buff `bi` is `ev_uptime: expected` AND this is
+    /// an EV run. All `false` in Monte Carlo, where the knob does nothing.
+    ev_expected: Vec<bool>,
+    /// The indices with `ev_expected` set, in index order (empty in MC).
+    expected_list: Vec<usize>,
+    /// Per-buff scratch for the EV roll block — see [`ExpectedRoll`].
+    expected_rolls: Vec<ExpectedRoll>,
+
+    /// Test-only bookkeeping: live age-outs pushed / handled.
+    #[cfg(test)]
+    age_outs_scheduled: u32,
+    #[cfg(test)]
+    age_outs_handled: u32,
 }
 
 impl<'a> Sim<'a> {
@@ -1149,6 +1223,12 @@ impl<'a> Sim<'a> {
             }
         }
         let condition_names: Vec<String> = condition_set.into_iter().collect();
+        let ev_expected: Vec<bool> = sim_plan
+            .buffs
+            .iter()
+            .map(|b| rng.is_none() && b.ev_uptime == EvUptime::Expected)
+            .collect();
+        let expected_list: Vec<usize> = (0..n_buffs).filter(|&bi| ev_expected[bi]).collect();
 
         let mut sim = Sim {
             plan,
@@ -1193,6 +1273,12 @@ impl<'a> Sim<'a> {
                     tick_rate: 0.0,
                     stack_seconds: 0.0,
                     stack_since: 0.0,
+                    log: RollLog::default(),
+                    p: 0.0,
+                    p_seconds: 0.0,
+                    p_since: 0.0,
+                    age_generation: 0,
+                    age_scheduled: None,
                 })
                 .collect(),
             active_buff_set: Vec::new(),
@@ -1212,6 +1298,13 @@ impl<'a> Sim<'a> {
             condition_names,
             condition_accum: BTreeMap::new(),
             total_damage: 0.0,
+            ev_expected,
+            expected_list,
+            expected_rolls: vec![ExpectedRoll::IDLE; n_buffs],
+            #[cfg(test)]
+            age_outs_scheduled: 0,
+            #[cfg(test)]
+            age_outs_handled: 0,
         };
 
         for name in sim.condition_names.clone() {
@@ -1281,16 +1374,27 @@ impl<'a> Sim<'a> {
     /// enforced with a MEANINGFUL message (naming the field and the
     /// instant, rather than "the queue went backwards").
     fn schedule(&mut self, time: f64, event: Event) -> Result<(), PlanError> {
+        self.seq += 1;
+        self.schedule_with_seq(time, event, self.seq)
+    }
+
+    /// [`Sim::schedule`] with a caller-chosen `seq` and no `seq`
+    /// consumption: the push itself, finiteness-checked the same way.
+    /// [`Sim::schedule`] consumes the next `seq` and delegates here; the
+    /// one other caller is the expected-uptime age-out, which reuses the
+    /// seq its roll-log entry consumed at the roll (see
+    /// [`Event::ExpectedAgeOut`]) — duplicate keys on the heap are fine,
+    /// since a stale duplicate is a generation-guarded no-op.
+    fn schedule_with_seq(&mut self, time: f64, event: Event, seq: u64) -> Result<(), PlanError> {
         if !time.is_finite() || time < 0.0 {
             return Err(PlanError {
                 what: format!("sim: scheduled a non-finite/negative time ({time}) for {event:?}"),
             });
         }
-        self.seq += 1;
         self.heap.push(QueueItem {
             time: FTime(time),
             rank: class_rank(&event, self.sim_plan.event_order),
-            seq: self.seq,
+            seq,
             event,
         });
         Ok(())
@@ -1387,6 +1491,18 @@ impl<'a> Sim<'a> {
         let now = self.time;
         self.flush_conditions(now);
         self.flush_ticks(now);
+        self.flush_expected(now);
+    }
+
+    /// Absorb each expected buff's elapsed span into `∫ P dt` at its
+    /// CURRENT P, then restart the span at `now`. A no-op in MC (the
+    /// list is empty there) and for a config with no expected buff.
+    fn flush_expected(&mut self, now: f64) {
+        for &bi in &self.expected_list {
+            let b = &mut self.buffs[bi];
+            b.p_seconds += (now - b.p_since) * b.p;
+            b.p_since = now;
+        }
     }
 
     fn flush_conditions(&mut self, now: f64) {
@@ -1612,16 +1728,16 @@ impl<'a> Sim<'a> {
     /// and sequential on both paths — the P8c scope boundary.
     fn apply_buff(&mut self, bi: usize, world: Option<&WorldSnapshot>) -> Result<(), PlanError> {
         let now = self.time;
-        self.refresh_time_varying_slots();
-        if self.sim_plan.buffs[bi].duration.reads_objectives() {
-            self.fill_objective_slots(ObjectiveWorld::Plain, "at buff application")?;
+        let duration = self.eval_buff_duration(bi)?;
+        if self.ev_expected[bi] {
+            // An EV `ev_uptime: expected` buff on an ACTION path (the
+            // proc path never reaches here — `run_proc_effects` skips
+            // it): a guaranteed application, logged as a q = 1 roll in
+            // place of the instance logic. Nothing below applies to it
+            // (no instances, no snapshot rate: `sim::compile` rejects a
+            // snapshot tick on such a buff).
+            return self.log_expected(bi, 1.0, duration);
         }
-        let duration = self.eval_quantity(&self.sim_plan.buffs[bi].duration, || {
-            format!(
-                "buff `{}` duration at application (t={now})",
-                self.sim_plan.buffs[bi].name
-            )
-        })?;
         let expire_at = now + duration;
 
         // The incoming instance's SNAPSHOT rate, captured here — at the
@@ -1828,6 +1944,113 @@ impl<'a> Sim<'a> {
             },
         )?;
         Ok(())
+    }
+
+    /// Evaluate buff `bi`'s `duration` NOW, against the live slot array —
+    /// the one evaluation both a discrete application ([`Sim::apply_buff`])
+    /// and an expected-uptime roll ([`Sim::roll_procs_ev`]) use, so the
+    /// two read D identically. Fail-closed on a negative/non-finite value.
+    fn eval_buff_duration(&mut self, bi: usize) -> Result<f64, PlanError> {
+        let now = self.time;
+        self.refresh_time_varying_slots();
+        if self.sim_plan.buffs[bi].duration.reads_objectives() {
+            self.fill_objective_slots(ObjectiveWorld::Plain, "at buff application")?;
+        }
+        self.eval_quantity(&self.sim_plan.buffs[bi].duration, || {
+            format!(
+                "buff `{}` duration at application (t={now})",
+                self.sim_plan.buffs[bi].name
+            )
+        })
+    }
+
+    /// Log one roll of EV `ev_uptime: expected` buff `bi`: probability
+    /// `q` (clamped to `[0, 1]` — float error in [`q_of`] can land a
+    /// hair outside) that this cast event applies it, covering `duration`
+    /// seconds from now. Consumes ONE `seq` — the one a discrete
+    /// application's `BuffExpire` would — and stores it on the entry, so
+    /// the eventual age-out orders as that expiry would. Then P moves
+    /// under the usual transaction ([`Sim::set_expected_p`]) and the
+    /// age-out is rescheduled if the log's earliest entry changed.
+    /// Counts as one `applications` (the report's documented reading).
+    fn log_expected(&mut self, bi: usize, q: f64, duration: f64) -> Result<(), PlanError> {
+        debug_assert!(
+            self.ev_expected[bi],
+            "only an EV expected buff has a roll log"
+        );
+        let q = q.clamp(0.0, 1.0);
+        self.seq += 1;
+        let seq = self.seq;
+        let t_end = self.time + duration;
+        self.buffs[bi].applications += 1;
+        self.buffs[bi].log.push(t_end, q, seq);
+        self.set_expected_p(bi)?;
+        self.reschedule_age_out(bi)
+    }
+
+    /// Recompute `bi`'s cached P from its log at `now`. A changed value
+    /// goes through the state-change transaction (flush the OLD P's
+    /// elapsed span → set → refold), exactly as a discrete application
+    /// or expiry would; an unchanged one skips it, as a discrete
+    /// `refresh` that moves no count does. (Dropping a zero-weight entry
+    /// leaves the sum bit-identical, so q = 1 refreshes stay
+    /// transaction-free like their discrete twins.)
+    fn set_expected_p(&mut self, bi: usize) -> Result<(), PlanError> {
+        let p = self.buffs[bi].log.p_at(self.time).clamp(0.0, 1.0);
+        if p == self.buffs[bi].p {
+            return Ok(());
+        }
+        self.flush_before_change();
+        self.buffs[bi].p = p;
+        self.refresh_after_change()
+    }
+
+    /// Keep exactly one live [`Event::ExpectedAgeOut`] for `bi`, at its
+    /// log's earliest `t_end`, carrying THAT entry's stored seq. Pushes
+    /// nothing when the live one already targets it (a roll that does
+    /// not shorten the head) or the log is empty.
+    fn reschedule_age_out(&mut self, bi: usize) -> Result<(), PlanError> {
+        let next = self.buffs[bi].log.next_age_out();
+        if next == self.buffs[bi].age_scheduled {
+            return Ok(());
+        }
+        self.buffs[bi].age_scheduled = next;
+        let Some((t_end, seq)) = next else {
+            return Ok(());
+        };
+        self.buffs[bi].age_generation += 1;
+        let generation = self.buffs[bi].age_generation;
+        #[cfg(test)]
+        {
+            self.age_outs_scheduled += 1;
+        }
+        self.schedule_with_seq(
+            t_end,
+            Event::ExpectedAgeOut {
+                buff: bi,
+                generation,
+            },
+            seq,
+        )
+    }
+
+    /// The age-out sweep for expected buff `bi`: drop EVERY entry with
+    /// `t_end <= now` in one call (so entries ending together drain
+    /// once), move P under the transaction, and reschedule at the next
+    /// earliest entry with its stored seq. A stale `generation` no-ops.
+    fn handle_expected_age_out(&mut self, bi: usize, generation: u64) -> Result<(), PlanError> {
+        if self.buffs[bi].age_generation != generation {
+            return Ok(()); // superseded by a reschedule since.
+        }
+        #[cfg(test)]
+        {
+            self.age_outs_handled += 1;
+        }
+        self.buffs[bi].age_scheduled = None;
+        let now = self.time;
+        self.buffs[bi].log.drop_expired(now);
+        self.set_expected_p(bi)?;
+        self.reschedule_age_out(bi)
     }
 
     /// Run `action`'s compiled effects list — every buff it names in
@@ -2820,6 +3043,10 @@ impl<'a> Sim<'a> {
             }
         } else {
             let shared = CritWeight::Shared(1.0);
+            // The crit model the expected-uptime q conditions on — the
+            // same `crit_chance` / `independent_n` the weights below use.
+            // A utility cast rolls `on_cast` only: no crit at all.
+            let mut crit_model = CritModel::None;
             if first {
                 self.roll_procs_ev(Trigger::OnCast, shared, action, None)?;
             }
@@ -2848,10 +3075,19 @@ impl<'a> Sim<'a> {
                         CritWeight::Shared(1.0 - crit_chance),
                     ),
                 };
+                let p = crit_chance.clamp(0.0, 1.0);
+                crit_model = match independent_n {
+                    // `hits` is capped at PER_HIT_ROLL_LIMIT (whole_hits).
+                    Some(hits) => CritModel::Independent { p, n: hits as u32 },
+                    // `n` is filled per buff from its per_hit rolls.
+                    None => CritModel::Shared { p, n: 1 },
+                };
                 self.roll_procs_ev(Trigger::OnHit, shared, action, Some(d))?;
                 self.roll_procs_ev(Trigger::OnCrit, on_crit, action, Some(d))?;
                 self.roll_procs_ev(Trigger::OnNonCrit, on_non_crit, action, Some(d))?;
             }
+            // One log entry per expected buff for this landing (#33 item 4).
+            self.log_expected_rolls(crit_model)?;
         }
         if last {
             // The segmented cast is over: only NOW, after the last
@@ -3265,6 +3501,11 @@ impl<'a> Sim<'a> {
                 self.fill_objective_slots(ObjectiveWorld::Plain, "at a proc roll")?;
             }
             let base = self.sim_plan.procs[pi].chance.eval(&self.scratch.slots);
+            if !self.sim_plan.procs[pi].expected_buffs.is_empty() {
+                // Before the accumulator step: D is captured at the first
+                // contributor, before this proc's own fire can move state.
+                self.add_expected_roll(pi, trigger, base, rolls)?;
+            }
             let (chance, rolls) = match weight {
                 CritWeight::Shared(w) => (base * w, rolls),
                 CritWeight::Independent { p_hit, hits } => {
@@ -3310,6 +3551,86 @@ impl<'a> Sim<'a> {
                 if self.procs[pi].acc >= 1.0 - PROC_FIRE_EPSILON {
                     self.fire_proc(pi, now)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold proc `pi`'s roll (`trigger`, its resolved [`ProcRolls`], the
+    /// UNWEIGHTED `base` chance, and its roll count `rolls`) into the
+    /// per-cast-event [`ExpectedRoll`] of every EV expected buff it
+    /// applies. The crit weighting is NOT applied here: [`q_of`]
+    /// conditions on the crit model the block builds once per landing.
+    /// The first contributor to a buff in this block captures its D (at
+    /// this roll's instant, before the accumulator step).
+    ///
+    /// Fail-closed on a non-finite `base`: the accumulator path silently
+    /// never crosses on a NaN, but a log entry would carry it into P, so
+    /// here it is a positioned error naming the proc, the buff and the
+    /// instant.
+    fn add_expected_roll(
+        &mut self,
+        pi: usize,
+        trigger: Trigger,
+        base: f64,
+        rolls: u64,
+    ) -> Result<(), PlanError> {
+        let sim_plan = self.sim_plan;
+        let proc_def = &sim_plan.procs[pi];
+        if !base.is_finite() {
+            return Err(PlanError {
+                what: format!(
+                    "proc `{}` chance evaluated to {base} at a proc roll (t={}): it applies \
+                     `ev_uptime: expected` buff `{}`, whose roll probability must be finite",
+                    proc_def.name, self.time, sim_plan.buffs[proc_def.expected_buffs[0]].name
+                ),
+            });
+        }
+        // `rolls` is capped at PER_HIT_ROLL_LIMIT (whole_hits).
+        let n = rolls as u32;
+        for &bi in &proc_def.expected_buffs {
+            if !self.expected_rolls[bi].touched {
+                let duration = self.eval_buff_duration(bi)?;
+                self.expected_rolls[bi] = ExpectedRoll {
+                    touched: true,
+                    duration,
+                    ..ExpectedRoll::IDLE
+                };
+            }
+            let r = &mut self.expected_rolls[bi];
+            r.nf.add(trigger, proc_def.rolls, base, n);
+            if proc_def.rolls == ProcRolls::PerHit
+                && matches!(trigger, Trigger::OnCrit | Trigger::OnNonCrit)
+            {
+                // The measured hit count a shared crit outcome gates.
+                r.hits = n;
+            }
+        }
+        Ok(())
+    }
+
+    /// After one landing's four EV trigger loops: turn each touched
+    /// expected buff's [`ExpectedRoll`] into ONE log entry — `q =`
+    /// [`q_of`] under `crit` (a `Shared` model takes the buff's recorded
+    /// hit count) — and reset the scratch. A `q` of 0 logs nothing
+    /// (exact: it would multiply every older weight by 1), so a cast no
+    /// proc can fire from leaves no entry and schedules no age-out.
+    /// Buff-index order, so seq assignment is deterministic.
+    fn log_expected_rolls(&mut self, crit: CritModel) -> Result<(), PlanError> {
+        for k in 0..self.expected_list.len() {
+            let bi = self.expected_list[k];
+            let r = self.expected_rolls[bi];
+            if !r.touched {
+                continue;
+            }
+            self.expected_rolls[bi] = ExpectedRoll::IDLE;
+            let crit = match crit {
+                CritModel::Shared { p, .. } => CritModel::Shared { p, n: r.hits },
+                other => other,
+            };
+            let q = q_of(&r.nf, crit).clamp(0.0, 1.0);
+            if q > 0.0 {
+                self.log_expected(bi, q, r.duration)?;
             }
         }
         Ok(())
@@ -3602,6 +3923,11 @@ impl<'a> Sim<'a> {
                 // overlay (see `Sim::eval_objective`). After an earlier
                 // entry in THIS list, "ambient" is the refolded state
                 // that entry left behind — sequential, not frozen.
+                // An EV expected buff's application is off the
+                // accumulator's crossing: the roll block logged it per
+                // cast event (see `Sim::land`). The proc's OTHER effects
+                // still fire here, discretely.
+                CompiledEffect::ApplyBuff(bi) if self.ev_expected[bi] => {}
                 CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
                 CompiledEffect::CastAction(ai) => self.free_cast(ai)?,
             }
@@ -3720,6 +4046,9 @@ impl<'a> Sim<'a> {
                 Event::BuffExpire { buff, generation } => {
                     self.handle_buff_expire(buff, generation)?
                 }
+                Event::ExpectedAgeOut { buff, generation } => {
+                    self.handle_expected_age_out(buff, generation)?
+                }
                 Event::PhaseBoundary { phase } => {
                     self.flush_before_change();
                     self.current_phase = phase;
@@ -3761,6 +4090,10 @@ impl<'a> Sim<'a> {
             Event::BuffExpire { buff, .. } => {
                 format!("expiry of buff `{}`", self.sim_plan.buffs[buff].name)
             }
+            Event::ExpectedAgeOut { buff, .. } => format!(
+                "roll-log age-out of `ev_uptime: expected` buff `{}`",
+                self.sim_plan.buffs[buff].name
+            ),
             Event::PhaseBoundary { phase } => {
                 format!("phase boundary into `{}`", self.scenario.phases[phase].name)
             }
@@ -3785,6 +4118,7 @@ impl<'a> Sim<'a> {
         self.time = now;
         self.flush_conditions(now);
         self.flush_ticks(now);
+        self.flush_expected(now);
         // Index iteration rather than `iter_mut` so the `∫ stacks dt`
         // formula lives in `flush_stacks` alone — the borrow checker was
         // the only reason it was ever written out twice.
@@ -3846,10 +4180,16 @@ impl<'a> Sim<'a> {
         for (bi, b) in self.sim_plan.buffs.iter().enumerate() {
             let rt = &self.buffs[bi];
             let (uptime, avg_stacks) = if self.duration > 0.0 {
-                (
-                    rt.active_seconds / self.duration,
-                    rt.stack_seconds / self.duration,
-                )
+                if self.ev_expected[bi] {
+                    // At most one stack: both read `∫ P dt / duration`.
+                    let u = rt.p_seconds / self.duration;
+                    (u, u)
+                } else {
+                    (
+                        rt.active_seconds / self.duration,
+                        rt.stack_seconds / self.duration,
+                    )
+                }
             } else {
                 (0.0, 0.0)
             };
@@ -15653,6 +15993,410 @@ mod tests {
             );
             assert_eq!(read.actions["strike"].casts, ev.actions["strike"].casts);
             assert!(close(read.total.total_damage, ev.total.total_damage));
+        }
+    }
+
+    // ==================================================================
+    // #33 item 4, task 3 — `ev_uptime: "expected"` in the executor: the
+    // EV roll log, the cached P, and the age-out event. Readers
+    // (conditions, contributions, live ticks) are task 4; these pins
+    // read only the buff report and the run's other outputs.
+    // ==================================================================
+    mod ev_uptime_exec {
+        use super::*;
+        use crate::scenario::Scenario;
+
+        fn dummy(seconds: f64) -> Scenario {
+            serde_json::from_str(&format!(
+                r#"{{ "phases": [ {{ "name": "p", "weight": {seconds} }} ] }}"#
+            ))
+            .unwrap()
+        }
+
+        /// `, "ev_uptime": "expected"` or nothing — the one knob every
+        /// fixture below is run both ways on.
+        fn knob(expected: bool) -> &'static str {
+            if expected {
+                r#", "ev_uptime": "expected""#
+            } else {
+                ""
+            }
+        }
+
+        fn compile_json(plan: &Plan, simdef_json: &str, rotation_json: &str) -> SimPlan {
+            let simdef: SimDef = serde_json::from_str(simdef_json).unwrap();
+            let rotation: Rotation = serde_json::from_str(rotation_json).unwrap();
+            sim_compile(plan, &simdef, &rotation).unwrap()
+        }
+
+        fn run_json(
+            plan: &Plan,
+            simdef_json: &str,
+            rotation_json: &str,
+            s: f64,
+            mode: Mode,
+        ) -> SimReport {
+            let sp = compile_json(plan, simdef_json, rotation_json);
+            run(plan, &sp, &minimal_build(), &dummy(s), mode).unwrap()
+        }
+
+        const STRIKE_ROT: &str = r#"{ "rules": [ { "action": "strike" } ] }"#;
+
+        /// `strike`: 1 s cast, damaging (`hit = dmg`), one `on_hit` proc
+        /// at `chance` applying `x` (duration `d`).
+        fn strike_simdef(expected: bool, chance: &str, d: f64) -> String {
+            format!(
+                r#"{{ "actions": {{ "strike": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                     "buffs": {{ "x": {{ "duration": {d}{} }} }},
+                     "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "{chance}",
+                                            "apply_buff": "x" }} }},
+                     "damage_objective": "hit" }}"#,
+                knob(expected)
+            )
+        }
+
+        /// Runs the EV loop and hands back the `Sim` itself, for the pins
+        /// that inspect the age-out bookkeeping rather than the report.
+        fn ev_sim<'a>(
+            plan: &'a Plan,
+            sp: &'a SimPlan,
+            build: &'a BuildState,
+            sc: &'a Scenario,
+        ) -> Sim<'a> {
+            let duration = sc.phases.iter().map(|p| p.weight).sum();
+            let scratch = SimScratch::new(plan, sp);
+            let mut sim = Sim::new(plan, sp, build, sc, duration, scratch, None).unwrap();
+            sim.run_loop().unwrap();
+            sim
+        }
+
+        // --------------------------------------------------------------
+        // THE HAND-WORKED PIN. 1 s casts complete at t=1..10, each an
+        // on_hit roll at q = 0.5 applying `x` for D = 2.5 s.
+        //
+        // expected: P(s) = 1 − 0.5^(live rolls), a roll at t live on
+        // (t, t+2.5]:
+        //   [1,2)  one roll                       0.5    × 1 = 0.5
+        //   [2,3)  two rolls                      0.75   × 1 = 0.75
+        //   [k,k+1), k=3..9: three rolls for the first half second
+        //          (0.875), two for the second (0.75) → mean 0.8125
+        //                                         0.8125 × 7 = 5.6875
+        //   ∫P = 6.9375 → uptime = avg_stacks = 0.69375, 10 rolls.
+        // discrete: acc += 0.5/cast fires at casts 2,4,6,8,10, each a
+        //   2.5 s window → one continuous span [2,10] → 0.8, 5 applications.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_expected_hand_worked_uptime() {
+            let plan = minimal_plan();
+            let exp = run_json(
+                &plan,
+                &strike_simdef(true, "0.5", 2.5),
+                STRIKE_ROT,
+                10.0,
+                Mode::Expected,
+            );
+            let dis = run_json(
+                &plan,
+                &strike_simdef(false, "0.5", 2.5),
+                STRIKE_ROT,
+                10.0,
+                Mode::Expected,
+            );
+            let (e, d) = (&exp.buffs["x"], &dis.buffs["x"]);
+            assert!(
+                close(e.uptime, 0.69375),
+                "expected uptime: got {}",
+                e.uptime
+            );
+            assert!(
+                close(e.avg_stacks, 0.69375),
+                "expected avg_stacks: got {}",
+                e.avg_stacks
+            );
+            assert_eq!(e.applications, 10, "one log entry per cast");
+            assert!(close(d.uptime, 0.8), "discrete uptime: got {}", d.uptime);
+            assert!(
+                close(d.avg_stacks, 0.8),
+                "discrete avg_stacks: got {}",
+                d.avg_stacks
+            );
+            assert_eq!(d.applications, 5, "fires at casts 2/4/6/8/10");
+            // The accumulator itself is untouched: same fire count.
+            assert_eq!(exp.proc_counts["spark"], 5);
+            assert_eq!(dis.proc_counts["spark"], 5);
+        }
+
+        // --------------------------------------------------------------
+        // q = 1 is binary: the expected report must equal the discrete
+        // one. `a` (1 s, cd 2) completes at 1,3,5,7,9; `b` (1 s) fills at
+        // 2,4,..,10. `spark` (on_hit, chance 1, `a` only) applies `x` for
+        // D = 2, so the window from `a`@1 ends EXACTLY at `a`@3's
+        // completion — an age-out coincident with a CastComplete, whose
+        // order the two EventOrders decide differently. `x` drives `c`,
+        // and `hit = dmg × (1 + c)`, so the discrete damage proves the
+        // fixture really is coincident (it differs between the orders).
+        // Condition/damage equality under `expected` is task 4 (the
+        // readers); here: the buff report, field for field, both orders.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_expected_q_one_equals_discrete() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"], "conditions": ["c"],
+                     "pipeline": [ { "name": "hit", "expr": "dmg * (1 + c)" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let rot = r#"{ "rules": [ { "action": "a" }, { "action": "b" } ] }"#;
+            let simdef = |expected: bool, order: &str| {
+                format!(
+                    r#"{{ "defaults": {{ "event_order": "{order}" }},
+                         "actions": {{
+                           "a": {{ "cast_time": "1", "cooldown": 2, "damage": {{ "stats": {{}} }} }},
+                           "b": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                         "buffs": {{ "x": {{ "duration": 2, "conditions": {{ "c": 1.0 }}{} }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "1",
+                                                "actions": ["a"], "apply_buff": "x" }} }},
+                         "damage_objective": "hit" }}"#,
+                    knob(expected)
+                )
+            };
+            let mut discrete_damage = Vec::new();
+            for order in ["scheduled", "completions_first"] {
+                let exp = run_json(&plan, &simdef(true, order), rot, 10.0, Mode::Expected);
+                let dis = run_json(&plan, &simdef(false, order), rot, 10.0, Mode::Expected);
+                assert_eq!(dis.actions["a"].casts, 5, "{order}");
+                assert_eq!(dis.actions["b"].casts, 5, "{order}");
+                let (e, d) = (&exp.buffs["x"], &dis.buffs["x"]);
+                assert_eq!(e.uptime, d.uptime, "{order}: uptime");
+                assert_eq!(e.avg_stacks, d.avg_stacks, "{order}: avg_stacks");
+                assert!(
+                    close(d.uptime, 0.9),
+                    "{order}: up on [1,10], got {}",
+                    d.uptime
+                );
+                discrete_damage.push(dis.total.total_damage);
+            }
+            // completions_first: `a`@1 unbuffed (its own application
+            // lands after its damage), 2..10 buffed → 100 + 9 × 200 =
+            // 1900. scheduled: each expiry from `a`@k pops before
+            // `a`@(k+2)'s completion → `a`@3,5,7,9 unbuffed → 1500.
+            assert_eq!(discrete_damage, [1500.0, 1900.0]);
+        }
+
+        // --------------------------------------------------------------
+        // Review Focus 1: only the expected buff's application leaves
+        // the accumulator's crossing. `spark` applies `x` AND free-casts
+        // `surge` (+1 mana); `strike` costs 1 mana from a 3-mana pool
+        // regenerating 0.25/s, so it starves. The fire count, the surge
+        // casts (the mana gained: 1 each) and the starvation they move
+        // are identical.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_other_proc_effects_unmoved() {
+            let plan = minimal_plan();
+            let simdef = |expected: bool| {
+                format!(
+                    r#"{{ "resources": {{ "mana": {{ "max": "3", "regen_per_sec": "0.25" }} }},
+                         "actions": {{
+                           "strike": {{ "cast_time": "1", "cost": {{ "mana": 1 }},
+                                        "damage": {{ "stats": {{}} }} }},
+                           "surge": {{ "cast_time": "0", "gain": {{ "mana": 1 }} }} }},
+                         "buffs": {{ "x": {{ "duration": 2.5{} }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "0.5",
+                             "effects": [ {{ "apply_buff": "x" }}, {{ "cast_action": "surge" }} ] }} }},
+                         "damage_objective": "hit" }}"#,
+                    knob(expected)
+                )
+            };
+            let exp = run_json(&plan, &simdef(true), STRIKE_ROT, 25.0, Mode::Expected);
+            let dis = run_json(&plan, &simdef(false), STRIKE_ROT, 25.0, Mode::Expected);
+            assert_eq!(exp.proc_counts["spark"], dis.proc_counts["spark"]);
+            assert!(dis.proc_counts["spark"] > 0);
+            assert_eq!(
+                exp.actions["surge"].casts, dis.actions["surge"].casts,
+                "mana gained"
+            );
+            assert_eq!(dis.actions["surge"].casts, dis.proc_counts["spark"]);
+            assert_eq!(exp.actions["strike"].casts, dis.actions["strike"].casts);
+            assert_eq!(
+                serde_json::to_string(&exp.resources).unwrap(),
+                serde_json::to_string(&dis.resources).unwrap()
+            );
+            assert!(
+                dis.resources["mana"].time_starved > 0.0,
+                "the gains are load-bearing"
+            );
+            assert_eq!(exp.total.total_damage, dis.total.total_damage);
+            // ...while `x` itself did move to the log.
+            assert_eq!(exp.buffs["x"].applications, exp.actions["strike"].casts);
+        }
+
+        // --------------------------------------------------------------
+        // Review Focus 3: a proc that never qualifies (its `actions`
+        // filter names an action the rotation never casts) logs nothing
+        // and schedules no age-out — uptime 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_never_applied_is_zero() {
+            let plan = minimal_plan();
+            let json = format!(
+                r#"{{ "actions": {{ "strike": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }},
+                                  "other": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                     "buffs": {{ "x": {{ "duration": 2.5{} }} }},
+                     "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "0.5",
+                                            "actions": ["other"], "apply_buff": "x" }} }},
+                     "damage_objective": "hit" }}"#,
+                knob(true)
+            );
+            let sp = compile_json(&plan, &json, STRIKE_ROT);
+            let build = minimal_build();
+            let sc = dummy(10.0);
+            let sim = ev_sim(&plan, &sp, &build, &sc);
+            assert_eq!(
+                sim.age_outs_scheduled, 0,
+                "no ExpectedAgeOut was ever pushed"
+            );
+            assert!(sim.buffs[0].log.next_age_out().is_none());
+            let r = sim.into_report();
+            assert_eq!(r.actions["strike"].casts, 10);
+            assert_eq!(r.buffs["x"].uptime, 0.0);
+            assert_eq!(r.buffs["x"].avg_stacks, 0.0);
+            assert_eq!(r.buffs["x"].applications, 0);
+        }
+
+        // --------------------------------------------------------------
+        // Review Focus 4: entries that end together drain in ONE
+        // age-out. `b` (1 s, damaging) and `a` (instant utility, cd 2):
+        // `a`@0; `b` completes at 1,2,..; `a` recasts at 2 and 4, in the
+        // same instant as `b`'s completion. `spark` (on_cast, 0.5)
+        // applies `x` for 1.5 s, so the cast events are
+        //   t = 0 (a), 1 (b), 2 (b, a), 3 (b), 4 (b, a), 5 (b)
+        // with t_ends 1.5, 2.5, 3.5 ×2, 4.5, 5.5 ×2, 6.5. The horizon is
+        // 5.5, one of the doubled instants. Distinct t_ends <= 5.5:
+        // 1.5, 2.5, 3.5, 4.5, 5.5 → exactly 5 live age-outs (one per
+        // entry would be 7).
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_equal_t_end_drains_once() {
+            let plan = minimal_plan();
+            let json = format!(
+                r#"{{ "actions": {{ "a": {{ "cast_time": "0", "cooldown": 2 }},
+                                  "b": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                     "buffs": {{ "x": {{ "duration": 1.5{} }} }},
+                     "procs": {{ "spark": {{ "trigger": "on_cast", "chance": "0.5",
+                                            "apply_buff": "x" }} }},
+                     "damage_objective": "hit" }}"#,
+                knob(true)
+            );
+            let rot = r#"{ "rules": [ { "action": "a" }, { "action": "b" } ] }"#;
+            let sp = compile_json(&plan, &json, rot);
+            let build = minimal_build();
+            let sc = dummy(5.5);
+            let sim = ev_sim(&plan, &sp, &build, &sc);
+            assert_eq!(
+                sim.age_outs_handled, 5,
+                "one live age-out per distinct t_end"
+            );
+            let r = sim.into_report();
+            assert_eq!(r.actions["a"].casts, 3);
+            assert_eq!(r.actions["b"].casts, 5);
+            assert_eq!(r.buffs["x"].applications, 8);
+        }
+
+        // --------------------------------------------------------------
+        // Review Focus 2: a segmented cast logs one entry PER LANDING.
+        // `burst`: two 0.5 s damaging segments → landings every 0.5 s at
+        // t = 0.5k, k = 1..20. on_hit q = 0.5, D = 1.2: a roll at t is
+        // live on (t, t+1.2].
+        //   [0.5,1.0)  one roll                   0.5  × 0.5 = 0.25
+        //   [1.0,1.5)  two rolls (the first ends at 1.7)
+        //                                         0.75 × 0.5 = 0.375
+        //   [0.5k, 0.5k+0.5), k = 3..19: three rolls for 0.2 s (0.875),
+        //          two for 0.3 s (0.75) → 0.4 per half second × 17 = 6.8
+        //   ∫P = 7.425 → uptime 0.7425, 20 entries.
+        // discrete: fires every 2nd landing (t = 1, 2, .., 10), 1.2 s
+        //   windows → continuous [1,10] → 0.9.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_segments_log_per_landing() {
+            let plan = minimal_plan();
+            let simdef = |expected: bool| {
+                format!(
+                    r#"{{ "actions": {{ "burst": {{ "segments": [
+                           {{ "duration": 0.5, "damage": {{ "stats": {{}} }} }},
+                           {{ "duration": 0.5, "damage": {{ "stats": {{}} }} }} ] }} }},
+                         "buffs": {{ "x": {{ "duration": 1.2{} }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "0.5",
+                                                "apply_buff": "x" }} }},
+                         "damage_objective": "hit" }}"#,
+                    knob(expected)
+                )
+            };
+            let rot = r#"{ "rules": [ { "action": "burst" } ] }"#;
+            let exp = run_json(&plan, &simdef(true), rot, 10.0, Mode::Expected);
+            let dis = run_json(&plan, &simdef(false), rot, 10.0, Mode::Expected);
+            assert_eq!(exp.actions["burst"].casts, 10);
+            assert_eq!(exp.buffs["x"].applications, 20, "one entry per landing");
+            assert!(
+                close(exp.buffs["x"].uptime, 0.7425),
+                "got {}",
+                exp.buffs["x"].uptime
+            );
+            assert!(close(exp.buffs["x"].avg_stacks, 0.7425));
+            assert!(
+                close(dis.buffs["x"].uptime, 0.9),
+                "got {}",
+                dis.buffs["x"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // MC ignores the knob: same seed, byte-identical report.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_ignored_in_mc() {
+            let plan = minimal_plan();
+            let mc = Mode::MonteCarlo {
+                iterations: 50,
+                seed: 7,
+            };
+            let exp = run_json(
+                &plan,
+                &strike_simdef(true, "0.5", 2.5),
+                STRIKE_ROT,
+                10.0,
+                mc,
+            );
+            let dis = run_json(
+                &plan,
+                &strike_simdef(false, "0.5", 2.5),
+                STRIKE_ROT,
+                10.0,
+                mc,
+            );
+            assert_eq!(
+                serde_json::to_string(&exp).unwrap(),
+                serde_json::to_string(&dis).unwrap()
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Fail closed: a non-finite chance on a proc that applies an
+        // expected buff is a positioned error, not a silent log entry
+        // (the accumulator would merely never cross on a NaN).
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_non_finite_chance_fails_closed() {
+            let plan = minimal_plan();
+            let sp = compile_json(&plan, &strike_simdef(true, "0 / 0", 2.5), STRIKE_ROT);
+            let e = run(&plan, &sp, &minimal_build(), &dummy(10.0), Mode::Expected).unwrap_err();
+            for needle in ["proc `spark`", "t=1", "`x`", "NaN"] {
+                assert!(e.what.contains(needle), "`{needle}` in: {}", e.what);
+            }
+            // The discrete EV path keeps today's behavior (no check).
+            let sp = compile_json(&plan, &strike_simdef(false, "0 / 0", 2.5), STRIKE_ROT);
+            assert!(run(&plan, &sp, &minimal_build(), &dummy(10.0), Mode::Expected).is_ok());
         }
     }
 }

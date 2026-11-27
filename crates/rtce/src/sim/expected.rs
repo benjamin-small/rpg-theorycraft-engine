@@ -10,8 +10,6 @@
 //!
 //! No default or evaluation instant lives here: callers (the executor)
 //! decide when a roll happens and what `chance` evaluates to.
-// Consumed by the executor in a later task, which removes this allow.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::VecDeque;
 
@@ -189,6 +187,7 @@ impl RollLog {
     }
 
     /// Empty the log, keeping its capacity.
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
