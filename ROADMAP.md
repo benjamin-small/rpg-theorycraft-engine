@@ -132,7 +132,7 @@
   `SegmentLand` events and the generalized landing order, and
   `objective.<name>` reads in sim timing fields. #33 item 4 —
   per-buff `ev_uptime: "expected"` (EV tracks P(up) from the exact roll
-  log) — is DONE (Unreleased; design:
+  log) — is DONE (0.9.0; design:
   `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`).
 - [ ] **Hit-level casts, second half** (design §6 slices 5, 7 and 8).
   Open debt, deliberately not yet built:
@@ -158,7 +158,7 @@
     time-varying resource max/regen is re-sampled more often than under
     `discrete`, and flipping the knob on one buff can move an UNRELATED
     resource's numbers.
-  - **`ev_uptime` self-feeding is not rejected (Unreleased).** `P` is
+  - **`ev_uptime` self-feeding is not rejected (0.9.0).** `P` is
     exact only when the applying procs' q (chance, crit chance) and D do
     not depend on the buff's own state. Shape (ii) (a contribution gated
     on a condition the buff drives) fails closed at compile; shape (i)
@@ -167,7 +167,7 @@
     that depends on X) is only documented — detecting it needs a
     Plan-dependency analysis. EV's P is then mean-field, likely slightly
     high against MC.
-  - **`ev_uptime` per-cast allocation on the EV loop (Unreleased).** An
+  - **`ev_uptime` per-cast allocation on the EV loop (0.9.0).** An
     expected buff costs about two full refolds per cast (the roll, then
     its age-out), each cloning the effective `BuildState` / phase maps
     (BTreeMap / Vec clones in `refresh_effective_state`). Opt-in, but it
@@ -192,7 +192,7 @@
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
       actually touches `crates/rtce-testkit/`.
-- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, and 0.8.0 are
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, 0.8.0, and 0.9.0 are
       also live; the tag-driven trusted-publishing workflow verifies the tag,
       changelog, formatting, clippy, tests, and package contents before it
       publishes missing crate versions.
