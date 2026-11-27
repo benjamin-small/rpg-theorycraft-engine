@@ -95,7 +95,7 @@ An action with `segments` is a cast made of timed landings: each segment
 has a `duration` and its own damage. A rotation normally lets the cast
 run to its last landing. Say `slam` is two segments, 0.5 s of 100 damage
 then 0.75 s of 300, and `jab` is a 0.25 s cast on a 2 s cooldown worth 50.
-Over 5 s, with `jab` on top and `slam` below it, the 5 s fight ends at
+Over a 5 s fight, with `jab` on top and `slam` below it, the total is
 **1400**.
 
 A rule can opt in to being cancelled with `"interrupt": true`:
@@ -114,7 +114,10 @@ totals **1250**: three jabs and five slam casts, two of them cancelled
   first rule *above* the one that started it that is eligible right now
   (its `when`, cooldown and cost all pass). The same rule and lower ones
   never cancel it. A higher rule naming the same action does cancel it and
-  restarts it.
+  restarts it. While the higher rules are tested the cast is still in
+  flight, so their `when` reads this boundary's `segments_done` and
+  `segments_remain`, not the 0 a normal decision sees; their cost is
+  checked with both at 0, as the new cast will pay it.
 - **`interrupt_if` picks the boundaries.** An optional expression
   evaluated at each non-last boundary; it reads `segments_done` (the
   landings so far, counting the one that just landed) and

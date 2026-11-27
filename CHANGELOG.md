@@ -12,15 +12,20 @@ until then, per semver's "anything goes" pre-1.0 clause).
   false) lets a higher-priority rule cancel a segmented cast at a segment
   boundary: after a non-last landing, the first rule above the cast's
   starting rule whose `when`, cooldown and cost pass begins at once.
-  `interrupt_if` (optional expression over `segments_done`,
-  `segments_remain` and `objective.<name>`) gates which boundaries are
-  candidates. A cancel keeps the paid cost, the armed cooldown and
-  everything landed segments did; the unlanded rest, including
-  action-level `gain` and `effects`, never happens. No cancel at the
-  horizon instant. Deterministic: EV and Monte Carlo agree.
+  Those higher rules' `when` reads the boundary's `segments_done` /
+  `segments_remain`; their cost is checked with both at 0, the world the
+  cast start pays it in. `interrupt_if` (optional; any sim expression,
+  including `segments_done`, `segments_remain` and `objective.<name>`)
+  gates which boundaries are candidates. A cancel keeps the paid cost,
+  the armed cooldown and everything landed segments did; the unlanded
+  rest, including action-level `gain` and `effects`, never happens. No
+  cancel at the horizon instant. The check draws no RNG, so EV and Monte
+  Carlo apply the same rule; the counts agree when the scanned rules'
+  inputs are deterministic.
 - **`ActionReport.cancelled`**: casts of the action cut short by a
   cancel (still counted in `casts`). Pooled as a rounded mean in MC.
-  Every config without `interrupt` is byte-identical.
+  Every config without `interrupt` is numerically identical (every
+  number unchanged); serialized reports gain `"cancelled": 0`.
 
 ### Upgrade notes
 - Rust `Rule` struct literals need `interrupt: None, interrupt_if: None`.

@@ -181,9 +181,13 @@
   - Refund-on-cancel knobs.
   - Open debt from player cancels (Unreleased): `interrupt_if` is pinned
     for `segments_done` and `objective.<name>` reads, but not for
-    `segments_remain`; `when` on a higher rule reads the boundary's
-    `segments_done`, not 0 (documented on `try_cancel`, one discriminating
-    pin: the same-action test).
+    `segments_remain`. `when` on a higher rule reads the boundary's
+    `segments_done`, not 0 (documented on `Rule::interrupt` and
+    `try_cancel`; pinned by the same-action, instant-first-segment and
+    restored-words tests), while its cost is checked at words 0 (pinned
+    by `a_cancel_checks_the_winners_cost_in_the_world_it_pays_in`).
+    Nested cancels (an instant-first-segment winner cancelled at the
+    same instant) are pinned for one level only.
 
 - [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
       the registry (`cargo search` confirms), alongside `rtce-testkit`

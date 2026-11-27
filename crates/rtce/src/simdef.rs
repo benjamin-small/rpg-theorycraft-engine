@@ -903,7 +903,11 @@ pub struct ActionDef {
     ///   rolls) and reset to `0` only after its proc rolls. They describe
     ///   the in-flight ROTATION cast: `0` when none is in flight (so
     ///   `0` for an unsegmented rotation cast and at every rotation
-    ///   decision — a `when` reading them cannot wedge the rotation). A
+    ///   decision — a `when` reading them cannot wedge the rotation),
+    ///   except higher rules' `when` during a player-cancel scan
+    ///   ([`Rule::interrupt`]), which reads the boundary's values (the
+    ///   scanned winner's COST is still checked with both at `0`, the
+    ///   world its cast start pays in). A
     ///   proc-fired FREE cast at a landing of a segmented cast reads THAT
     ///   cast's values (like a proc `chance` at that instant), whatever
     ///   the free cast's own action is.
@@ -957,8 +961,12 @@ impl ActionDef {
 /// landing only, then this segment's `on_hit`, `on_crit`,
 /// `on_non_crit`); `segments_done` and `segments_remain` reset to `0`
 /// (last segment only — so the whole transaction above read `n` / `0`);
-/// then, for any other segment, the next one starts (its `duration` is
-/// evaluated, a `cast_start` world captured, its landing scheduled).
+/// then, for any other segment, the player-cancel check
+/// ([`Rule::interrupt`]: if the starting rule interrupts and a higher
+/// rule is eligible, the cast ends here and that rule's action begins
+/// at this instant), and otherwise the next segment starts (its
+/// `duration` is evaluated, a `cast_start` world captured, its landing
+/// scheduled).
 /// The canonical diagram is in the `sim` module docs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SegmentDef {
@@ -1985,8 +1993,9 @@ pub struct Rule {
     ///   transaction (damage, effects, proc rolls, `casts`,
     ///   `segments_done`; `gain` is last-landing-only so it never fires at
     ///   a non-last boundary), before the next segment starts. Evaluated
-    ///   on the plain effective build and phase. Deterministic: EV and MC
-    ///   behave identically.
+    ///   on the plain effective build and phase. The check draws no RNG,
+    ///   so EV and MC apply the same rule; the counts agree when the
+    ///   scanned rules' inputs are deterministic.
     /// - **Interactions:** only meaningful for a segmented action with at
     ///   least 2 segments (otherwise there is no non-last boundary): any
     ///   other action is a positioned compile error. Only rules ranked
@@ -2001,6 +2010,15 @@ pub struct Rule {
     ///   nothing, and action-level `gain` and `effects` (last-landing-only)
     ///   are NOT applied. A boundary at the horizon instant does not cancel
     ///   (the replacement could not begin).
+    /// - **Segment words in the scan:** the cast is still in flight while
+    ///   the higher rules are tested, so their `when` reads THIS
+    ///   boundary's `segments_done` / `segments_remain` (not the `0` a
+    ///   rotation decision sees — a higher rule `when: "segments_done >=
+    ///   1"` is eligible only at a boundary). Their action's COST is
+    ///   checked with both words at `0`, the world its cast start then
+    ///   pays in, so what is afforded is what is paid. A winner whose
+    ///   own first segment is instant lands at once and may itself be
+    ///   cancelled at the same instant, if its rule interrupts.
     /// - **No cast-id guard (yet):** a cancel happens before the next
     ///   segment landing is scheduled, so no stale landing event can
     ///   exist; the staleness guard is needed only once outside
@@ -2020,7 +2038,10 @@ pub struct Rule {
     ///   `ev_uptime` forbidden-read check applies).
     /// - **Interactions:** same constraints as `interrupt` (segmented,
     ///   at least 2 segments); a falsy value means no cancel at that
-    ///   boundary, and the cast simply continues. EV = MC.
+    ///   boundary, and the cast simply continues. Not evaluated at a
+    ///   boundary at the horizon instant (no cancel is possible there).
+    ///   Draws no RNG, though it may read state that MC samples (a
+    ///   proc-applied buff, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_if: Option<String>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"

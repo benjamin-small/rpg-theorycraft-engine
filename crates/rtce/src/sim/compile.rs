@@ -2807,6 +2807,40 @@ mod tests {
         );
     }
 
+    // `interrupt_if` is a sim expression like `when`, so an
+    // `ev_uptime: expected` buff's words are forbidden in it too; the
+    // error names the field. Contrast: the same read on a discrete buff
+    // compiles.
+    #[test]
+    fn rule_interrupt_if_rejects_an_expected_buffs_words() {
+        let compile_with = |ev_uptime: &str| {
+            let def: SimDef = serde_json::from_str(&CANCEL_SIMDEF.replacen(
+                r#""damage_objective""#,
+                &format!(
+                    r#""buffs": {{ "x": {{ "duration": 1 {ev_uptime} }} }}, "damage_objective""#
+                ),
+                1,
+            ))
+            .unwrap();
+            let rot: Rotation = serde_json::from_str(
+                r#"{ "rules": [ { "action": "slam", "interrupt_if": "buff.x" } ] }"#,
+            )
+            .unwrap();
+            compile(&toy_plan(), &def, &rot)
+        };
+        let e = compile_with(r#", "ev_uptime": "expected""#).unwrap_err();
+        assert_names(
+            &e.what,
+            &[
+                "rotation rule (action `slam`) interrupt_if",
+                "buff.x",
+                "buff `x`",
+                "ev_uptime: expected",
+            ],
+        );
+        assert!(compile_with("").is_ok());
+    }
+
     #[test]
     fn segments_and_cast_time_together_is_a_compile_error() {
         let e = segment_compile(

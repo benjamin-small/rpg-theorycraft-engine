@@ -179,9 +179,10 @@ pub struct ActionReport {
     /// cancelled cast still counts in `casts` (it counted at its first
     /// landing) and keeps its landed segments' damage. Always `0` for an
     /// unsegmented action and for any action no interrupting rule
-    /// starts. Deterministic, so EV and Monte Carlo agree; under Monte
-    /// Carlo it is the pooled mean rounded to the nearest whole count,
-    /// like `casts`.
+    /// starts. The check draws no RNG, so EV and Monte Carlo apply the
+    /// same rule; the counts agree when the scanned rules' inputs are
+    /// deterministic. Under Monte Carlo it is the pooled mean rounded to
+    /// the nearest whole count, like `casts`.
     pub cancelled: u64,
     /// Damage this action's completed casts accumulated
     /// (`damage_objective × hits`, summed). A segmented cast cut off by
