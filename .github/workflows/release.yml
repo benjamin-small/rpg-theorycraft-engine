@@ -48,6 +48,9 @@ jobs:
             echo "::error::CHANGELOG.md has no heading for $TAG_VERSION"
             exit 1
           fi
+          # The GitHub release body is built from this section after
+          # publishing; fail now, before anything reaches crates.io.
+          scripts/release-notes.sh "$TAG_VERSION" > /dev/null
 
       - name: Format
         run: cargo fmt --all --check
@@ -96,3 +99,36 @@ jobs:
                 ;;
             esac
           done
+
+  github-release:
+    name: Create GitHub release
+    needs: publish-crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create release from the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; skipping"
+            exit 0
+          fi
+          RELEASE_REPO_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            scripts/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"
+          # Mark Latest only when this is the highest release tag, so a
+          # re-run or backport of an older tag never steals it.
+          highest=$(git ls-remote --tags --refs origin 'v[0-9]*' |
+            sed 's|.*refs/tags/||' | sort -V | tail -n1)
+          latest=false
+          if [ "$highest" = "$GITHUB_REF_NAME" ]; then latest=true; fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "rtce $version" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest="$latest"
