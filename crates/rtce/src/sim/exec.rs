@@ -4026,6 +4026,7 @@ mod tests {
             "proc_buff".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(0.5),
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -4129,6 +4130,7 @@ mod tests {
             "window".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration,
                 max_stacks: 1,
                 on_reapply: ReapplyPolicy::Refresh,
@@ -4555,6 +4557,7 @@ mod tests {
             "charge".to_string(),
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(buff_duration),
                 max_stacks,
                 on_reapply,
@@ -4878,6 +4881,7 @@ mod tests {
                 "power_up".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -4975,6 +4979,7 @@ mod tests {
                 "x".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5197,6 +5202,7 @@ mod tests {
                 "enrage_window".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5382,6 +5388,7 @@ mod tests {
                 "window".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(buff_duration),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -5955,6 +5962,7 @@ mod tests {
                 "proc_buff".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(0.5),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -6059,6 +6067,7 @@ mod tests {
                     "proc_buff".to_string(),
                     BuffDef {
                         extra: Default::default(),
+                        ev_uptime: Default::default(),
                         duration: NumOrExpr::Num(0.5),
                         max_stacks: 1,
                         on_reapply: ReapplyPolicy::Refresh,
@@ -6477,6 +6486,7 @@ mod tests {
                 "y".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(1.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -6612,6 +6622,7 @@ mod tests {
                 "focus".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -6624,6 +6635,7 @@ mod tests {
                 "marker".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(1.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -7265,6 +7277,7 @@ mod tests {
                 "boost".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -8156,6 +8169,7 @@ mod tests {
                 "poison".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(duration),
                     max_stacks,
                     on_reapply,
@@ -8222,6 +8236,7 @@ mod tests {
                 "empower".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(100.0),
                     contributions: vec![Contribution {
                         bucket: "boost".into(),
@@ -9071,6 +9086,7 @@ mod tests {
         fn mark_buff(duration: f64) -> BuffDef {
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: vec![Contribution {
                     bucket: "boost".into(),
@@ -9192,6 +9208,7 @@ mod tests {
         fn plain_buff(duration: f64) -> BuffDef {
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
@@ -9206,6 +9223,7 @@ mod tests {
         fn empower_buff(duration: f64) -> BuffDef {
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: vec![Contribution {
                     bucket: "boost".into(),
@@ -9225,6 +9243,7 @@ mod tests {
         fn snapshot_buff(duration: f64) -> BuffDef {
             BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(duration),
                 contributions: Vec::new(),
                 conditions: BTreeMap::new(),
@@ -9455,6 +9474,7 @@ mod tests {
                 "gate".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(3.0),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -9467,6 +9487,7 @@ mod tests {
                 "timed".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Expr("2 * (1 + stacks.gate)".into()),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -10043,6 +10064,7 @@ mod tests {
             let build = boosted_dot_build();
             let cond = |v: f64| BuffDef {
                 extra: Default::default(),
+                ev_uptime: Default::default(),
                 duration: NumOrExpr::Num(100.0),
                 contributions: Vec::new(),
                 conditions: [("marked".to_string(), v)].into_iter().collect(),
@@ -10121,6 +10143,7 @@ mod tests {
                 "over".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(5.0),
                     contributions: Vec::new(),
                     conditions: [("marked".to_string(), 5.0)].into_iter().collect(),
@@ -10826,6 +10849,7 @@ mod tests {
                 "timed".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Expr("1 + casts.ping".into()),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -11003,6 +11027,7 @@ mod tests {
                 "steady".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(3.0),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -11041,6 +11066,7 @@ mod tests {
                 "stack".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(2.0),
                     contributions: Vec::new(),
                     conditions: BTreeMap::new(),
@@ -13744,6 +13770,7 @@ mod tests {
                 "venom_dot".to_string(),
                 BuffDef {
                     extra: Default::default(),
+                    ev_uptime: Default::default(),
                     duration: NumOrExpr::Num(4.0),
                     max_stacks: 1,
                     on_reapply: ReapplyPolicy::Refresh,
@@ -13949,6 +13976,7 @@ mod tests {
                     "empower".to_string(),
                     BuffDef {
                         extra: Default::default(),
+                        ev_uptime: Default::default(),
                         duration: NumOrExpr::Num(100.0),
                         contributions: vec![Contribution {
                             bucket: "boost".into(),
