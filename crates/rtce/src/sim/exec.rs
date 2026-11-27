@@ -2995,7 +2995,7 @@ impl<'a> Sim<'a> {
                 return Ok(false);
             }
         }
-        for wi in 0..ridx {
+        for (wi, winner) in sim_plan.rules.iter().enumerate().take(ridx) {
             let Some((cd_ready, afford)) =
                 self.rule_gates(wi, now, "at a segment boundary", true)?
             else {
@@ -3007,7 +3007,7 @@ impl<'a> Sim<'a> {
                 self.segments_total = 0;
                 self.actions[action].cancelled += 1;
                 self.cast_rule = Some(wi);
-                self.begin_cast(sim_plan.rules[wi].action)?;
+                self.begin_cast(winner.action)?;
                 return Ok(true);
             }
         }
