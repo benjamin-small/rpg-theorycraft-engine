@@ -7,6 +7,24 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **`ev_uptime: "expected"` on a buff** (#33 item 4). In EV mode the buff
+  carries a probability `P` of being up, built from the exact log of its
+  proc application rolls, instead of a binary window opened when the
+  accumulator crosses a whole application. For a buff applied by a
+  high-chance `on_crit` proc (crit 0.23, 0.33 s casts, duration 4) EV
+  `discrete` reports 0.9945 where MC says 0.9538; `expected` reports
+  0.9538. `P` feeds conditions (`P·v + (1 − P)·static`), contributions
+  (`value × P`), live `tick_objective` rates (`rate × P`) and the uptime
+  and `avg_stacks` columns (`∫P / duration`). Defaults to `discrete`, so
+  every config that omits it is byte-identical; MC ignores the field.
+  Fail-closed at compile: needs `refresh` with `max_stacks: 1`, no
+  snapshot tick, no proc with `icd > 0` applying it, no free-cast
+  application, no `buff.` / `buff_remaining.` / `stacks.` reads of it, and
+  no driven condition that a sim expression reads or another buff shares.
+  Design: `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`.
+  Guide: chapter 7, "Buffs that depend on luck".
+
 ## [0.8.0] — 2026-11-26
 
 **Hit-level casts, first half.** Version 0.8.0 lets a timeline derive

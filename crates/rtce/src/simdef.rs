@@ -1550,6 +1550,19 @@ pub struct BuffDef {
     ///
     /// A proc applying an `expected` buff alongside other effects stays
     /// legal: its other effects keep firing discretely.
+    ///
+    /// # Differences from `discrete` worth knowing
+    ///
+    /// - `D` is evaluated at EVERY considered cast (each roll's weight
+    ///   needs its end time), including casts on which discrete EV would
+    ///   not fire. A duration expression that errors can therefore
+    ///   surface under `expected` where `discrete` never hits it.
+    /// - The condition blend `P·v + (1 − P)·static` reaches the `Plan`
+    ///   UNCLAMPED, while `condition_uptime` reports the value clamped to
+    ///   `[0, 1]` — the same split active buffs already have.
+    /// - Expected buffs' contributions fold AFTER the active buffs', not
+    ///   in buff-index order, so a `sum` bucket shared with an active
+    ///   buff can differ from discrete by a ULP.
     #[serde(default)]
     pub ev_uptime: EvUptime,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"

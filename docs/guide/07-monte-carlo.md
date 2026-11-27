@@ -102,6 +102,33 @@ practical argument for why EV mode is usually enough. Run a five-second
 burst instead of a sixty-second fight and that stops being true, and MC
 stops being optional.
 
+## Buffs that depend on luck
+
+EV mode has one blind spot worth knowing about. A proc-applied buff opens a
+window whenever the accumulator crosses a whole application: a crit proc at
+chance 1 with a 23% crit rate adds 0.23 of an application per cast, so
+discrete EV applies the buff once every 4.35 casts. With 0.33-second casts
+and a 4-second duration that is every 1.43 seconds, always inside the
+previous window, and the buff reads as up the whole fight. The ceiling is
+`0.9945` over a 300-second fight.
+
+Monte Carlo disagrees, correctly. About `4 / 0.33 = 12.1` casts are live at
+any moment and the buff is down only if every one of them missed, so the
+steady state is `1 − 0.77^12.1 = 0.958`, and `0.9538` over the 300 seconds
+once the ramp-up is counted.
+
+Set `"ev_uptime": "expected"` on the buff and EV mode tracks that
+probability directly instead of a window: `0.9538`, matching the MC mean
+within three standard errors. The same arithmetic on ten 1-second casts at
+50% with a 2.5-second duration gives `0.69375` where discrete reports
+`0.8`. Use it for a high-uptime buff applied by a chance-based proc, when
+you read its uptime or its contributions in EV. It forbids what cannot be
+a probability (stacking, snapshot ticks, ICD procs, reading it as
+`buff.<name>`); the compiler names the offending line if you try. MC is
+unaffected by the field. All of the numbers above are asserted by
+`ev_and_mc_agree_on_expected_uptime_regression` and
+`ev_uptime_expected_hand_worked_uptime`.
+
 ## When to use which
 
 | | Use it when |

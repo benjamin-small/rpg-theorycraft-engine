@@ -141,8 +141,16 @@
     deterministic schedules; jitter and chance are MC-only.
   - **A Rolling-Slam-shaped CI-run example** with hand-worked EV pins.
 - [ ] Open debt from 0.8.0 (each deliberately unpinned or not yet built):
-  - #33 item 4, EV expected uptime for Bernoulli-driven buffs. This is
-    research, and MC is the documented answer meanwhile.
+  - **Pre-existing resource-settle bug (found reviewing #33 item 4).**
+    `flush_before_change` never settles resources, so a refold's new
+    resource max/regen applies retroactively to the whole span since
+    `last_update` (exec.rs `flush_before_change` /
+    `refresh_effective_state` / `settle_resource`). Example: regen
+    `"10 - buff.boost * 10"`, a cost leaves the pool at 50 at t=0, `boost`
+    applies at t=1, the next settle at t=2 gives 50 where the true value
+    is 60. The pin `resource_max_expr_refolds_against_the_applying_buff`
+    passes only by coincidence (a cap increase from a full pool). Not
+    fixed here.
   - A `when`/`cost` that reads an objective on a damaging action clones
     the overlay `BuildState` on every decision. It is opt-in and
     documented; memoize per (instant, world), or build the overlay

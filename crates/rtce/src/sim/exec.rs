@@ -1508,11 +1508,15 @@ impl<'a> Sim<'a> {
             }));
         }
         // An EV expected buff is never in `active_buff_set`: it folds
-        // here instead, at `value × P` — the expected value, by linearity
+        // here instead, AFTER the active buffs' contributions (not in
+        // buff-index order), at `value × P` — the expected value, by linearity
         // for one buff, and the same per-value scaling `stacks` uses
         // above. P = 0 folds nothing (the buff is certainly down); a
         // zero-valued contribution is the identity in every fold kind
         // anyway, so the skip only saves the clones. Empty in MC.
+        // Fold-order caveat: `sum` buckets add in this order, so when a
+        // LOWER-index expected buff shares a `sum` bucket with an active
+        // buff, discrete (index order) and expected can differ by a ULP.
         for &bi in &self.expected_list {
             let p = self.buffs[bi].p;
             if p == 0.0 {
@@ -16970,9 +16974,14 @@ mod tests {
         // from t=1 on (older weights × 0), so every later roll and every
         // age-out (of a zero-weight entry) leaves P unchanged; the
         // discrete twin's refreshes likewise move no count and refold
-        // nothing. Both refold once, at t=1 → max = 1. Nothing spends or
-        // settles `mana` until the end: amount 0 (= max at t=0),
-        // regen 1/s over 10 s reaches max 1 at t=1 → time_capped 9.
+        // nothing. Both refold once, at t=1 → max = 1. Nothing spends
+        // `mana`; amount 0 (= max at t=0). The pinned 9 holds under
+        // EITHER resource-settle accounting: settled once at the end with
+        // the t=1 max, regen 1/s hits max 1 at t=1 and sits capped for
+        // 9 s; settled at the t=1 refold against the OLD max 0 it is
+        // capped for that first second, then refills to 1 by t=2 and
+        // sits capped for the remaining 8 s, again 9 (see ROADMAP:
+        // `flush_before_change` never settles resources).
         // Mutation: no skip → a refold at every roll/age-out, the last
         // at t=10 (max 10) → time_capped 0.
         // --------------------------------------------------------------
@@ -16991,6 +17000,127 @@ mod tests {
                 capped.push(r.resources["mana"].time_capped);
             }
             assert_eq!(capped, [9.0, 9.0], "[expected, discrete]");
+        }
+
+        // --------------------------------------------------------------
+        // EV/MC REGRESSION: the #33 item 4 shape. `shot` (0.33 s cast,
+        // one hit) on a branched plan with crit p = 0.23; an `on_crit`
+        // proc at chance 1 applies `buff` (D = 4) on every crit, over a
+        // 300 s fight (~909 casts).
+        //
+        // Steady state: a cast applies at q = 0.23, and about 4 / 0.33 =
+        // 12.12 rolls are live at once, so the buff is down only when
+        // all of them missed: P = 1 − 0.77^12.12 ~ 0.958. The 300 s mean
+        // sits a little under it (the ramp-up; the hand-worked 0.69375
+        // pin above is the same math at small scale).
+        //
+        // DISCRETE EV accumulates 0.23 of an application per cast: one
+        // every 4.35 casts = 1.43 s, always inside the previous 4 s
+        // window, so it reports ~1.0 where MC says ~0.958.
+        // The test pins: expected is inside 3σ of MC's mean (σ from the
+        // per-iteration spread of 200 single-iteration runs, / √2000;
+        // observed: MC 0.95375, expected 0.95375, band ±0.0011, discrete
+        // 0.9945), the discrete number is outside that band, and expected
+        // sits within 0.01 under the closed-form steady state.
+        // --------------------------------------------------------------
+        fn regression_simdef(expected: bool) -> String {
+            format!(
+                r#"{{ "actions": {{ "shot": {{ "cast_time": "0.33",
+                         "damage": {{ "stats": {{}} }} }} }},
+                     "buffs": {{ "buff": {{ "duration": 4{} }} }},
+                     "procs": {{ "p": {{ "trigger": "on_crit", "chance": "1",
+                                        "apply_buff": "buff" }} }},
+                     "damage_objective": "hit" }}"#,
+                knob(expected)
+            )
+        }
+
+        fn regression_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "cc"],
+                     "events": { "crit": { "chance": "cc", "factor": "1.5" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * event_factors",
+                                     "branched": true } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        #[test]
+        fn ev_and_mc_agree_on_expected_uptime_regression() {
+            let plan = regression_plan();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 100.0, "cc": 0.23 } }"#).unwrap();
+            let rot = r#"{ "rules": [ { "action": "shot" } ] }"#;
+            let fight = dummy(300.0);
+            let uptime = |expected: bool, mode: Mode| {
+                let sp = compile_json(&plan, &regression_simdef(expected), rot);
+                run(&plan, &sp, &build, &fight, mode).unwrap().buffs["buff"].uptime
+            };
+
+            let mc_n = 2_000u32;
+            let mc = uptime(
+                false,
+                Mode::MonteCarlo {
+                    iterations: mc_n,
+                    seed: 20261127,
+                },
+            );
+            // Per-iteration spread: single-iteration runs on 200 seeds.
+            let sp = compile_json(&plan, &regression_simdef(false), rot);
+            let samples: Vec<f64> = (1..=200u64)
+                .map(|seed| {
+                    run(
+                        &plan,
+                        &sp,
+                        &build,
+                        &fight,
+                        Mode::MonteCarlo {
+                            iterations: 1,
+                            seed,
+                        },
+                    )
+                    .unwrap()
+                    .buffs["buff"]
+                        .uptime
+                })
+                .collect();
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            let sd = (samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / samples.len() as f64)
+                .sqrt();
+            let band = 3.0 * sd / (mc_n as f64).sqrt();
+
+            let expected = uptime(true, Mode::Expected);
+            let discrete = uptime(false, Mode::Expected);
+            assert!(
+                (expected - mc).abs() <= band,
+                "expected {expected} vs MC mean {mc} (3σ band {band})"
+            );
+            assert!(
+                (discrete - mc).abs() > band,
+                "discrete {discrete} should be outside MC {mc} ± {band}"
+            );
+            // The numbers the guide quotes (chapter 7, "Buffs that depend
+            // on luck"): discrete ~0.99, expected and MC ~0.954.
+            assert!(
+                (discrete - 0.9945).abs() < 0.001,
+                "discrete reports ~0.99, got {discrete}"
+            );
+            assert!(
+                (expected - 0.9538).abs() < 0.0005 && (mc - 0.9538).abs() < 0.0015,
+                "expected {expected} and MC {mc} both ~0.954"
+            );
+            let steady = 1.0 - 0.77f64.powf(4.0 / 0.33);
+            assert!(
+                (steady - 0.958).abs() < 0.001,
+                "closed form is ~0.958, got {steady}"
+            );
+            assert!(
+                (expected - steady).abs() < 0.01 && expected < steady,
+                "expected {expected} should sit just under the steady state {steady}"
+            );
         }
     }
 }
