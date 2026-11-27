@@ -7,6 +7,21 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Fixed
+- **A resource's new `max`/`regen_per_sec` no longer applies
+  retroactively.** When a state change (a buff applied or expired, a
+  phase boundary) re-derived a resource's max or regen, the pool was not
+  settled first. The next cost, gain or the end of the fight then
+  applied the NEW rate and cap to the whole span since the pool's last
+  settle. Example: max 100, regen `"buff.boost * 10"`, a cost leaves the
+  pool at 50 at t=0, `boost` applies at t=1. The pool now refills from
+  t=1 and is capped for 14 s of a 20 s fight; before, the refill was
+  credited from t=0, giving 15 s. Affects only configs whose resource
+  max/regen changes mid-fight. A cap increase from a full pool was
+  already right (the existing pin
+  `resource_max_expr_refolds_against_the_applying_buff`, 15 s, is
+  unchanged); `diablo4_rotation` and both consumers are unchanged.
+
 ## [0.9.0] — 2026-11-27
 
 **Expected buff uptime in EV.** Version 0.9.0 lets a buff opt in, with
