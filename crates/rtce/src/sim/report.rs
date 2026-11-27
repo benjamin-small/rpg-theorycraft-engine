@@ -169,6 +169,21 @@ pub struct ActionReport {
     /// FIRST landing, so one cut off by the horizon after that landing
     /// still counts.
     pub casts: u64,
+    /// Casts of this action cut short by a player cancel: a rule ranked
+    /// above the one that started the cast became eligible at one of its
+    /// NON-LAST segment boundaries (`interrupt` / `interrupt_if` on the
+    /// starting rule — see [`crate::simdef::Rule`]), and that rule's
+    /// action began in its place at the same instant. Counted once per
+    /// cancel, and only when the replacement began: a boundary AT the
+    /// fight horizon never cancels, since no cast may begin there. A
+    /// cancelled cast still counts in `casts` (it counted at its first
+    /// landing) and keeps its landed segments' damage. Always `0` for an
+    /// unsegmented action and for any action no interrupting rule
+    /// starts. The check draws no RNG, so EV and Monte Carlo apply the
+    /// same rule; the counts agree when the scanned rules' inputs are
+    /// deterministic. Under Monte Carlo it is the pooled mean rounded to
+    /// the nearest whole count, like `casts`.
+    pub cancelled: u64,
     /// Damage this action's completed casts accumulated
     /// (`damage_objective × hits`, summed). A segmented cast cut off by
     /// the horizon contributes the segments that landed.

@@ -89,6 +89,51 @@ enforces it. It is written out because that is the honest shape of a real
 priority list, and because the interesting version ("only spend above 60, so
 there's always a reserve") is one character away.
 
+## Cancelling a segmented cast
+
+An action with `segments` is a cast made of timed landings: each segment
+has a `duration` and its own damage. A rotation normally lets the cast
+run to its last landing. Say `slam` is two segments, 0.5 s of 100 damage
+then 0.75 s of 300, and `jab` is a 0.25 s cast on a 2 s cooldown worth 50.
+Over a 5 s fight, with `jab` on top and `slam` below it, the total is
+**1400**.
+
+A rule can opt in to being cancelled with `"interrupt": true`:
+
+```text
+{ "rules": [ { "action": "jab" },
+             { "action": "slam", "interrupt": true } ] }
+```
+
+At the boundary after `slam`'s first landing, `jab` is off cooldown, so the
+rotation drops the rest of the cast and starts `jab`. The same fight now
+totals **1250**: three jabs and five slam casts, two of them cancelled
+(`ActionReport::cancelled`).
+
+- **Only higher rules cancel.** The cast is cancelled in favour of the
+  first rule *above* the one that started it that is eligible right now
+  (its `when`, cooldown and cost all pass). The same rule and lower ones
+  never cancel it. A higher rule naming the same action does cancel it and
+  restarts it. While the higher rules are tested the cast is still in
+  flight, so their `when` reads this boundary's `segments_done` and
+  `segments_remain`, not the 0 a normal decision sees; their cost is
+  checked with both at 0, as the new cast will pay it.
+- **`interrupt_if` picks the boundaries.** An optional expression
+  evaluated at each non-last boundary; it reads `segments_done` (the
+  landings so far, counting the one that just landed) and
+  `segments_remain`, and may read `objective.<name>`. `"interrupt_if":
+  "segments_done >= 2"` never fires on a two-segment action, whose only
+  non-last boundary has `segments_done` = 1: the fight is back to 1400.
+  Absent, every non-last boundary is a candidate.
+- **What a cancel costs.** The cost already paid stays paid, and the
+  armed cooldown stays armed. Landed segments keep everything they did
+  (damage, effects, proc rolls). The unlanded rest never happens, and
+  neither do the action-level `gain` and `effects`, which only a finished
+  cast delivers.
+- **No cancel at the horizon.** At the instant the fight ends nothing new
+  begins, so nothing is cancelled there, and `interrupt_if` is not
+  evaluated.
+
 ## The fight, again
 
 ```json title=05-scenario.json

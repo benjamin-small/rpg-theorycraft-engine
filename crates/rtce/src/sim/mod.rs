@@ -19,7 +19,10 @@
 //!   ([`crate::simdef::ActionDef::segments`]) is in flight, the segments
 //!   landed so far (counting the landing being measured) and the
 //!   segments still to land; `0` when none is in flight (so for an
-//!   unsegmented rotation cast and at every rotation decision). A
+//!   unsegmented rotation cast and at every rotation decision), except
+//!   higher rules' `when` during a player-cancel scan
+//!   ([`crate::simdef::Rule::interrupt`]), which reads the boundary's
+//!   values (the winner's cost is checked with both at `0`). A
 //!   proc-fired free cast at one of a segmented cast's landings reads
 //!   that cast's values.
 //! - each resource, by its bare name — the resource's current amount.
@@ -131,6 +134,10 @@
 //!   →  proc rolls: [first landing] on_cast, then this landing's on_hit,
 //!      on_crit, on_non_crit
 //!   →  [last landing] segments_done and segments_remain reset to 0
+//!   →  [non-last segment] player-cancel check (the starting rule has
+//!      `interrupt`, its `interrupt_if` passes, not at the horizon): the
+//!      first eligible HIGHER rule wins → the cast ends (cancelled += 1,
+//!      both segment words 0) and that rule's action begins now; stop
 //!   →  [non-last segment] start the NEXT segment: evaluate its duration,
 //!      capture its cast_start snapshot if it measures there, schedule
 //!      its landing

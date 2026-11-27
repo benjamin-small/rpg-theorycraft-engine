@@ -485,6 +485,13 @@ pub struct CompiledRule {
     /// Compiled `when` predicate, if present (absent = always eligible,
     /// subject to the executor's automatic hard gates).
     pub when: Option<SimProgram>,
+    /// Whether a cast this rule starts is player-cancellable at its
+    /// non-last segment boundaries. Already resolved: true if the rule's
+    /// `interrupt` or its `interrupt_if` is set.
+    pub interrupt: bool,
+    /// Compiled `interrupt_if` predicate, if present (absent = cancellable
+    /// at every non-last boundary when `interrupt`).
+    pub interrupt_if: Option<SimProgram>,
 }
 
 /// A `SimDef` + `Rotation` compiled once against a [`Plan`]: every
@@ -859,6 +866,34 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             return Err(PlanError {
                 what: format!("rotation rule {i}: unknown action `{}`", rule.action),
             });
+        }
+    }
+
+    // Player cancels: explicit `interrupt: false` with `interrupt_if`
+    // contradicts; an interrupting rule needs a non-last segment boundary
+    // (>= 2 segments). Fail closed, naming the rule's position and action.
+    for (i, rule) in rotation.rules.iter().enumerate() {
+        if rule.interrupt == Some(false) && rule.interrupt_if.is_some() {
+            return Err(PlanError {
+                what: format!(
+                    "rotation rule {i} (action `{}`): `interrupt: false` contradicts \
+                     `interrupt_if` (which implies `interrupt: true`) — drop one",
+                    rule.action
+                ),
+            });
+        }
+        if rule.interrupt == Some(true) || rule.interrupt_if.is_some() {
+            let segs = simdef.actions[&rule.action].segments.len();
+            if segs < 2 {
+                return Err(PlanError {
+                    what: format!(
+                        "rotation rule {i} (action `{}`): `interrupt` needs an action \
+                         with at least 2 segments (a non-last boundary to cancel at), \
+                         but `{}` has {segs}",
+                        rule.action, rule.action
+                    ),
+                });
+            }
         }
     }
 
@@ -1509,9 +1544,20 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             )?),
             None => None,
         };
+        let interrupt_if = match &rule.interrupt_if {
+            Some(w) => Some(compile_sim(
+                w,
+                &syms,
+                || format!("rotation rule (action `{}`) interrupt_if", rule.action),
+                ObjectiveReads::Legal,
+            )?),
+            None => None,
+        };
         rules.push(CompiledRule {
             action: action_index(&rule.action),
             when,
+            interrupt: rule.interrupt == Some(true) || rule.interrupt_if.is_some(),
+            interrupt_if,
         });
     }
 
@@ -1717,11 +1763,15 @@ mod tests {
             extra: Default::default(),
             rules: vec![
                 Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "frost_nova".into(),
                     when: Some("and(cooldown.frost_nova == 0, buff.vuln_window == 0)".into()),
                 },
                 Rule {
+                    interrupt: None,
+                    interrupt_if: None,
                     extra: Default::default(),
                     action: "fireball".into(),
                     when: Some("mana >= 40".into()),
@@ -1786,6 +1836,8 @@ mod tests {
         let plan = toy_plan();
         let mut rotation = valid_rotation();
         rotation.rules.push(Rule {
+            interrupt: None,
+            interrupt_if: None,
             extra: Default::default(),
             action: "mystery_action".into(),
             when: None,
@@ -2576,6 +2628,8 @@ mod tests {
         );
         let mut rotation = valid_rotation();
         rotation.rules.push(Rule {
+            interrupt: None,
+            interrupt_if: None,
             extra: Default::default(),
             action: "basic_bolt".into(),
             when: None,
@@ -2635,6 +2689,156 @@ mod tests {
             a.segments[0].damage.is_none(),
             "no damage = a wind-up segment"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 5 — `interrupt` / `interrupt_if`: config and compile checks.
+    // ------------------------------------------------------------------
+
+    const CANCEL_SIMDEF: &str = r#"{
+      "actions": {
+        "slam": { "segments": [ { "duration": 0.5 }, { "duration": 0.5 } ] },
+        "one":  { "segments": [ { "duration": 0.5 } ] },
+        "jab":  { "cast_time": "0.5" }
+      },
+      "damage_objective": "hit_after_dr"
+    }"#;
+
+    fn cancel_compile(rules: &str) -> Result<SimPlan, PlanError> {
+        let def: SimDef = serde_json::from_str(CANCEL_SIMDEF).unwrap();
+        let rot: Rotation = serde_json::from_str(&format!(r#"{{ "rules": {rules} }}"#)).unwrap();
+        compile(&toy_plan(), &def, &rot)
+    }
+
+    #[test]
+    fn rule_interrupt_parses_and_defaults() {
+        let sp = cancel_compile(r#"[ { "action": "slam" } ]"#).unwrap();
+        assert!(!sp.rules[0].interrupt);
+        assert!(sp.rules[0].interrupt_if.is_none());
+
+        let sp = cancel_compile(r#"[ { "action": "slam", "interrupt": true } ]"#).unwrap();
+        assert!(sp.rules[0].interrupt);
+        assert!(sp.rules[0].interrupt_if.is_none());
+
+        // interrupt_if alone implies interrupt.
+        let sp =
+            cancel_compile(r#"[ { "action": "slam", "interrupt_if": "segments_done >= 1" } ]"#)
+                .unwrap();
+        assert!(sp.rules[0].interrupt);
+        assert!(sp.rules[0].interrupt_if.is_some());
+
+        // Explicit false alone is the default.
+        let sp = cancel_compile(r#"[ { "action": "slam", "interrupt": false } ]"#).unwrap();
+        assert!(!sp.rules[0].interrupt);
+
+        // Round-trips through serde.
+        let rot: Rotation =
+            serde_json::from_str(r#"{ "rules": [ { "action": "slam", "interrupt": true } ] }"#)
+                .unwrap();
+        let back: Rotation = serde_json::from_str(&serde_json::to_string(&rot).unwrap()).unwrap();
+        assert_eq!(back.rules[0].interrupt, Some(true));
+    }
+
+    #[test]
+    fn rule_without_interrupt_fields_serializes_without_them() {
+        let rot: Rotation =
+            serde_json::from_str(r#"{ "rules": [ { "action": "slam" } ] }"#).unwrap();
+        let out = serde_json::to_string(&rot).unwrap();
+        assert!(!out.contains("interrupt"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_misspelled_interrupt_gets_a_did_you_mean() {
+        let e = cancel_compile(r#"[ { "action": "slam", "interupt": true } ]"#).unwrap_err();
+        assert!(
+            e.what.contains("did you mean `interrupt`"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
+    fn rule_interrupt_false_with_interrupt_if_is_an_error() {
+        let e = cancel_compile(
+            r#"[ { "action": "jab" },
+                 { "action": "slam", "interrupt": false, "interrupt_if": "1" } ]"#,
+        )
+        .unwrap_err();
+        assert!(e.what.contains("rotation rule 1"), "got: {}", e.what);
+        assert!(e.what.contains("action `slam`"), "got: {}", e.what);
+        assert!(e.what.contains("interrupt"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn rule_interrupt_on_an_unsegmented_action_is_an_error() {
+        let e = cancel_compile(r#"[ { "action": "jab", "interrupt": true } ]"#).unwrap_err();
+        assert!(e.what.contains("rotation rule 0"), "got: {}", e.what);
+        assert!(e.what.contains("action `jab`"), "got: {}", e.what);
+        assert!(e.what.contains("at least 2 segments"), "got: {}", e.what);
+
+        // interrupt_if alone implies interrupt, so it is refused too.
+        let e = cancel_compile(r#"[ { "action": "jab", "interrupt_if": "1" } ]"#).unwrap_err();
+        assert!(e.what.contains("at least 2 segments"), "got: {}", e.what);
+
+        // And a 1-segment action has no non-last boundary either.
+        let e = cancel_compile(r#"[ { "action": "one", "interrupt": true } ]"#).unwrap_err();
+        assert!(e.what.contains("rotation rule 0"), "got: {}", e.what);
+        assert!(e.what.contains("action `one`"), "got: {}", e.what);
+        assert!(e.what.contains("at least 2 segments"), "got: {}", e.what);
+    }
+
+    #[test]
+    fn rule_interrupt_if_reads_objectives_legally() {
+        let sp = cancel_compile(
+            r#"[ { "action": "slam", "interrupt_if": "objective.hit_after_dr > 0" } ]"#,
+        );
+        assert!(sp.is_ok(), "got: {:?}", sp.err().map(|e| e.what));
+    }
+
+    #[test]
+    fn rule_interrupt_if_unknown_symbol_is_positioned() {
+        let e = cancel_compile(r#"[ { "action": "slam", "interrupt_if": "nonesuch > 0" } ]"#)
+            .unwrap_err();
+        assert!(
+            e.what
+                .contains("rotation rule (action `slam`) interrupt_if"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    // `interrupt_if` is a sim expression like `when`, so an
+    // `ev_uptime: expected` buff's words are forbidden in it too; the
+    // error names the field. Contrast: the same read on a discrete buff
+    // compiles.
+    #[test]
+    fn rule_interrupt_if_rejects_an_expected_buffs_words() {
+        let compile_with = |ev_uptime: &str| {
+            let def: SimDef = serde_json::from_str(&CANCEL_SIMDEF.replacen(
+                r#""damage_objective""#,
+                &format!(
+                    r#""buffs": {{ "x": {{ "duration": 1 {ev_uptime} }} }}, "damage_objective""#
+                ),
+                1,
+            ))
+            .unwrap();
+            let rot: Rotation = serde_json::from_str(
+                r#"{ "rules": [ { "action": "slam", "interrupt_if": "buff.x" } ] }"#,
+            )
+            .unwrap();
+            compile(&toy_plan(), &def, &rot)
+        };
+        let e = compile_with(r#", "ev_uptime": "expected""#).unwrap_err();
+        assert_names(
+            &e.what,
+            &[
+                "rotation rule (action `slam`) interrupt_if",
+                "buff.x",
+                "buff `x`",
+                "ev_uptime: expected",
+            ],
+        );
+        assert!(compile_with("").is_ok());
     }
 
     #[test]
@@ -3004,6 +3208,8 @@ mod tests {
         Rotation {
             extra: Default::default(),
             rules: vec![Rule {
+                interrupt: None,
+                interrupt_if: None,
                 extra: Default::default(),
                 action: "fireball".into(),
                 when: Some(when.into()),
