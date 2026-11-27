@@ -303,6 +303,12 @@ pub struct CompiledAction {
     /// Cooldown in seconds, starting when the cast begins — evaluated at
     /// cast start (see [`crate::simdef::NumOrExpr`]).
     pub cooldown: CompiledValue,
+    /// The RESOLVED global cooldown this action arms when it begins —
+    /// [`crate::simdef::ActionDef::gcd`] where the config named one, else
+    /// [`crate::simdef::SimDefaults::gcd`]. `None` = OFF the GCD (resolved
+    /// absent, or the literal `0`): the action neither waits for nor arms
+    /// the lock. `Some` = GCD-bound, the value evaluated at cast start.
+    pub gcd: Option<CompiledValue>,
     /// Resource cost paid on cast begin: `(resource index, amount)`, the
     /// amount evaluated at cast start (and at every affordability check).
     pub cost: Vec<(usize, CompiledValue)>,
@@ -1395,6 +1401,11 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             });
         }
         let cooldown = compile_value(&a.cooldown, &syms, || format!("action `{name}` cooldown"))?;
+        let gcd = match a.gcd.as_ref().or(simdef.defaults.gcd.as_ref()) {
+            None => None,
+            Some(NumOrExpr::Num(n)) if *n == 0.0 => None,
+            Some(v) => Some(compile_value(v, &syms, || format!("action `{name}` gcd"))?),
+        };
         let mut cost = Vec::new();
         for (r, v) in &a.cost {
             let v = compile_value(v, &syms, || format!("action `{name}` cost `{r}`"))?;
@@ -1438,6 +1449,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
             name: name.clone(),
             cast_time,
             cooldown,
+            gcd,
             cost,
             gain,
             damage,
@@ -1643,6 +1655,7 @@ mod tests {
         actions.insert(
             "fireball".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -1662,6 +1675,7 @@ mod tests {
         actions.insert(
             "frost_nova".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -2613,6 +2627,7 @@ mod tests {
         simdef.actions.insert(
             "basic_bolt".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,

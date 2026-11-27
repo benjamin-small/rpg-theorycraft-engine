@@ -503,6 +503,13 @@ their shape. Three groups:
       and ships candidate sets as JSON. Give them the P8a treatment
       (stored `extra` + walk, or parse-time mirror) when that happens.
 
+## Global cooldown (Unreleased) — open debt
+- **No `gcd.remains` / `gcd.max` sim symbols yet.** A rotation `when`
+  cannot read the lock; SimC-style APLs that test `gcd.remains` need
+  them. Add as engine context words when the first consumer needs one.
+- **The lock is not reported.** `SimReport` has no time-idle-on-GCD
+  figure; WoW-style reports want one.
+
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;
   the timeline executor has no notion of more than one target.

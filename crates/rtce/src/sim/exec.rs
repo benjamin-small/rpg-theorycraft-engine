@@ -1135,6 +1135,11 @@ struct Sim<'a> {
     seq: u64,
     heap: BinaryHeap<QueueItem>,
     mid_cast: bool,
+    /// When the global cooldown lock releases: a GCD-bound action may
+    /// begin only at or after this instant (see
+    /// [`crate::simdef::SimDefaults::gcd`]). `0.0` before any GCD-bound
+    /// cast, so a config without a GCD never reads anything else.
+    gcd_ready_at: f64,
     /// Segment count of the in-flight SEGMENTED cast; `0` while idle and
     /// for every unsegmented action. Set by [`Sim::begin_cast`], cleared
     /// with `segments_done` at the last landing. Feeds the reserved sim
@@ -1270,6 +1275,7 @@ impl<'a> Sim<'a> {
             seq: 0,
             heap: BinaryHeap::new(),
             mid_cast: false,
+            gcd_ready_at: 0.0,
             segments_total: 0,
             segments_done: 0,
             cast_rule: None,
@@ -2912,7 +2918,14 @@ impl<'a> Sim<'a> {
             }
         }
         let action = rule.action;
-        let cd_ready = self.actions[action].cooldown_ready_at;
+        // A GCD-bound action is held by the lock exactly like a cooldown,
+        // so the eligibility answer and the wake time both see it.
+        let cd_ready = match sim_plan.actions[action].gcd {
+            Some(_) => self.actions[action]
+                .cooldown_ready_at
+                .max(self.gcd_ready_at),
+            None => self.actions[action].cooldown_ready_at,
+        };
         let words = sim_plan.segments_done_slot;
         let live_words = cancel_scan.then(|| {
             let live = [self.scratch.slots[words], self.scratch.slots[words + 1]];
@@ -3027,7 +3040,12 @@ impl<'a> Sim<'a> {
         // `cost` and `cooldown` share the pre-payment world: one fill.
         let sim_plan = self.sim_plan;
         let a = &sim_plan.actions[action];
-        let start_values = a.cost.iter().map(|(_, v)| v).chain([&a.cooldown]);
+        let start_values = a
+            .cost
+            .iter()
+            .map(|(_, v)| v)
+            .chain([&a.cooldown])
+            .chain(a.gcd.iter());
         self.fill_for_action_values(action, start_values, "at cast start")?;
         let costs = self.eval_costs(action, now, "at cast start")?;
         let cooldown = self.eval_quantity(&self.sim_plan.actions[action].cooldown, || {
@@ -3036,8 +3054,20 @@ impl<'a> Sim<'a> {
                 self.sim_plan.actions[action].name
             )
         })?;
+        let gcd = match &self.sim_plan.actions[action].gcd {
+            Some(v) => Some(self.eval_quantity(v, || {
+                format!(
+                    "action `{}` gcd at cast start (t={now})",
+                    self.sim_plan.actions[action].name
+                )
+            })?),
+            None => None,
+        };
         self.pay_cost(&costs, now);
         self.actions[action].cooldown_ready_at = now + cooldown;
+        if let Some(gcd) = gcd {
+            self.gcd_ready_at = now + gcd;
+        }
 
         self.refresh_time_varying_slots();
         // A segmented action (no `cast_time`): the cast is in flight from
@@ -4628,6 +4658,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -4734,6 +4765,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -4840,6 +4872,7 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -4893,6 +4926,7 @@ mod tests {
         actions.insert(
             "nova".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -4961,6 +4995,7 @@ mod tests {
         actions.insert(
             "spender".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -4980,6 +5015,7 @@ mod tests {
         actions.insert(
             "generator".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -5044,6 +5080,7 @@ mod tests {
         actions.insert(
             "beam".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -5157,6 +5194,7 @@ mod tests {
         actions.insert(
             "charge_gen".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -5173,6 +5211,7 @@ mod tests {
         actions.insert(
             "filler".to_string(),
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -5294,6 +5333,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5398,6 +5438,7 @@ mod tests {
             actions.insert(
                 "spender".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5489,6 +5530,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5505,6 +5547,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5641,6 +5684,7 @@ mod tests {
             actions.insert(
                 "a".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5718,6 +5762,7 @@ mod tests {
             actions.insert(
                 "instant_nop".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5816,6 +5861,7 @@ mod tests {
             actions.insert(
                 "empower".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5832,6 +5878,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -5953,6 +6000,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6026,6 +6074,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6187,6 +6236,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6310,6 +6360,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6606,6 +6657,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6713,6 +6765,7 @@ mod tests {
                 actions.insert(
                     "spam".to_string(),
                     ActionDef {
+                        gcd: None,
                         crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
@@ -6805,6 +6858,7 @@ mod tests {
             actions.insert(
                 "trigger".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6821,6 +6875,7 @@ mod tests {
             actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6904,6 +6959,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -6973,6 +7029,7 @@ mod tests {
             actions.insert(
                 "spam".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -7124,6 +7181,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -7143,6 +7201,7 @@ mod tests {
             actions.insert(
                 "ping".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -7276,6 +7335,7 @@ mod tests {
             actions.insert(
                 "strike".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -7941,6 +8001,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -8049,6 +8110,7 @@ mod tests {
             actions.insert(
                 "spend".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -8426,6 +8488,7 @@ mod tests {
             simdef.actions.insert(
                 "nuke".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -8576,6 +8639,7 @@ mod tests {
                 simdef.actions.insert(
                     name.to_string(),
                     ActionDef {
+                        gcd: None,
                         crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
@@ -8934,6 +8998,7 @@ mod tests {
             actions.insert(
                 "opener".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -8952,6 +9017,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -9973,6 +10039,7 @@ mod tests {
         /// for, and the one the D4 example's `frost_nova` now uses.
         fn utility(cast_time: &str, cooldown: f64, apply_buff: Vec<String>) -> ActionDef {
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -9997,6 +10064,7 @@ mod tests {
             apply_buff: Vec<String>,
         ) -> ActionDef {
             ActionDef {
+                gcd: None,
                 crit_rolls: None,
                 extra: Default::default(),
                 measure: None,
@@ -11626,6 +11694,7 @@ mod tests {
             actions.insert(
                 "filler".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -11645,6 +11714,7 @@ mod tests {
             actions.insert(
                 "ping".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -14568,6 +14638,7 @@ mod tests {
             actions.insert(
                 "venom".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
@@ -14774,6 +14845,7 @@ mod tests {
                 simdef.actions.insert(
                     "filler".to_string(),
                     ActionDef {
+                        gcd: None,
                         crit_rolls: None,
                         extra: Default::default(),
                         measure: None,
@@ -14910,6 +14982,7 @@ mod tests {
             actions.insert(
                 "shout".to_string(),
                 ActionDef {
+                    gcd: None,
                     crit_rolls: None,
                     extra: Default::default(),
                     measure: None,
