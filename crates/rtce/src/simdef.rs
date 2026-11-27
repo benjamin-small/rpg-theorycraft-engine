@@ -104,6 +104,56 @@ pub struct SimDefaults {
     /// every action sample its crit per hit.
     #[serde(default)]
     pub proc_rolls: ProcRolls,
+    /// The global cooldown (GCD) every action that does not override it
+    /// triggers when its cast BEGINS, in seconds: a lock during which no
+    /// other GCD-bound action may begin. Literal or expression (see
+    /// [`NumOrExpr`]), e.g. WoW's haste-scaled
+    /// `"max(0.75, 1.5 / (1 + haste / 100))"`.
+    ///
+    /// # Default
+    ///
+    /// ABSENT (`None`) = no global cooldown at all — the pre-GCD
+    /// behavior, byte-identical for every config that names neither this
+    /// field nor [`ActionDef::gcd`]. The resolution per action is
+    /// `action.gcd ?? defaults.gcd ?? none`.
+    ///
+    /// # Evaluation instant
+    ///
+    /// AT CAST START, in the same pre-payment world as `cost` and
+    /// `cooldown` (a resource read sees the amount BEFORE this cast
+    /// spends it). Must be finite and `>= 0`; anything else fails closed
+    /// naming the action. Evaluated per cast, so a haste buff that lands
+    /// mid-fight shortens every GCD begun after it.
+    ///
+    /// # Interactions
+    ///
+    /// - **GCD-bound vs off-GCD.** An action is GCD-BOUND when its
+    ///   resolved value is present and not the literal `0`. A GCD-bound
+    ///   action may not begin while the lock is held, and arms it (to
+    ///   `now + gcd`) when it begins. An off-GCD action (resolved absent,
+    ///   or literal `0`) ignores the lock entirely: it neither waits for
+    ///   it nor arms it, so it can be woven inside another action's GCD
+    ///   at the same instant. An EXPRESSION that happens to evaluate to
+    ///   `0` is still GCD-bound — it waits for a held lock, then arms a
+    ///   zero-length one.
+    /// - **`cast_time`.** The lock runs CONCURRENTLY with the cast, from
+    ///   its start: the actor is busy until `max(cast end, GCD end)` for
+    ///   the next GCD-bound action. A cast longer than the GCD is paced
+    ///   by its cast time; a shorter one (an instant) leaves the actor
+    ///   waiting out the lock. Effects still land at cast completion.
+    /// - **Rotation priority.** A GCD-bound rule blocked by the lock is
+    ///   skipped like one on cooldown, so a LOWER-ranked off-GCD rule can
+    ///   fire during the lock; the decision re-runs when the lock ends.
+    /// - **Segments** ([`ActionDef::segments`]): a segmented cast arms the
+    ///   lock once, at its start, like any other cast.
+    /// - **Player cancels** (`Rule::interrupt`): the replacement cast is
+    ///   gated by the lock like any decision, and a cancel never refunds
+    ///   the cancelled cast's GCD.
+    /// - **Free casts** (a proc's `cast_action`): never gated and never
+    ///   arming, whatever either action's `gcd` says — a free cast is not
+    ///   a decision of the rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcd: Option<NumOrExpr>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything
     /// else fails closed at `sim::compile`, naming this block.
@@ -116,7 +166,7 @@ impl SimDefaults {
     /// Staleness here only degrades the did-you-mean, never
     /// correctness — see `config_keys`' module docs ("Staleness").
     pub(crate) const KNOWN_KEYS: &'static [&'static str] =
-        &["measure", "event_order", "proc_rolls"];
+        &["measure", "event_order", "proc_rolls", "gcd"];
 
     /// `true` when serializing this block would write nothing a reader
     /// needs: every knob at its default AND no `_` annotations to carry
@@ -635,6 +685,28 @@ pub struct ActionDef {
     /// see [`NumOrExpr`].
     #[serde(default)]
     pub cooldown: NumOrExpr,
+    /// Per-action override of [`SimDefaults::gcd`] — the global cooldown
+    /// THIS action triggers when it begins. `0` makes the action OFF the
+    /// GCD (it neither waits for nor arms the lock, even when the
+    /// defaults block sets one).
+    ///
+    /// # Default
+    ///
+    /// ABSENT (`None`) = inherit [`SimDefaults::gcd`], whose own default
+    /// is no GCD. A present value here always wins.
+    ///
+    /// # Evaluation instant
+    ///
+    /// AT CAST START, as [`SimDefaults::gcd`] documents.
+    ///
+    /// # Interactions
+    ///
+    /// Every interaction is [`SimDefaults::gcd`]'s, applied to the
+    /// resolved value: what "GCD-bound" means, how the lock overlaps
+    /// `cast_time`, how it orders against rotation priority, segments,
+    /// cancels, and free casts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcd: Option<NumOrExpr>,
     /// Resource cost paid when the cast begins, by resource name. Literal
     /// or expression; an expression is evaluated AT CAST START, and also
     /// at every decision point that checks whether this action is
@@ -934,6 +1006,7 @@ impl ActionDef {
     pub(crate) const KNOWN_KEYS: &'static [&'static str] = &[
         "cast_time",
         "cooldown",
+        "gcd",
         "cost",
         "gain",
         "damage",
