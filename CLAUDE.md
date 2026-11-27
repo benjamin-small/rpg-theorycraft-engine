@@ -10,14 +10,14 @@ truth) and `docs/superpowers/plans/` for the active plan.
 
 ## Consumers
 
-Both consume `rtce` from **crates.io** (verified 2026-11-26), NOT by path,
+Both consume `rtce` from **crates.io** (verified 2026-11-27), NOT by path,
 so a change here does NOT reach them until it is published and they bump
 their requirement. Both were renamed and restructured in 2026-08:
 
 | now | was | requires | consumes |
 |---|---|---|---|
-| `../d4-theory-crafting` | `diablo4-calc` | `rtce = "0.7"` (bumped from 0.4 in d4#14) | `plan` (production: its native math is deleted) |
-| `../poe2-theory-crafting` | `poe2-calcs` | `rtce = "0.7.0"` | `plan` + `sim` + `search` (parity proof; its `calc.rs` stays normative) |
+| `../d4-theory-crafting` | `diablo4-calc` | `rtce = "0.10"` (bumped from 0.8 in d4#18) | `plan` (production: its native math is deleted) |
+| `../poe2-theory-crafting` | `poe2-calcs` | `rtce = "0.10.0"` (bumped from 0.9.1 in poe2#263) | `plan` + `sim` + `search` (parity proof; its `calc.rs` stays normative) |
 
 To test THIS working tree against a consumer, override its dependency for
 one run without editing its manifest, then restore its lockfile:
@@ -25,7 +25,7 @@ one run without editing its manifest, then restore its lockfile:
 (both consumers track `Cargo.lock`: restore it afterwards with `git
 checkout Cargo.lock`). That works only while the consumer's requirement
 accepts this crate's version: when this crate's version moves to a new
-0.x minor (e.g. 0.8.0), both consumers' `^0.7` stops matching and each
+0.x minor (e.g. 0.11.0), both consumers' `^0.10` stops matching and each
 needs a requirement bump before the override applies again.
 
 Older entries in CHANGELOG and `docs/superpowers/` use the previous names
