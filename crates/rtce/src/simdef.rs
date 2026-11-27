@@ -2021,7 +2021,7 @@ pub struct Rule {
     /// - **Interactions:** same constraints as `interrupt` (segmented,
     ///   at least 2 segments); a falsy value means no cancel at that
     ///   boundary, and the cast simply continues. EV = MC.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_if: Option<String>,
     /// Unknown keys collected at parse — see [`SimDef`]'s "Unknown keys"
     /// section: `_`-prefixed annotations survive round-trips; anything

@@ -2740,6 +2740,24 @@ mod tests {
     }
 
     #[test]
+    fn rule_without_interrupt_fields_serializes_without_them() {
+        let rot: Rotation =
+            serde_json::from_str(r#"{ "rules": [ { "action": "slam" } ] }"#).unwrap();
+        let out = serde_json::to_string(&rot).unwrap();
+        assert!(!out.contains("interrupt"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_misspelled_interrupt_gets_a_did_you_mean() {
+        let e = cancel_compile(r#"[ { "action": "slam", "interupt": true } ]"#).unwrap_err();
+        assert!(
+            e.what.contains("did you mean `interrupt`"),
+            "got: {}",
+            e.what
+        );
+    }
+
+    #[test]
     fn rule_interrupt_false_with_interrupt_if_is_an_error() {
         let e = cancel_compile(
             r#"[ { "action": "jab" },
