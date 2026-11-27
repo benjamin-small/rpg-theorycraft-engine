@@ -1413,18 +1413,40 @@ impl<'a> Sim<'a> {
     /// driving it WINS over the current phase's static uptime (spec
     /// precedence rule); first match in buff-index order if more than one
     /// active buff drives the same name.
+    ///
+    /// A condition driven by an EV `ev_uptime: expected` buff `bi` (see
+    /// [`SimPlan::condition_expected`]) is instead the EXPECTATION of
+    /// that rule: `P·v + (1 − P)·static`, with `static` the current
+    /// phase's uptime, clamped exactly as the plain branch clamps it, and
+    /// `v` left as raw as an active buff's value is. `sim::compile`
+    /// guarantees no other buff drives such a condition, so there is no
+    /// precedence to resolve. It is re-read at every refold — each P
+    /// step (roll, age-out) AND each phase boundary, where the static
+    /// half moves under an unchanged P. At P = 0 it is exactly `static`,
+    /// at P = 1 exactly `v`. In MC `ev_expected` is all-false, so this
+    /// branch never runs there.
     fn condition_value(&self, name: &str) -> f64 {
+        let static_uptime = || {
+            self.scenario.phases[self.current_phase]
+                .uptimes
+                .get(name)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+        };
+        if let Some(&bi) = self.sim_plan.condition_expected.get(name) {
+            if self.ev_expected[bi] {
+                let p = self.buffs[bi].p;
+                let v = self.sim_plan.buffs[bi].conditions[name];
+                return p * v + (1.0 - p) * static_uptime();
+            }
+        }
         for &bi in &self.active_buff_set {
             if let Some(v) = self.sim_plan.buffs[bi].conditions.get(name) {
                 return *v;
             }
         }
-        self.scenario.phases[self.current_phase]
-            .uptimes
-            .get(name)
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0)
+        static_uptime()
     }
 
     /// Recompute everything derived from `(current_phase, active_buff_set)`:
@@ -1485,6 +1507,23 @@ impl<'a> Sim<'a> {
                 c
             }));
         }
+        // An EV expected buff is never in `active_buff_set`: it folds
+        // here instead, at `value × P` — the expected value, by linearity
+        // for one buff, and the same per-value scaling `stacks` uses
+        // above. P = 0 folds nothing (the buff is certainly down); a
+        // zero-valued contribution is the identity in every fold kind
+        // anyway, so the skip only saves the clones. Empty in MC.
+        for &bi in &self.expected_list {
+            let p = self.buffs[bi].p;
+            if p == 0.0 {
+                continue;
+            }
+            contributions.extend(self.sim_plan.buffs[bi].contributions.iter().map(|c| {
+                let mut c = c.clone();
+                c.value *= p;
+                c
+            }));
+        }
         self.effective_damage_build = BuildState {
             stats: self.build.stats.clone(),
             contributions,
@@ -1522,8 +1561,16 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// Credit every ticking buff's DoT damage since its last flush at
+    /// its current `tick_rate`: the active buffs, plus each EV expected
+    /// buff with a (necessarily live) `tick_objective`, whose rate
+    /// [`Sim::refresh_after_change`] set to `rate × P`.
     fn flush_ticks(&mut self, now: f64) {
-        for &bi in &self.active_buff_set {
+        for k in 0..self.active_buff_set.len() + self.expected_list.len() {
+            let bi = match k.checked_sub(self.active_buff_set.len()) {
+                None => self.active_buff_set[k],
+                Some(j) => self.expected_list[j],
+            };
             if self.sim_plan.buffs[bi].tick_objective.is_some() {
                 let b = &mut self.buffs[bi];
                 let elapsed = now - b.tick_last_eval;
@@ -1572,6 +1619,24 @@ impl<'a> Sim<'a> {
                     // tick the same re-evaluated rate k times over.
                     let val = self.eval_objective(tick.objective, None)?;
                     val * self.buffs[bi].instances.len() as f64
+                };
+                let b = &mut self.buffs[bi];
+                b.tick_rate = rate;
+                b.tick_last_eval = now;
+            }
+        }
+        // An EV expected buff's live DoT ticks `rate × P` (`sim::compile`
+        // forbids a snapshot one). P = 0 ticks nothing and evaluates
+        // nothing, as an inactive discrete buff does. Empty in MC.
+        for k in 0..self.expected_list.len() {
+            let bi = self.expected_list[k];
+            if let Some(tick) = self.sim_plan.buffs[bi].tick_objective {
+                debug_assert!(!tick.snapshot, "rejected by sim::compile");
+                let p = self.buffs[bi].p;
+                let rate = if p == 0.0 {
+                    0.0
+                } else {
+                    self.eval_objective(tick.objective, None)? * p
                 };
                 let b = &mut self.buffs[bi];
                 b.tick_rate = rate;
@@ -16162,21 +16227,23 @@ mod tests {
 
         // --------------------------------------------------------------
         // q = 1 is binary: the expected report must equal the discrete
-        // one. `a` (1 s, cd 2) completes at 1,3,5,7,9; `b` (1 s) fills at
-        // 2,4,..,10. `spark` (on_hit, chance 1, `a` only) applies `x` for
-        // D = 2, so the window from `a`@1 ends EXACTLY at `a`@3's
-        // completion — an age-out coincident with a CastComplete, whose
-        // order the two EventOrders decide differently. `x` drives `c`,
-        // and `hit = dmg × (1 + c)`, so the discrete damage proves the
-        // fixture really is coincident (it differs between the orders).
-        // Condition/damage equality under `expected` is task 4 (the
-        // readers); here: the buff report, field for field, both orders.
+        // one, FIELD FOR FIELD (the whole serialized report). `a` (1 s,
+        // cd 2) completes at 1,3,5,7,9; `b` (1 s) fills at 2,4,..,10.
+        // `spark` (on_hit, chance 1, `a` only) applies `x` for D = 2, so
+        // the window from `a`@1 ends EXACTLY at `a`@3's completion — an
+        // age-out coincident with a CastComplete, whose order the two
+        // EventOrders decide differently. `x` drives `c` AND adds +50 to
+        // `bonus`, and `hit = dmg × (1 + c) × (1 + bonus/100)`, so both
+        // readers feed damage and the discrete damage proves the fixture
+        // really is coincident (it differs between the orders).
         // --------------------------------------------------------------
         #[test]
         fn ev_uptime_expected_q_one_equals_discrete() {
             let def: GameDef = serde_json::from_str(
                 r#"{ "stats": ["dmg"], "conditions": ["c"],
-                     "pipeline": [ { "name": "hit", "expr": "dmg * (1 + c)" } ],
+                     "buckets": { "bonus": { "fold": "sum" } },
+                     "pipeline": [ { "name": "hit",
+                                     "expr": "dmg * (1 + c) * (1 + bonus / 100)" } ],
                      "objectives": ["hit"] }"#,
             )
             .unwrap();
@@ -16188,7 +16255,8 @@ mod tests {
                          "actions": {{
                            "a": {{ "cast_time": "1", "cooldown": 2, "damage": {{ "stats": {{}} }} }},
                            "b": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
-                         "buffs": {{ "x": {{ "duration": 2, "conditions": {{ "c": 1.0 }}{} }} }},
+                         "buffs": {{ "x": {{ "duration": 2, "conditions": {{ "c": 1.0 }},
+                                         "contributions": [ {{ "bucket": "bonus", "value": 50.0 }} ]{} }} }},
                          "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "1",
                                                 "actions": ["a"], "apply_buff": "x" }} }},
                          "damage_objective": "hit" }}"#,
@@ -16201,21 +16269,24 @@ mod tests {
                 let dis = run_json(&plan, &simdef(false, order), rot, 10.0, Mode::Expected);
                 assert_eq!(dis.actions["a"].casts, 5, "{order}");
                 assert_eq!(dis.actions["b"].casts, 5, "{order}");
-                let (e, d) = (&exp.buffs["x"], &dis.buffs["x"]);
-                assert_eq!(e.uptime, d.uptime, "{order}: uptime");
-                assert_eq!(e.avg_stacks, d.avg_stacks, "{order}: avg_stacks");
                 assert!(
-                    close(d.uptime, 0.9),
+                    close(dis.buffs["x"].uptime, 0.9),
                     "{order}: up on [1,10], got {}",
-                    d.uptime
+                    dis.buffs["x"].uptime
+                );
+                assert_eq!(
+                    serde_json::to_string(&exp).unwrap(),
+                    serde_json::to_string(&dis).unwrap(),
+                    "{order}: the whole report"
                 );
                 discrete_damage.push(dis.total.total_damage);
             }
-            // completions_first: `a`@1 unbuffed (its own application
-            // lands after its damage), 2..10 buffed → 100 + 9 × 200 =
-            // 1900. scheduled: each expiry from `a`@k pops before
-            // `a`@(k+2)'s completion → `a`@3,5,7,9 unbuffed → 1500.
-            assert_eq!(discrete_damage, [1500.0, 1900.0]);
+            // A buffed cast is 100 × 2 × 1.5 = 300. completions_first:
+            // `a`@1 unbuffed (its own application lands after its
+            // damage), 2..10 buffed → 100 + 9 × 300 = 2800. scheduled:
+            // each expiry from `a`@k pops before `a`@(k+2)'s completion →
+            // `a`@1,3,5,7,9 unbuffed, every `b` buffed → 500 + 1500 = 2000.
+            assert_eq!(discrete_damage, [2000.0, 2800.0]);
         }
 
         // --------------------------------------------------------------
@@ -16619,6 +16690,307 @@ mod tests {
             let x_age_out = seq_of(|e| matches!(e, Event::ExpectedAgeOut { .. }));
             let y_expire = seq_of(|e| matches!(e, Event::BuffExpire { .. }));
             assert!(x_age_out < y_expire, "x {x_age_out} vs y {y_expire}");
+        }
+
+        // ==============================================================
+        // Task 4: the readers. Every fixture below is Task 3's
+        // hand-worked timeline unless it says otherwise: 1 s `strike`s
+        // complete at t = 1..10, each an on_hit roll at q = 0.5 applying
+        // `x` for D = 2.5 s, with the default `scheduled` order (no
+        // age-out at a half-integer ever meets a completion).
+        //
+        //   P on [1,2) 0.5; [2,3) 0.75; [k,k+½) 0.875 and [k+½,k+1) 0.75
+        //   for k = 3..9 → ∫₀¹⁰ P = 0.5 + 0.75 + 7 × 0.8125 = 6.9375.
+        //   P read by the cast completing at t (its damage is measured
+        //   BEFORE its own roll): t=1 0, t=2 0.5, t=3..10 0.75 (the
+        //   entry from t−3 aged out at t−½, leaving the two from t−2 and
+        //   t−1: 0.25 + 0.5).
+        // discrete: fires at casts 2,4,6,8,10 → up on [2,10]; casts
+        //   3..10 buffed.
+        // ==============================================================
+
+        /// `hit = dmg × (1 + bonus/100)` (a `sum` bucket); `dot = dmg/10`
+        /// (= 10, a live DoT rate nothing here moves); `recently`, a
+        /// condition the pipeline does not read (its report is the point).
+        fn reader_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"], "conditions": ["recently"],
+                     "buckets": { "bonus": { "fold": "sum" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * (1 + bonus / 100)" },
+                                   { "name": "dot", "expr": "dmg / 10" } ],
+                     "objectives": ["hit", "dot"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        /// The timeline above, with `x_extra` (each field with a LEADING
+        /// comma) spliced into `x`, and an optional `rest` of top-level
+        /// fields (each with a trailing comma).
+        fn reader_simdef(
+            expected: bool,
+            chance: &str,
+            d: f64,
+            x_extra: &str,
+            rest: &str,
+        ) -> String {
+            format!(
+                r#"{{ {rest}
+                     "actions": {{ "strike": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                     "buffs": {{ "x": {{ "duration": {d}{x_extra}{} }} }},
+                     "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "{chance}",
+                                            "apply_buff": "x" }} }},
+                     "damage_objective": "hit" }}"#,
+                knob(expected)
+            )
+        }
+
+        fn scenario(json: &str) -> Scenario {
+            serde_json::from_str(json).unwrap()
+        }
+
+        /// One phase of 10 s with `recently` statically up 20%.
+        const STATIC_02: &str =
+            r#"{ "phases": [ { "name": "p", "weight": 10, "uptimes": { "recently": 0.2 } } ] }"#;
+
+        fn reader_run(expected: bool, x_extra: &str, sc: &str) -> SimReport {
+            let plan = reader_plan();
+            let sp = compile_json(
+                &plan,
+                &reader_simdef(expected, "0.5", 2.5, x_extra, ""),
+                STRIKE_ROT,
+            );
+            run(&plan, &sp, &minimal_build(), &scenario(sc), Mode::Expected).unwrap()
+        }
+
+        const DRIVES_RECENTLY: &str = r#", "conditions": { "recently": 1.0 }"#;
+
+        // --------------------------------------------------------------
+        // condition = P·v + (1 − P)·static: ∫ = 6.9375 + 0.2 × (10 −
+        // 6.9375) = 7.55 → 0.755. discrete: 8 + 0.2 × 2 = 8.4 → 0.84.
+        // Mutation: dropping the (1 − P)·static term → 0.69375.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_condition_blends_with_static() {
+            let exp = reader_run(true, DRIVES_RECENTLY, STATIC_02);
+            let dis = reader_run(false, DRIVES_RECENTLY, STATIC_02);
+            let (e, d) = (
+                exp.condition_uptime["recently"],
+                dis.condition_uptime["recently"],
+            );
+            assert!(close(e, 0.755), "expected: got {e}");
+            assert!(close(d, 0.84), "discrete: got {d}");
+        }
+
+        // --------------------------------------------------------------
+        // Review Focus 5: the blend re-reads the static uptime when the
+        // PHASE moves, with P unchanged. Static 0.2 on [0,5), 0.6 on
+        // [5,10). ∫P splits 2.875 (0.5 + 0.75 + 2 × 0.8125) / 4.0625.
+        //   [0,5):  0.2 × 5 + 0.8 × 2.875  = 3.3
+        //   [5,10): 0.6 × 5 + 0.4 × 4.0625 = 4.625
+        //   → 7.925 / 10 = 0.7925.
+        // A blend frozen at the old static (0.2) would give 0.755.
+        // discrete: [0,5) 3 + 0.2 × 2 = 3.4, [5,10) 5 → 0.84.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_condition_reblends_at_phase_boundary() {
+            let sc = r#"{ "phases": [
+                { "name": "a", "weight": 5, "uptimes": { "recently": 0.2 } },
+                { "name": "b", "weight": 5, "uptimes": { "recently": 0.6 } } ] }"#;
+            let exp = reader_run(true, DRIVES_RECENTLY, sc);
+            let dis = reader_run(false, DRIVES_RECENTLY, sc);
+            let (e, d) = (
+                exp.condition_uptime["recently"],
+                dis.condition_uptime["recently"],
+            );
+            assert!(close(e, 0.7925), "expected: got {e}");
+            assert!(close(d, 0.84), "discrete: got {d}");
+        }
+
+        const ADDS_BONUS: &str = r#", "contributions": [ { "bucket": "bonus", "value": 100.0 } ]"#;
+
+        // --------------------------------------------------------------
+        // contribution value × P: each cast's damage is 100 × (1 + P)
+        // at its completion. Per-cast P 0, 0.5, 0.75 × 8 →
+        //   100 × (10 + 0.5 + 6) = 1650.
+        // discrete: casts 3..10 at 200 → 100 × 2 + 200 × 8 = 1800.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_contribution_scales_by_p() {
+            let exp = reader_run(true, ADDS_BONUS, STATIC_02);
+            let dis = reader_run(false, ADDS_BONUS, STATIC_02);
+            assert!(
+                close(exp.total.total_damage, 1650.0),
+                "expected: got {}",
+                exp.total.total_damage
+            );
+            assert!(
+                close(dis.total.total_damage, 1800.0),
+                "discrete: got {}",
+                dis.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // live tick_objective rate × P: x's DoT is 10 × ∫P = 69.375.
+        // discrete: 10 × 8 = 80. The casts add their plain 1000.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_live_tick_scales_by_p() {
+            let dot = r#", "tick_objective": { "objective": "dot" }"#;
+            let exp = reader_run(true, dot, STATIC_02);
+            let dis = reader_run(false, dot, STATIC_02);
+            let (e, d) = (exp.buffs["x"].damage, dis.buffs["x"].damage);
+            assert!(close(e, 69.375), "expected: got {e}");
+            assert!(close(d, 80.0), "discrete: got {d}");
+            assert!(close(exp.total.total_damage, 1069.375));
+        }
+
+        // --------------------------------------------------------------
+        // Ledger 4: q == 0 (chance 0) is "never applied": no roll is
+        // logged, no age-out is ever pushed, the condition reads the
+        // static uptime, and the contribution is absent (plain 1000).
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_q_zero_is_never_applied() {
+            let plan = reader_plan();
+            let x = format!("{DRIVES_RECENTLY}{ADDS_BONUS}");
+            let sp = compile_json(&plan, &reader_simdef(true, "0", 2.5, &x, ""), STRIKE_ROT);
+            let build = minimal_build();
+            let sc = scenario(STATIC_02);
+            let sim = ev_sim(&plan, &sp, &build, &sc);
+            assert_eq!(sim.age_outs_scheduled, 0);
+            let r = sim.into_report();
+            assert_eq!(r.actions["strike"].casts, 10);
+            assert_eq!(r.buffs["x"].applications, 0);
+            assert_eq!(r.buffs["x"].uptime, 0.0);
+            assert_eq!(r.condition_uptime["recently"], 0.2);
+            assert_eq!(r.total.total_damage, 1000.0);
+        }
+
+        // --------------------------------------------------------------
+        // Ledger 3, at reader level: under completions_first a cast
+        // completing at the instant an entry ends pops BEFORE that
+        // entry's age-out and must still see its weight. 1 s strikes,
+        // on_hit q 0.5, D 2 (the entry from t ends at t+2, exactly on a
+        // completion), +100 bonus, horizon 4. P read by each cast:
+        //   completions_first: t=1 0, t=2 0.5, t=3 0.25 + 0.5 = 0.75
+        //     (the t=1 entry is still live), t=4 0.75 (after t=3's roll
+        //     0.125 + 0.25 + 0.5, the t=1 age-out leaves 0.75; the t=2
+        //     entry is again still live at t=4)
+        //     → 100 + 150 + 175 + 175 = 600
+        //   scheduled: the age-out pops first at t=3 and t=4 → 0.5 each
+        //     → 100 + 150 + 150 + 150 = 550
+        // Mutation: ExpectedAgeOut outranking CastComplete under
+        // completions_first → 550 there.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_coincident_cast_reads_the_ending_entry() {
+            let plan = reader_plan();
+            for (order, want) in [("completions_first", 600.0), ("scheduled", 550.0)] {
+                let rest = format!(r#""defaults": {{ "event_order": "{order}" }},"#);
+                let sp = compile_json(
+                    &plan,
+                    &reader_simdef(true, "0.5", 2.0, ADDS_BONUS, &rest),
+                    STRIKE_ROT,
+                );
+                let r = run(&plan, &sp, &minimal_build(), &dummy(4.0), Mode::Expected).unwrap();
+                assert_eq!(r.actions["strike"].casts, 4, "{order}");
+                assert!(
+                    close(r.total.total_damage, want),
+                    "{order}: got {}",
+                    r.total.total_damage
+                );
+            }
+        }
+
+        // --------------------------------------------------------------
+        // Ledger 2 (M8): an age-out RESCHEDULED from the age-out handler
+        // keeps its entry's stored seq. q = 1, so `expected` must equal
+        // `discrete` field for field.
+        //   `a` (1 s, only while casts.a < 2) completes at 1 and 2, each
+        //   applying `x` (chance 1, D 2): entries end at 3 (seq s₁) and 4
+        //   (seq s₂). `b` (2 s) starts at 2 — AFTER a@2's roll, so its
+        //   completion at 4 holds seq s_b > s₂ — and completes at 4, 6.
+        //   At t=3 the age-out drops the (zero-weight) t=1 entry and
+        //   reschedules at 4: THAT push is the one under test (at a@2's
+        //   roll the head did not move, so nothing was pushed then).
+        //   discrete: a@2's refresh pushed x's BuffExpire at 4 with a seq
+        //   below s_b, so under `scheduled` it pops first and b@4 is
+        //   unbuffed; under completions_first b@4 pops first, buffed.
+        //   hit = dmg × (1 + c): a@1 100, a@2 200, b@4 100 | 200, b@6 100
+        //   → scheduled 500, completions_first 600.
+        // Mutation: a fresh seq on the reschedule (> s_b) → under
+        // `scheduled` b@4 is buffed: 600 ≠ 500.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_rescheduled_age_out_keeps_the_stored_seq() {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg"], "conditions": ["c"],
+                     "pipeline": [ { "name": "hit", "expr": "dmg * (1 + c)" } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            let plan = plan::compile(&def).unwrap();
+            let rot = r#"{ "rules": [ { "action": "a", "when": "casts.a < 2" },
+                                      { "action": "b" } ] }"#;
+            let simdef = |expected: bool, order: &str| {
+                format!(
+                    r#"{{ "defaults": {{ "event_order": "{order}" }},
+                         "actions": {{
+                           "a": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }},
+                           "b": {{ "cast_time": "2", "damage": {{ "stats": {{}} }} }} }},
+                         "buffs": {{ "x": {{ "duration": 2, "conditions": {{ "c": 1.0 }}{} }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "1",
+                                                "actions": ["a"], "apply_buff": "x" }} }},
+                         "damage_objective": "hit" }}"#,
+                    knob(expected)
+                )
+            };
+            let mut discrete_damage = Vec::new();
+            for order in ["scheduled", "completions_first"] {
+                let exp = run_json(&plan, &simdef(true, order), rot, 6.0, Mode::Expected);
+                let dis = run_json(&plan, &simdef(false, order), rot, 6.0, Mode::Expected);
+                assert_eq!(dis.actions["a"].casts, 2, "{order}");
+                assert_eq!(dis.actions["b"].casts, 2, "{order}");
+                assert_eq!(
+                    serde_json::to_string(&exp).unwrap(),
+                    serde_json::to_string(&dis).unwrap(),
+                    "{order}"
+                );
+                discrete_damage.push(dis.total.total_damage);
+            }
+            assert_eq!(discrete_damage, [500.0, 600.0]);
+        }
+
+        // --------------------------------------------------------------
+        // Ledger 5: the equal-P transaction skip IS observable, through
+        // a resource whose `max` reads `time` (max/regen are evaluated
+        // only at a refold). q = 1 every second keeps P bit-exactly 1
+        // from t=1 on (older weights × 0), so every later roll and every
+        // age-out (of a zero-weight entry) leaves P unchanged; the
+        // discrete twin's refreshes likewise move no count and refold
+        // nothing. Both refold once, at t=1 → max = 1. Nothing spends or
+        // settles `mana` until the end: amount 0 (= max at t=0),
+        // regen 1/s over 10 s reaches max 1 at t=1 → time_capped 9.
+        // Mutation: no skip → a refold at every roll/age-out, the last
+        // at t=10 (max 10) → time_capped 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_equal_p_skips_the_refold() {
+            let plan = reader_plan();
+            let rest = r#""resources": { "mana": { "max": "time", "regen_per_sec": "1" } },"#;
+            let mut capped = Vec::new();
+            for expected in [true, false] {
+                let sp = compile_json(
+                    &plan,
+                    &reader_simdef(expected, "1", 2.5, "", rest),
+                    STRIKE_ROT,
+                );
+                let r = run(&plan, &sp, &minimal_build(), &dummy(10.0), Mode::Expected).unwrap();
+                capped.push(r.resources["mana"].time_capped);
+            }
+            assert_eq!(capped, [9.0, 9.0], "[expected, discrete]");
         }
     }
 }
