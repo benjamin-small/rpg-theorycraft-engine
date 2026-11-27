@@ -104,28 +104,28 @@ pub(crate) fn q_of(nf: &NoFire, crit: CritModel) -> f64 {
                     + (1.0 - p) * nf.nc_per_hit.powi(n) * nf.nc_per_cast)
         }
         CritModel::Independent { p, n } => {
-            let mut sum = 0.0;
-            // Degenerate p: the binomial collapses to one term, and the
-            // running ratio below would divide by zero.
-            let term = |k: u32, w: f64| {
-                w * nf.crit_per_hit.powi(k as i32)
-                    * if k > 0 { nf.crit_per_cast } else { 1.0 }
-                    * nf.nc_per_hit.powi((n - k) as i32)
-                    * if k < n { nf.nc_per_cast } else { 1.0 }
-            };
-            if p <= 0.0 {
-                sum = term(0, 1.0);
-            } else if p >= 1.0 {
-                sum = term(n, 1.0);
+            // Closed form of sum_k Binomial(n,p)(k) * a^k * b^(n-k) *
+            // C^[k>0] * D^[k<n], with a/b = crit/non-crit per_hit,
+            // C/D = crit/non-crit per_cast. The bulk term applies C and
+            // D to every k; the k=0 term lacks C and the k=n term lacks
+            // D, corrected by the other two. O(1), exact, no underflow
+            // to a wrong answer (an underflowing term is negligible).
+            // n = 0 (no hits): neither crit-gated group rolls.
+            if n == 0 {
+                nf.indep
             } else {
-                // w_k = C(n,k) p^k (1-p)^(n-k), by the running ratio.
-                let mut w = (1.0 - p).powi(n as i32);
-                for k in 0..=n {
-                    sum += term(k, w);
-                    w *= (n - k) as f64 / (k + 1) as f64 * p / (1.0 - p);
-                }
+                let (a, b, c, d) = (
+                    nf.crit_per_hit,
+                    nf.nc_per_hit,
+                    nf.crit_per_cast,
+                    nf.nc_per_cast,
+                );
+                let n = n as i32;
+                nf.indep
+                    * (c * d * (p * a + (1.0 - p) * b).powi(n)
+                        + (1.0 - c) * d * ((1.0 - p) * b).powi(n)
+                        + c * (1.0 - d) * (p * a).powi(n))
             }
-            nf.indep * sum
         }
     };
     1.0 - no_fire
@@ -289,5 +289,27 @@ mod tests {
         assert_eq!(log.next_age_out(), Some((4.0, 3)));
         log.clear();
         assert_eq!(log.next_age_out(), None);
+    }
+
+    #[test]
+    fn q_independent_large_n_does_not_underflow() {
+        let mut nf = NoFire::ONE;
+        nf.add(Trigger::OnCrit, ProcRolls::PerHit, 0.5, 2000);
+        let q = q_of(&nf, CritModel::Independent { p: 0.5, n: 2000 });
+        close(q, 1.0 - 0.75f64.powi(2000));
+        let mut nf = NoFire::ONE;
+        nf.add(Trigger::OnCrit, ProcRolls::PerCast, 0.5, 2000);
+        // fires iff k > 0 (certain at n 2000, p .5): q = 0.5 * (1 - 0.5^2000)
+        close(q_of(&nf, CritModel::Independent { p: 0.5, n: 2000 }), 0.5);
+    }
+
+    #[test]
+    fn q_independent_n_one_matches_shared() {
+        let mut nf = NoFire::ONE;
+        nf.add(Trigger::OnCrit, ProcRolls::PerCast, 0.5, 1);
+        nf.add(Trigger::OnNonCrit, ProcRolls::PerCast, 0.5, 1);
+        // 0.25*0.5 + 0.75*0.5
+        close(q_of(&nf, CritModel::Independent { p: 0.25, n: 1 }), 0.5);
+        close(q_of(&nf, CritModel::Shared { p: 0.25, n: 1 }), 0.5);
     }
 }
