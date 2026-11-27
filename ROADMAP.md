@@ -144,20 +144,12 @@
     deterministic schedules; jitter and chance are MC-only.
   - **A Rolling-Slam-shaped CI-run example** with hand-worked EV pins.
 - [ ] Open debt from 0.8.0 (each deliberately unpinned or not yet built):
-  - **Pre-existing resource-settle bug (found reviewing #33 item 4).**
-    `flush_before_change` never settles resources, so a refold's new
-    resource max/regen applies retroactively to the whole span since
-    `last_update` (exec.rs `flush_before_change` /
-    `refresh_effective_state` / `settle_resource`). Example: regen
-    `"10 - buff.boost * 10"`, a cost leaves the pool at 50 at t=0, `boost`
-    applies at t=1, the next settle at t=2 gives 50 where the true value
-    is 60. The pin `resource_max_expr_refolds_against_the_applying_buff`
-    passes only by coincidence (a cap increase from a full pool). Not
-    fixed here. `ev_uptime: "expected"` widens its reach: an expected
-    buff refolds at every P step (each roll and each age-out), so a
-    time-varying resource max/regen is re-sampled more often than under
-    `discrete`, and flipping the knob on one buff can move an UNRELATED
-    resource's numbers.
+  - **`ev_uptime` refolds re-sample time-varying resource fields.** An
+    expected buff refolds at every P step (each roll and each age-out),
+    so a resource max/regen that reads `time` is re-sampled more often
+    than under `discrete`: flipping the knob on one buff can move an
+    UNRELATED resource's numbers. (The retroactive-rate bug this entry
+    once described alongside it is FIXED, Unreleased.)
   - **`ev_uptime` self-feeding is not rejected (0.9.0).** `P` is
     exact only when the applying procs' q (chance, crit chance) and D do
     not depend on the buff's own state. Shape (ii) (a contribution gated

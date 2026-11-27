@@ -1485,6 +1485,20 @@ impl<'a> Sim<'a> {
         // a wrong number. See `Sim::apply_buff` for why the buff flags are
         // already correct by this point.
         self.refresh_time_varying_slots();
+        // Settle every pool at the OUTGOING max/regen before re-deriving
+        // them: the span since each pool's `last_update` ran at the old
+        // rate, and the new rate applies only from this refold onward.
+        // Settling first matters even though pools are otherwise settled
+        // lazily — the next settle (a cost, a gain, `finalize`) would
+        // otherwise apply the NEW rate and cap to that whole earlier span.
+        // A no-op at `Sim::new`'s initial fold (`dt == 0`). Settling does not
+        // change any pool's current amount as the slot tail reads it, so the
+        // tail refreshed above stays correct. Pinned by
+        // `resource_refold_settles_at_the_old_rate_first`.
+        let now = self.time;
+        for ri in 0..self.resources.len() {
+            self.settle_resource(ri, now);
+        }
         for (ri, r) in self.sim_plan.resources.iter().enumerate() {
             self.resource_max[ri] = r.max.eval(&self.scratch.slots);
             self.resource_regen[ri] = r.regen_per_sec.eval(&self.scratch.slots);
@@ -7676,9 +7690,12 @@ mod tests {
         //   t=1   filler completes, proc applies `boost` → refold → max 100
         //         (pool stays 50 and starts refilling at 10/s)
         //   t=6   pool reaches the new cap of 100 and pins there
-        //   time_capped = [0,1) + [6,20) … but the pool is settled lazily, so
-        //   the single settle at t=20 computes it directly: amount 50 < max
-        //   100, t_reach = (100-50)/10 = 5s, capped = 20 - 5 = 15s.
+        //   time_capped = [0,1) + [6,20) = 1 + 14 = 15s (the t=1 refold
+        //   settles the full pool first — 1s capped at max 50 — then the
+        //   pool refills from 50 to the new cap of 100 in 5s). A cap
+        //   increase from a full pool gives 15 whether or not the refold
+        //   settles; `resource_refold_settles_at_the_old_rate_first` is the
+        //   pin that tells the two apart.
         // If the refold read a stale tail (boost still down) the cap stays 50,
         // the pool is at cap the whole fight, and time_capped = 20.
         // ------------------------------------------------------------------
@@ -7768,6 +7785,112 @@ mod tests {
             assert!(
                 close(report.resources["mana"].time_capped, 15.0),
                 "got {} (20 = the refold read a stale tail and kept max at 50)",
+                report.resources["mana"].time_capped
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // A refold SETTLES every resource at the old max/regen before it
+        // re-derives them: the new rate applies from the change onward, never
+        // to the span before it.
+        //
+        // Fixture: `mana` max 100, regen `"buff.boost * 10"` (0 until `boost`
+        // lands, 10/s after). `spend` (cast 1s, cost 50, cooldown 100) is cast
+        // once, at t=0; its on_cast proc applies `boost` at t=1. Hand-worked
+        // over 20s:
+        //   t=0   cost settles the full pool: 100 → 50, regen 0
+        //   t=1   boost refold: the pool is still 50 (regen was 0 on [0,1));
+        //         from here it refills at 10/s
+        //   t=6   pool reaches 100 and pins → time_capped = 20 − 6 = 14
+        // An unsettled refold applies 10/s from t=0 instead: the pool reaches
+        // 100 at t=5 and time_capped = 15.
+        // ------------------------------------------------------------------
+        #[test]
+        fn resource_refold_settles_at_the_old_rate_first() {
+            let plan = flat_plan();
+            let build = flat_build();
+            let scenario: Scenario =
+                serde_json::from_str(r#"{ "phases": [ { "name": "p", "weight": 20 } ] }"#).unwrap();
+
+            let mut resources = BTreeMap::new();
+            resources.insert(
+                "mana".to_string(),
+                ResourceDef {
+                    extra: Default::default(),
+                    max: "100".into(),
+                    regen_per_sec: "buff.boost * 10".into(),
+                },
+            );
+            let mut actions = BTreeMap::new();
+            actions.insert(
+                "spend".to_string(),
+                ActionDef {
+                    crit_rolls: None,
+                    extra: Default::default(),
+                    measure: None,
+                    cast_time: Some("1".into()),
+                    segments: Vec::new(),
+                    cooldown: NumOrExpr::Num(100.0),
+                    cost: BTreeMap::from([("mana".to_string(), NumOrExpr::Num(50.0))]),
+                    gain: BTreeMap::new(),
+                    damage: None,
+                    apply_buff: Vec::new(),
+                    effects: Vec::new(),
+                },
+            );
+            let mut buffs = BTreeMap::new();
+            buffs.insert(
+                "boost".to_string(),
+                BuffDef {
+                    extra: Default::default(),
+                    ev_uptime: Default::default(),
+                    duration: NumOrExpr::Num(100.0),
+                    max_stacks: 1,
+                    on_reapply: ReapplyPolicy::Refresh,
+                    contributions: Vec::new(),
+                    conditions: BTreeMap::new(),
+                    tick_objective: None,
+                },
+            );
+            let mut procs = BTreeMap::new();
+            procs.insert(
+                "boost_proc".to_string(),
+                ProcDef {
+                    extra: Default::default(),
+                    rolls: None,
+                    trigger: Trigger::OnCast,
+                    chance: "1".into(),
+                    icd: 0.0,
+                    apply_buff: Some("boost".into()),
+                    effects: Vec::new(),
+                    cast_action: None,
+                    actions: None,
+                },
+            );
+            let simdef = SimDef {
+                extra: Default::default(),
+                defaults: Default::default(),
+                resources,
+                actions,
+                buffs,
+                procs,
+                damage_objective: "hit".into(),
+            };
+            let rotation = Rotation {
+                extra: Default::default(),
+                rules: vec![Rule {
+                    extra: Default::default(),
+                    action: "spend".into(),
+                    when: None,
+                }],
+            };
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            let report = run(&plan, &sim_plan, &build, &scenario, Mode::Expected).unwrap();
+
+            assert_eq!(report.proc_counts["boost_proc"], 1);
+            assert!(
+                close(report.resources["mana"].time_capped, 14.0),
+                "got {} (15 = the refold applied the new regen to [0,1) too)",
                 report.resources["mana"].time_capped
             );
         }
