@@ -134,14 +134,17 @@
   per-buff `ev_uptime: "expected"` (EV tracks P(up) from the exact roll
   log) — is DONE (0.9.0; design:
   `docs/superpowers/specs/2026-11-27-ev-expected-uptime-design.md`).
+- **Player cancels, DONE (Unreleased).** `Rule::interrupt` /
+  `interrupt_if` at segment boundaries and the `ActionReport.cancelled`
+  column (design §6 slice 5; plan
+  `docs/superpowers/plans/2026-11-27-slice5-player-cancels.md`).
 - [ ] **Hit-level casts, second half** (design §6 slices 5, 7 and 8).
   Open debt, deliberately not yet built:
-  - **Player cancels:** `Rule::interrupt` / `interrupt_if` at segment
-    boundaries, the `cancelled` report column, and the cast-id
-    staleness guard on `SegmentLand`. `interrupt_if` must compile as a
-    legal objective-read field.
   - **Outside interruptions:** `SimDef::interruptions`. EV accepts only
-    deterministic schedules; jitter and chance are MC-only.
+    deterministic schedules; jitter and chance are MC-only. Interruptions
+    land mid-segment, so this slice also adds the cast-id staleness guard
+    on `SegmentLand` that player cancels (which only act at boundaries,
+    before the next landing is scheduled) did not need.
   - **A Rolling-Slam-shaped CI-run example** with hand-worked EV pins.
 - [ ] Open debt from 0.8.0 (each deliberately unpinned or not yet built):
   - **`ev_uptime` refolds re-sample time-varying resource fields.** An
@@ -176,6 +179,11 @@
   - Free-casting a segmented action, which is a compile error today.
   - SimC-style `chain` / `early_chain_if`.
   - Refund-on-cancel knobs.
+  - Open debt from player cancels (Unreleased): `interrupt_if` is pinned
+    for `segments_done` and `objective.<name>` reads, but not for
+    `segments_remain`; `when` on a higher rule reads the boundary's
+    `segments_done`, not 0 (documented on `try_cancel`, one discriminating
+    pin: the same-action test).
 
 - [x] ~~**Publish 0.3.0** to crates.io~~ — DONE: `rtce` 0.3.0 is live on
       the registry (`cargo search` confirms), alongside `rtce-testkit`

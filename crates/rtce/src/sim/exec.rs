@@ -16015,6 +16015,99 @@ mod tests {
         }
 
         // --------------------------------------------------------------
+        // A higher rule that passes `when` and its cooldown but cannot
+        // AFFORD its cost does not cancel. jab costs 60 of a 100-rage
+        // pool (starts full, regen 0): jab 0–0.25 pays → 40 left (ready
+        // 2). slam 0.25: 0.75, 1.5; slam 1.5: 2.0 — jab is ready but
+        // 40 < 60, no cancel; slam 2.75; slam 2.75: 3.25, 4.0; slam
+        // 4.0: 4.5, 5.25 (past the horizon). jab 50 + seg 0 × 4 (400) +
+        // seg 1 × 3 (900) = 1350, slam casts 4, cancelled 0, jab casts 1.
+        // Contrast: a free jab is the 1250 timeline with cancelled 2.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_higher_rule_that_cannot_afford_its_cost_does_not_cancel() {
+            let res = r#""resources": { "rage": { "max": "100", "regen_per_sec": "0" } },"#;
+            let jab = r#"{ "cast_time": "0.25", "cooldown": 2.0, "cost": { "rage": 60 },
+                           "damage": { "stats": { "dmg": 50 } } }"#;
+            let r = cancel_ev(
+                &cancel_simdef(&slam_with(""), jab, res),
+                &jab_over_slam(r#""interrupt": true,"#),
+                5.0,
+            );
+            assert_total(&r, 1350.0, "unaffordable jab");
+            assert_eq!(r.actions["slam"].casts, 4);
+            assert_eq!(r.actions["slam"].cancelled, 0);
+            assert_eq!(r.actions["jab"].casts, 1);
+        }
+
+        // --------------------------------------------------------------
+        // `interrupt_if` reads an objective: its Plain-world fill happens
+        // at the boundary. Build dmg 10 makes the plain-world `hit` = 10
+        // (the actions' own `damage.stats` override dmg, so the fixture
+        // timelines keep their numbers). `objective.hit == 10` is the
+        // 1250 timeline, cancelled 2. `objective.hit == 0` (what an
+        // unfilled slot would read) never cancels: the 1400 timeline,
+        // cancelled 0. (Both timelines hand-derived at
+        // `a_higher_rule_cancels_at_a_boundary`.)
+        // --------------------------------------------------------------
+        #[test]
+        fn interrupt_if_reading_an_objective_decides_the_cancel() {
+            let plan = seg_plan();
+            let simdef: SimDef =
+                serde_json::from_str(&cancel_simdef(&slam_with(""), JAB, "")).unwrap();
+            let build: BuildState =
+                serde_json::from_str(r#"{ "stats": { "dmg": 10.0, "cc": 0.0 } }"#).unwrap();
+            let go = |gate: &str| {
+                let rot: Rotation = serde_json::from_str(&format!(
+                    r#"{{ "rules": {} }}"#,
+                    jab_over_slam(&format!(r#""interrupt": true, "interrupt_if": "{gate}","#))
+                ))
+                .unwrap();
+                let sp = sim_compile(&plan, &simdef, &rot).unwrap();
+                run(&plan, &sp, &build, &fight(5.0), Mode::Expected).unwrap()
+            };
+            let r = go("objective.hit == 10");
+            assert_total(&r, 1250.0, "objective.hit == 10");
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            let r = go("objective.hit == 0");
+            assert_total(&r, 1400.0, "objective.hit == 0");
+            assert_eq!(r.actions["slam"].cancelled, 0);
+        }
+
+        // --------------------------------------------------------------
+        // A higher rule naming the SAME action cancels and restarts it:
+        // rules `[slam when segments_done >= 1, slam interrupt]`. At a
+        // decision `segments_done` is 0, so rule 1 casts; at a boundary
+        // it is 1, so rule 0 is eligible (no cooldown, no cost) and
+        // cancels.
+        //   A 0 (rule 1): 0.5 (100) → CANCELLED; B 0.5 (rule 0, no
+        //   interrupt): 1.0, 1.75 (100 + 300); C 1.75 (rule 1): 2.25
+        //   (100) → CANCELLED; D 2.25: 2.75, 3.5 (100 + 300); E 3.5:
+        //   4.0 (100) → CANCELLED; F 4.0: 4.5 (100), 5.25 never.
+        //   100 + 400 + 100 + 400 + 100 + 100 = 1200, casts 6,
+        //   cancelled 3. Contrast: no `interrupt` → 4 uncancelled casts,
+        //   1600.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_higher_rule_naming_the_same_action_cancels_and_restarts() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let rules = |interrupt: &str| {
+                format!(
+                    r#"[ {{ "action": "slam", "when": "segments_done >= 1" }},
+                         {{ "action": "slam" {interrupt} }} ]"#
+                )
+            };
+            let r = cancel_ev(&def, &rules(r#", "interrupt": true"#), 5.0);
+            assert_total(&r, 1200.0, "same-action cancel");
+            assert_eq!(r.actions["slam"].casts, 6);
+            assert_eq!(r.actions["slam"].cancelled, 3);
+            let r = cancel_ev(&def, &rules(""), 5.0);
+            assert_total(&r, 1600.0, "no interrupt");
+            assert_eq!(r.actions["slam"].casts, 4);
+            assert_eq!(r.actions["slam"].cancelled, 0);
+        }
+
+        // --------------------------------------------------------------
         // A 3-segment slam `[0.5 → 100, 0.5 → 200, 0.5 → 300]`, the
         // fixture's jab, weight 5.
         // `interrupt_if: "segments_done == 2"` (second boundary only):

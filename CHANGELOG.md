@@ -7,6 +7,28 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **Player cancels** (#33, design slice 5). `Rule::interrupt` (default
+  false) lets a higher-priority rule cancel a segmented cast at a segment
+  boundary: after a non-last landing, the first rule above the cast's
+  starting rule whose `when`, cooldown and cost pass begins at once.
+  `interrupt_if` (optional expression over `segments_done`,
+  `segments_remain` and `objective.<name>`) gates which boundaries are
+  candidates. A cancel keeps the paid cost, the armed cooldown and
+  everything landed segments did; the unlanded rest, including
+  action-level `gain` and `effects`, never happens. No cancel at the
+  horizon instant. Deterministic: EV and Monte Carlo agree.
+- **`ActionReport.cancelled`**: casts of the action cut short by a
+  cancel (still counted in `casts`). Pooled as a rounded mean in MC.
+  Every config without `interrupt` is byte-identical.
+
+### Upgrade notes
+- Rust `Rule` struct literals need `interrupt: None, interrupt_if: None`.
+  JSON configs are unchanged.
+- `ActionReport` is `#[non_exhaustive]`, so `cancelled` is additive for
+  Rust consumers. Serialized reports gain a `"cancelled"` field on every
+  action (0 when nothing cancels).
+
 ## [0.9.1] — 2026-11-27
 
 A bug-fix release: when a resource's `max` or `regen_per_sec` changes
