@@ -7,6 +7,15 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-27
+
+**Expected buff uptime in EV.** Version 0.9.0 lets a buff opt in, with
+`ev_uptime: "expected"`, to carrying its exact probability of being up
+through an EV run. A "Recently" buff driven by crits then reports the
+same uptime in EV as in Monte Carlo, without running MC (#33 item 4,
+which closes #33). Every config that omits the field is byte-identical.
+The new `BuffDef` field changes Rust struct literals (see Upgrade notes).
+
 ### Added
 - **`ev_uptime: "expected"` on a buff** (#33 item 4). In EV mode the buff
   carries a probability `P` of being up, built from the exact log of its
