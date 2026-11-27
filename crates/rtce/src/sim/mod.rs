@@ -341,6 +341,7 @@
 
 mod compile;
 mod exec;
+mod expected;
 mod report;
 pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
