@@ -165,12 +165,25 @@ impl RollLog {
     }
 
     /// P(buff up at `s`): total weight of entries with `t_end > s`.
+    /// The latest-wins reading at an arbitrary instant; the executor
+    /// reads [`RollLog::live_weight`] instead (its log is swept by event).
+    #[cfg(test)]
     pub(crate) fn p_at(&self, s: f64) -> f64 {
         self.entries
             .iter()
             .filter(|e| e.t_end > s)
             .map(|e| e.weight)
             .sum()
+    }
+
+    /// Total weight of every entry still in the log — P(up) NOW for an
+    /// executor that removes entries only through its age-out event: an
+    /// entry whose `t_end` equals the current instant is still live
+    /// until that event pops, exactly as a discrete instance is live
+    /// until its `BuffExpire` pops (which a coincident completion can
+    /// precede under `completions_first`).
+    pub(crate) fn live_weight(&self) -> f64 {
+        self.entries.iter().map(|e| e.weight).sum()
     }
 
     /// Remove entries with `t_end <= s`, weight and all.

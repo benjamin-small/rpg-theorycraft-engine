@@ -902,7 +902,7 @@ struct BuffRt {
     /// no `instances` and never enters `active_buff_set` — it is not
     /// binary.
     log: RollLog,
-    /// The cached P(up) right now — `log.p_at(now)` as of the last
+    /// The cached P(up) right now — `log.live_weight()` as of the last
     /// change, clamped to `[0, 1]`. Changes only inside a
     /// `flush_before_change` / `refresh_after_change` transaction
     /// ([`Sim::set_expected_p`]), so every integrator sees a
@@ -933,6 +933,9 @@ struct ExpectedRoll {
     nf: NoFire,
     duration: f64,
     hits: u32,
+    /// The `seq` consumed at the first contributor's roll — the entry's
+    /// ordering key (see [`Sim::log_expected`]).
+    seq: u64,
 }
 
 impl ExpectedRoll {
@@ -941,6 +944,7 @@ impl ExpectedRoll {
         nf: NoFire::ONE,
         duration: 0.0,
         hits: 1,
+        seq: 0,
     };
 }
 
@@ -1191,6 +1195,9 @@ struct Sim<'a> {
     /// Test-only bookkeeping: live age-outs pushed / handled.
     #[cfg(test)]
     age_outs_scheduled: u32,
+    /// Test-only: `(t, P)` right after each roll is logged.
+    #[cfg(test)]
+    p_after_roll: Vec<(f64, f64)>,
     #[cfg(test)]
     age_outs_handled: u32,
 }
@@ -1303,6 +1310,8 @@ impl<'a> Sim<'a> {
             expected_rolls: vec![ExpectedRoll::IDLE; n_buffs],
             #[cfg(test)]
             age_outs_scheduled: 0,
+            #[cfg(test)]
+            p_after_roll: Vec::new(),
             #[cfg(test)]
             age_outs_handled: 0,
         };
@@ -1736,7 +1745,9 @@ impl<'a> Sim<'a> {
             // place of the instance logic. Nothing below applies to it
             // (no instances, no snapshot rate: `sim::compile` rejects a
             // snapshot tick on such a buff).
-            return self.log_expected(bi, 1.0, duration);
+            self.seq += 1;
+            let seq = self.seq;
+            return self.log_expected(bi, 1.0, duration, seq);
         }
         let expire_at = now + duration;
 
@@ -1967,28 +1978,43 @@ impl<'a> Sim<'a> {
     /// Log one roll of EV `ev_uptime: expected` buff `bi`: probability
     /// `q` (clamped to `[0, 1]` — float error in [`q_of`] can land a
     /// hair outside) that this cast event applies it, covering `duration`
-    /// seconds from now. Consumes ONE `seq` — the one a discrete
-    /// application's `BuffExpire` would — and stores it on the entry, so
-    /// the eventual age-out orders as that expiry would. Then P moves
-    /// under the usual transaction ([`Sim::set_expected_p`]) and the
-    /// age-out is rescheduled if the log's earliest entry changed.
+    /// seconds from now. `seq` is the one the caller consumed AT THE ROLL
+    /// — the first contributing proc's roll in the cast-event block
+    /// ([`Sim::add_expected_roll`]), or the application itself on the
+    /// action path — so it orders against whatever else that block
+    /// schedules as a discrete application at that roll would. It is
+    /// stored on the entry, and the eventual age-out carries it. Then P
+    /// moves under the usual transaction ([`Sim::set_expected_p`]) and
+    /// the age-out is rescheduled if the log's earliest entry changed.
     /// Counts as one `applications` (the report's documented reading).
-    fn log_expected(&mut self, bi: usize, q: f64, duration: f64) -> Result<(), PlanError> {
+    fn log_expected(
+        &mut self,
+        bi: usize,
+        q: f64,
+        duration: f64,
+        seq: u64,
+    ) -> Result<(), PlanError> {
         debug_assert!(
             self.ev_expected[bi],
             "only an EV expected buff has a roll log"
         );
         let q = q.clamp(0.0, 1.0);
-        self.seq += 1;
-        let seq = self.seq;
         let t_end = self.time + duration;
         self.buffs[bi].applications += 1;
         self.buffs[bi].log.push(t_end, q, seq);
         self.set_expected_p(bi)?;
+        #[cfg(test)]
+        self.p_after_roll.push((self.time, self.buffs[bi].p));
         self.reschedule_age_out(bi)
     }
 
-    /// Recompute `bi`'s cached P from its log at `now`. A changed value
+    /// Recompute `bi`'s cached P: the total weight still in its log.
+    /// Entries leave ONLY through [`Sim::handle_expected_age_out`], so
+    /// one ending at this very instant still counts until its age-out
+    /// pops — the discrete twin's instance is likewise live until its
+    /// `BuffExpire` pops, which a coincident `CastComplete` precedes
+    /// under `completions_first`. (Filtering by `t_end > now` here would
+    /// drop it early, at exactly that coincident instant.) A changed value
     /// goes through the state-change transaction (flush the OLD P's
     /// elapsed span → set → refold), exactly as a discrete application
     /// or expiry would; an unchanged one skips it, as a discrete
@@ -1996,7 +2022,7 @@ impl<'a> Sim<'a> {
     /// leaves the sum bit-identical, so q = 1 refreshes stay
     /// transaction-free like their discrete twins.)
     fn set_expected_p(&mut self, bi: usize) -> Result<(), PlanError> {
-        let p = self.buffs[bi].log.p_at(self.time).clamp(0.0, 1.0);
+        let p = self.buffs[bi].log.live_weight().clamp(0.0, 1.0);
         if p == self.buffs[bi].p {
             return Ok(());
         }
@@ -3561,8 +3587,9 @@ impl<'a> Sim<'a> {
     /// per-cast-event [`ExpectedRoll`] of every EV expected buff it
     /// applies. The crit weighting is NOT applied here: [`q_of`]
     /// conditions on the crit model the block builds once per landing.
-    /// The first contributor to a buff in this block captures its D (at
-    /// this roll's instant, before the accumulator step).
+    /// The first contributor to a buff in this block captures its D and
+    /// consumes the entry's seq (at this roll's instant, before the
+    /// accumulator step).
     ///
     /// Fail-closed on a non-finite `base`: the accumulator path silently
     /// never crosses on a NaN, but a log entry would carry it into P, so
@@ -3591,9 +3618,15 @@ impl<'a> Sim<'a> {
         for &bi in &proc_def.expected_buffs {
             if !self.expected_rolls[bi].touched {
                 let duration = self.eval_buff_duration(bi)?;
+                // The entry's seq is taken HERE, at its roll (design:
+                // "each log entry consumes a seq at its roll"), not after
+                // the block — so a same-instant event a LATER proc in the
+                // block schedules orders after this entry's age-out.
+                self.seq += 1;
                 self.expected_rolls[bi] = ExpectedRoll {
                     touched: true,
                     duration,
+                    seq: self.seq,
                     ..ExpectedRoll::IDLE
                 };
             }
@@ -3615,7 +3648,8 @@ impl<'a> Sim<'a> {
     /// hit count) — and reset the scratch. A `q` of 0 logs nothing
     /// (exact: it would multiply every older weight by 1), so a cast no
     /// proc can fire from leaves no entry and schedules no age-out.
-    /// Buff-index order, so seq assignment is deterministic.
+    /// Buff-index order (each entry's seq was already taken at its first
+    /// contributor's roll).
     fn log_expected_rolls(&mut self, crit: CritModel) -> Result<(), PlanError> {
         for k in 0..self.expected_list.len() {
             let bi = self.expected_list[k];
@@ -3630,7 +3664,7 @@ impl<'a> Sim<'a> {
             };
             let q = q_of(&r.nf, crit).clamp(0.0, 1.0);
             if q > 0.0 {
-                self.log_expected(bi, q, r.duration)?;
+                self.log_expected(bi, q, r.duration, r.seq)?;
             }
         }
         Ok(())
@@ -16397,6 +16431,194 @@ mod tests {
             // The discrete EV path keeps today's behavior (no check).
             let sp = compile_json(&plan, &strike_simdef(false, "0 / 0", 2.5), STRIKE_ROT);
             assert!(run(&plan, &sp, &minimal_build(), &dummy(10.0), Mode::Expected).is_ok());
+        }
+        // --------------------------------------------------------------
+        // Fix round 1, item 1: P is the weight still IN the log — an
+        // entry ending at this instant counts until its age-out pops.
+        // 1 s casts, on_hit q 0.5, D 2: the entry from t=1 ends at 3,
+        // exactly on the third completion. P right after each roll:
+        //   t=1  0.5            t=2  0.25 + 0.5 = 0.75
+        //   t=3, completions_first (the cast pops first): weights
+        //        0.125 + 0.25 + 0.5 = 0.875 — the t=1 entry, × (1 − q_new),
+        //        is still live (its discrete twin's instance would be too)
+        //   t=3, scheduled (the age-out from t=1 pops first): 0.5 left,
+        //        then the roll → 0.25 + 0.5 = 0.75
+        // Mutation: P = p_at(now) (filter t_end > now) gives 0.75 at t=3
+        // under completions_first.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_p_keeps_an_entry_until_its_age_out_pops() {
+            let plan = minimal_plan();
+            let build = minimal_build();
+            let sc = dummy(4.0);
+            for (order, at3) in [("completions_first", 0.875), ("scheduled", 0.75)] {
+                let json = format!(
+                    r#"{{ "defaults": {{ "event_order": "{order}" }},
+                         "actions": {{ "strike": {{ "cast_time": "1", "damage": {{ "stats": {{}} }} }} }},
+                         "buffs": {{ "x": {{ "duration": 2, "ev_uptime": "expected" }} }},
+                         "procs": {{ "spark": {{ "trigger": "on_hit", "chance": "0.5",
+                                                "apply_buff": "x" }} }},
+                         "damage_objective": "hit" }}"#
+                );
+                let sp = compile_json(&plan, &json, STRIKE_ROT);
+                let sim = ev_sim(&plan, &sp, &build, &sc);
+                assert_eq!(
+                    sim.p_after_roll[..3],
+                    [(1.0, 0.5), (2.0, 0.75), (3.0, at3)],
+                    "{order}"
+                );
+            }
+        }
+
+        /// `hit = dmg × event_factors`, one `crit` event at chance `cc`.
+        fn crit_plan() -> Plan {
+            let def: GameDef = serde_json::from_str(
+                r#"{ "stats": ["dmg", "cc"],
+                     "events": { "crit": { "chance": "cc", "factor": "1.5" } },
+                     "pipeline": [ { "name": "hit", "expr": "dmg * event_factors",
+                                     "branched": true } ],
+                     "objectives": ["hit"] }"#,
+            )
+            .unwrap();
+            plan::compile(&def).unwrap()
+        }
+
+        /// EV run, 4 s: `nova` (1 s cast, `hits` per use, `crit_rolls`
+        /// spliced) completes at t=1..4; `x` lasts 100 s, so the uptime
+        /// is `Σ_{k=1..3} (1 − (1 − q)^k) / 4` for a per-cast q.
+        fn crit_run(cc: f64, hits: u32, crit_rolls: &str, procs: &str) -> SimReport {
+            let plan = crit_plan();
+            let build: BuildState =
+                serde_json::from_str(&format!(r#"{{ "stats": {{ "dmg": 100.0, "cc": {cc} }} }}"#))
+                    .unwrap();
+            let json = format!(
+                r#"{{ "actions": {{ "nova": {{ "cast_time": "1"{crit_rolls},
+                         "damage": {{ "stats": {{ "hits_per_use": {hits} }} }} }} }},
+                     "buffs": {{ "x": {{ "duration": 100, "ev_uptime": "expected" }} }},
+                     "procs": {procs},
+                     "damage_objective": "hit" }}"#
+            );
+            let sp = compile_json(&plan, &json, r#"{ "rules": [ { "action": "nova" } ] }"#);
+            run(&plan, &sp, &build, &dummy(4.0), Mode::Expected).unwrap()
+        }
+
+        // --------------------------------------------------------------
+        // Fix round 1, item 2a: a Shared on_crit + on_non_crit cast is
+        // ONE entry with q = p·c₁ + (1 − p)·c₂ = 0.25·0.4 + 0.75·0.2 =
+        // 0.25. uptime = (0.25 + 0.4375 + 0.578125) / 4 = 0.31640625.
+        // Mutations: CritModel::None always → q 0, nothing logged;
+        // folding base × w instead of base → q 0.1375.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_shared_crit_and_non_crit_fold_into_one_entry() {
+            let r = crit_run(
+                0.25,
+                1,
+                "",
+                r#"{ "c": { "trigger": "on_crit", "chance": "0.4", "apply_buff": "x" },
+                     "nc": { "trigger": "on_non_crit", "chance": "0.2", "apply_buff": "x" } }"#,
+            );
+            assert_eq!(
+                r.buffs["x"].applications, 4,
+                "one entry per cast, not per proc"
+            );
+            assert!(
+                close(r.buffs["x"].uptime, 0.31640625),
+                "got {}",
+                r.buffs["x"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Fix round 1, item 2b: a per_hit on_crit proc (chance 0.5) on a
+        // 2-hit cast with crit p = 0.5.
+        //   Shared (crit_rolls per_cast): q = p·(1 − 0.5²) = 0.375 →
+        //     uptime (0.375 + 0.609375 + 0.755859375) / 4 = 0.43505859375
+        //   Independent (crit_rolls per_hit): per hit no-fire 1 − p·c =
+        //     0.75 → q = 1 − 0.75² = 0.4375 →
+        //     uptime (0.4375 + 0.68359375 + 0.822021484375) / 4
+        //            = 0.48577880859375
+        // Mutations: dropping `r.hits = n` → Shared q 0.25 (uptime
+        // 0.31640625); CritModel::None always → 0 for both.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_per_hit_on_crit_conditions_on_the_crit_model() {
+            let procs = r#"{ "c": { "trigger": "on_crit", "chance": "0.5", "rolls": "per_hit",
+                                    "apply_buff": "x" } }"#;
+            let shared = crit_run(0.5, 2, "", procs);
+            assert_eq!(shared.buffs["x"].applications, 4);
+            assert!(
+                close(shared.buffs["x"].uptime, 0.43505859375),
+                "shared: got {}",
+                shared.buffs["x"].uptime
+            );
+            let indep = crit_run(0.5, 2, r#", "crit_rolls": "per_hit""#, procs);
+            assert_eq!(indep.buffs["x"].applications, 4);
+            assert!(
+                close(indep.buffs["x"].uptime, 0.48577880859375),
+                "independent: got {}",
+                indep.buffs["x"].uptime
+            );
+        }
+
+        // --------------------------------------------------------------
+        // Fix round 1, item 2c: two procs (on_cast 0.5, on_hit 0.5)
+        // applying `x` in one cast → ONE entry, q = 1 − 0.5·0.5 = 0.75.
+        // uptime = (0.75 + 0.9375 + 0.984375) / 4 = 0.66796875.
+        // Mutation: logging once per proc → 8 applications.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_two_procs_one_cast_is_one_entry() {
+            let r = crit_run(
+                0.0,
+                1,
+                "",
+                r#"{ "a": { "trigger": "on_cast", "chance": "0.5", "apply_buff": "x" },
+                     "b": { "trigger": "on_hit", "chance": "0.5", "apply_buff": "x" } }"#,
+            );
+            assert_eq!(r.buffs["x"].applications, 4, "one entry per cast");
+            assert!(
+                close(r.buffs["x"].uptime, 0.66796875),
+                "got {}",
+                r.buffs["x"].uptime
+            );
+        }
+        // --------------------------------------------------------------
+        // Fix round 1, item 3: the entry's seq is taken AT ITS ROLL (the
+        // first contributor), not after the block. Procs roll in name
+        // order: `a` (chance 1) applies expected `x`, then `b` (chance 1)
+        // applies discrete `y`; both last 5 s, so after the one cast at
+        // t=1 the heap holds x's age-out and y's `BuffExpire`, both at
+        // t=6. In discrete, x's expiry (fired first) would hold the
+        // smaller seq, so the age-out must too. Mutation: a fresh seq
+        // after the block gives x the larger one.
+        // --------------------------------------------------------------
+        #[test]
+        fn ev_uptime_entry_seq_is_taken_at_its_roll() {
+            let plan = minimal_plan();
+            let json = r#"{ "actions": { "strike": { "cast_time": "1", "damage": { "stats": {} } } },
+                 "buffs": { "x": { "duration": 5, "ev_uptime": "expected" },
+                            "y": { "duration": 5 } },
+                 "procs": { "a": { "trigger": "on_hit", "chance": "1", "apply_buff": "x" },
+                            "b": { "trigger": "on_hit", "chance": "1", "apply_buff": "y" } },
+                 "damage_objective": "hit" }"#;
+            let sp = compile_json(&plan, json, STRIKE_ROT);
+            let build = minimal_build();
+            let sc = dummy(1.0);
+            let sim = ev_sim(&plan, &sp, &build, &sc);
+            let seq_of = |want: fn(&Event) -> bool| {
+                let at6: Vec<u64> = sim
+                    .heap
+                    .iter()
+                    .filter(|i| i.time.0 == 6.0 && want(&i.event))
+                    .map(|i| i.seq)
+                    .collect();
+                assert_eq!(at6.len(), 1, "{at6:?}");
+                at6[0]
+            };
+            let x_age_out = seq_of(|e| matches!(e, Event::ExpectedAgeOut { .. }));
+            let y_expire = seq_of(|e| matches!(e, Event::BuffExpire { .. }));
+            assert!(x_age_out < y_expire, "x {x_age_out} vs y {y_expire}");
         }
     }
 }
