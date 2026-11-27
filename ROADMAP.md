@@ -149,7 +149,7 @@
     so a resource max/regen that reads `time` is re-sampled more often
     than under `discrete`: flipping the knob on one buff can move an
     UNRELATED resource's numbers. (The retroactive-rate bug this entry
-    once described alongside it is FIXED, Unreleased.)
+    once described alongside it is FIXED, 0.9.1.)
   - **`ev_uptime` self-feeding is not rejected (0.9.0).** `P` is
     exact only when the applying procs' q (chance, crit chance) and D do
     not depend on the buff's own state. Shape (ii) (a contribution gated
@@ -184,7 +184,7 @@
       path, so a published tarball's tests resolve testkit from the
       registry (locally the path wins); testkit bumps only when a commit
       actually touches `crates/rtce-testkit/`.
-- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, 0.8.0, and 0.9.0 are
+- [x] ~~**Publish 0.4.0**~~ — DONE. Releases 0.5.0, 0.5.1, 0.6.0, 0.7.0, 0.8.0, 0.9.0, and 0.9.1 are
       also live; the tag-driven trusted-publishing workflow verifies the tag,
       changelog, formatting, clippy, tests, and package contents before it
       publishes missing crate versions.
