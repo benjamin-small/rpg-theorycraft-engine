@@ -520,6 +520,7 @@ fn run_monte_carlo(
     let mut phase_damage_sum: Vec<f64> = vec![0.0; scenario.phases.len()];
     let mut total_damage_sum = 0.0;
     let mut action_casts_sum: BTreeMap<String, f64> = BTreeMap::new();
+    let mut action_cancelled_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut action_damage_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut buff_uptime_sum: BTreeMap<String, f64> = BTreeMap::new();
     let mut buff_stacks_sum: BTreeMap<String, f64> = BTreeMap::new();
@@ -553,6 +554,7 @@ fn run_monte_carlo(
         }
         for (name, a) in &report.actions {
             *action_casts_sum.entry(name.clone()).or_insert(0.0) += a.casts as f64;
+            *action_cancelled_sum.entry(name.clone()).or_insert(0.0) += a.cancelled as f64;
             *action_damage_sum.entry(name.clone()).or_insert(0.0) += a.damage;
         }
         for (name, b) in &report.buffs {
@@ -602,10 +604,12 @@ fn run_monte_carlo(
     let mut actions = BTreeMap::new();
     for (name, casts_sum) in &action_casts_sum {
         let dmg = action_damage_sum.get(name).copied().unwrap_or(0.0) / n;
+        let cancelled_sum = action_cancelled_sum.get(name).copied().unwrap_or(0.0);
         actions.insert(
             name.clone(),
             ActionReport {
                 casts: (casts_sum / n).round() as u64,
+                cancelled: (cancelled_sum / n).round() as u64,
                 damage: dmg,
                 share: if total_damage_mean > 0.0 {
                     dmg / total_damage_mean
@@ -818,10 +822,20 @@ enum Afford {
     Never,
 }
 
+/// A rule whose `when` passed is eligible NOW iff its action's cooldown
+/// is ready and its cost payable now — the half of [`Sim::rule_gates`]'s
+/// answer both the rotation decision and the cancel scan act on.
+fn gates_pass_now(cooldown_ready_at: f64, afford: Afford, now: f64) -> bool {
+    cooldown_ready_at <= now && afford == Afford::Now
+}
+
 /// Per-action runtime state.
 struct ActionRt {
     cooldown_ready_at: f64,
     casts: u64,
+    /// Casts of this action cut short by a player cancel (slice 5) —
+    /// [`ActionReport::cancelled`].
+    cancelled: u64,
     damage: f64,
 }
 
@@ -1130,6 +1144,15 @@ struct Sim<'a> {
     /// idle / unsegmented). Incremented at each landing BEFORE that
     /// landing's measure; feeds the reserved sim word `segments_done`.
     segments_done: u32,
+    /// Index (into [`SimPlan::rules`]) of the rotation rule that started
+    /// the in-flight cast — or, between casts, the most recent one. Set
+    /// immediately BEFORE every rotation [`Sim::begin_cast`] (by
+    /// [`Sim::attempt_decision`], and by [`Sim::try_cancel`] for the
+    /// replacement it begins), so a segment landing synchronously inside
+    /// `begin_cast` already sees its own rule. Read only by
+    /// [`Sim::try_cancel`] at a non-last segment boundary. `None` before
+    /// the first rotation cast.
+    cast_rule: Option<usize>,
     /// The [`WorldSnapshot`] captured at cast START for the single
     /// in-flight cast, when its resolved measure is
     /// [`Measure::CastStart`] — set by [`Sim::begin_cast`] when it
@@ -1249,11 +1272,13 @@ impl<'a> Sim<'a> {
             mid_cast: false,
             segments_total: 0,
             segments_done: 0,
+            cast_rule: None,
             pending_snapshot: None,
             actions: (0..n_actions)
                 .map(|_| ActionRt {
                     cooldown_ready_at: 0.0,
                     casts: 0,
+                    cancelled: 0,
                     damage: 0.0,
                 })
                 .collect(),
@@ -2778,22 +2803,14 @@ impl<'a> Sim<'a> {
             let mut chosen: Option<usize> = None;
             let mut wake: Option<(f64, usize)> = None;
 
-            for (ridx, rule) in sim_plan.rules.iter().enumerate() {
-                if let Some(w) = &rule.when {
-                    if w.reads_objectives {
-                        self.fill_objective_slots(ObjectiveWorld::Plain, "at a rotation decision")?;
-                    }
-                    if w.eval(&self.scratch.slots) == 0.0 {
-                        continue;
-                    }
-                }
-                let action = rule.action;
-                let cd_ready = self.actions[action].cooldown_ready_at;
-                let cost = sim_plan.actions[action].cost.iter().map(|(_, v)| v);
-                self.fill_for_action_values(action, cost, "at a rotation decision")?;
-                let afford = self.afford(action, now, "at a rotation decision")?;
-                if cd_ready <= now && afford == Afford::Now {
-                    chosen = Some(action);
+            for ridx in 0..sim_plan.rules.len() {
+                let Some((cd_ready, afford)) =
+                    self.rule_gates(ridx, now, "at a rotation decision")?
+                else {
+                    continue;
+                };
+                if gates_pass_now(cd_ready, afford, now) {
+                    chosen = Some(ridx);
                     break;
                 }
                 let resource_time = match afford {
@@ -2809,7 +2826,9 @@ impl<'a> Sim<'a> {
                 }
             }
 
-            if let Some(action) = chosen {
+            if let Some(ridx) = chosen {
+                let action = sim_plan.rules[ridx].action;
+                self.cast_rule = Some(ridx);
                 self.begin_cast(action)?;
                 if self.mid_cast {
                     return Ok(());
@@ -2851,6 +2870,120 @@ impl<'a> Sim<'a> {
             }
             return Ok(());
         }
+    }
+
+    /// Rule `ridx`'s gates at `now`, in decision order: its `when`
+    /// (objective slots filled first if it reads them), then its action's
+    /// cooldown and cost (the cost's objective world filled first if it
+    /// reads one). `None` = `when` is false, so the rule is skipped;
+    /// otherwise `Some((cooldown_ready_at, afford))` — the rule is
+    /// eligible NOW iff [`gates_pass_now`]. The ONE per-rule eligibility check:
+    /// [`Sim::attempt_decision`] uses both halves (choice and wake),
+    /// [`Sim::try_cancel`] only the eligible-now answer. `instant` names
+    /// the position for any positioned error.
+    ///
+    /// PRECONDITION: the time-varying tail is current
+    /// ([`Sim::refresh_time_varying_slots`]).
+    fn rule_gates(
+        &mut self,
+        ridx: usize,
+        now: f64,
+        instant: &'static str,
+    ) -> Result<Option<(f64, Afford)>, PlanError> {
+        let sim_plan = self.sim_plan;
+        let rule = &sim_plan.rules[ridx];
+        if let Some(w) = &rule.when {
+            if w.reads_objectives {
+                self.fill_objective_slots(ObjectiveWorld::Plain, instant)?;
+            }
+            if w.eval(&self.scratch.slots) == 0.0 {
+                return Ok(None);
+            }
+        }
+        let action = rule.action;
+        let cd_ready = self.actions[action].cooldown_ready_at;
+        let cost = sim_plan.actions[action].cost.iter().map(|(_, v)| v);
+        self.fill_for_action_values(action, cost, instant)?;
+        let afford = self.afford(action, now, instant)?;
+        Ok(Some((cd_ready, afford)))
+    }
+
+    /// The player-cancel check (slice 5, spec §5.3), run by
+    /// [`Sim::land_segment`] at each NON-LAST segment boundary of
+    /// `action`'s in-flight cast — after that landing's whole transaction
+    /// ([`Sim::land`]), before the next segment starts. Returns `true` if
+    /// the cast was cancelled and a replacement began (the caller must
+    /// then stop: the new cast owns the timeline).
+    ///
+    /// - Only if the cast's starting rule ([`Sim::cast_rule`]) has
+    ///   `interrupt`, and its `interrupt_if` (if any) is nonzero —
+    ///   evaluated HERE, against the plain effective build and phase
+    ///   (objective slots filled first if it reads them), so it sees
+    ///   `segments_done` / `segments_remain` as of this boundary.
+    /// - Never at the fight horizon (`now >= duration`): no cast may
+    ///   begin there ([`Sim::run_loop`]'s rule), so a cancel that could
+    ///   not start its replacement is not made and not counted.
+    /// - Only rules ranked ABOVE the starting rule (`0..cast_rule`) are
+    ///   scanned, through [`Sim::rule_gates`] — the decision's own
+    ///   `when` → cooldown → cost check. The FIRST eligible one wins;
+    ///   the same rule and lower ones never cancel. While they are
+    ///   evaluated the cast is still in flight, so a `when` there reads
+    ///   this boundary's `segments_done` / `segments_remain` too.
+    /// - A cancel ends the cast (`mid_cast` false, both segment words
+    ///   0), counts `cancelled += 1` on `action`, and begins the winner
+    ///   at the same instant with its rule recorded. Nothing else is
+    ///   undone or applied: the paid cost and the armed cooldown stand,
+    ///   landed segments keep their damage, effects and proc rolls, and
+    ///   the unlanded rest — including action-level `gain` and `effects`,
+    ///   which run only at the last landing — never happens.
+    ///
+    /// No stale event can exist: the next segment's `SegmentLand` is
+    /// scheduled only after this check, so a cancel needs no cast-id
+    /// staleness guard. (Outside interruptions, which land mid-segment,
+    /// will need one — slice 7.)
+    ///
+    /// Deterministic (no RNG draw), so EV and Monte Carlo cancel
+    /// identically. Allocation-free beyond what the scanned rules'
+    /// gates and the winner's cast start already do.
+    fn try_cancel(&mut self, action: usize) -> Result<bool, PlanError> {
+        let Some(ridx) = self.cast_rule else {
+            return Ok(false);
+        };
+        let sim_plan = self.sim_plan;
+        let rule = &sim_plan.rules[ridx];
+        debug_assert_eq!(rule.action, action, "the in-flight cast is its rule's");
+        if !rule.interrupt {
+            return Ok(false);
+        }
+        let now = self.time;
+        if now >= self.duration {
+            return Ok(false);
+        }
+        self.refresh_time_varying_slots();
+        if let Some(gate) = &rule.interrupt_if {
+            if gate.reads_objectives {
+                self.fill_objective_slots(ObjectiveWorld::Plain, "at a segment boundary")?;
+            }
+            if gate.eval(&self.scratch.slots) == 0.0 {
+                return Ok(false);
+            }
+        }
+        for wi in 0..ridx {
+            let Some((cd_ready, afford)) = self.rule_gates(wi, now, "at a segment boundary")?
+            else {
+                continue;
+            };
+            if gates_pass_now(cd_ready, afford, now) {
+                self.mid_cast = false;
+                self.segments_done = 0;
+                self.segments_total = 0;
+                self.actions[action].cancelled += 1;
+                self.cast_rule = Some(wi);
+                self.begin_cast(sim_plan.rules[wi].action)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Start `action`'s cast at `self.time`. Both expression-valued
@@ -2982,13 +3115,17 @@ impl<'a> Sim<'a> {
     /// `self.time`, then start the next one — landing every following
     /// INSTANT segment synchronously, in this loop (never by recursion),
     /// until a timed segment is scheduled or the last one has landed.
+    /// After every NON-LAST landing — synchronous instant ones included —
+    /// and before the next segment starts, the player-cancel check
+    /// ([`Sim::try_cancel`]) runs; a cancel returns at once, since the
+    /// replacement cast owns the timeline from there.
     fn land_segment(&mut self, action: usize, segment: usize) -> Result<(), PlanError> {
         let n = self.sim_plan.actions[action].segments.len();
         let mut segment = segment;
         loop {
             self.land(action, Part::Segment(segment))?;
             let next = segment + 1;
-            if next == n || self.start_segment(action, next)? {
+            if next == n || self.try_cancel(action)? || self.start_segment(action, next)? {
                 return Ok(());
             }
             segment = next;
@@ -3019,9 +3156,9 @@ impl<'a> Sim<'a> {
     /// LANDING (a wind-up last segment builds one when the action has
     /// effects), so once per segment for a segmented cast instead of once
     /// per cast — the only allocation segments add to the run loop. The
-    /// next segment's start (duration, `cast_start` capture, schedule)
-    /// follows in [`Sim::land_segment`], AFTER this transaction's proc
-    /// rolls and reset.
+    /// player-cancel check and then the next segment's start (duration,
+    /// `cast_start` capture, schedule) follow in [`Sim::land_segment`],
+    /// AFTER this transaction's proc rolls and reset.
     fn land(&mut self, action: usize, part: Part) -> Result<(), PlanError> {
         let now = self.time;
         let (first, last) = match part {
@@ -4283,6 +4420,7 @@ impl<'a> Sim<'a> {
                 a.name.clone(),
                 ActionReport {
                     casts: rt.casts,
+                    cancelled: rt.cancelled,
                     damage: rt.damage,
                     share: if total.total_damage > 0.0 {
                         rt.damage / total.total_damage
@@ -15726,6 +15864,373 @@ mod tests {
                 let r = try_run(&simdef(&slam_with(""), 10.0, &p), &b, 5.0, mc).unwrap();
                 assert_eq!(r.proc_counts["ph"], want, "icd {icd}: {:?}", r.proc_counts);
             }
+        }
+
+        // ==============================================================
+        // Slice 5 — player cancels (`interrupt`, `interrupt_if`).
+        //
+        // Shared fixture: `slam` = SLAM (`[0.5 → 100, 0.75 → 300]`),
+        // `jab` = `cast_time 0.25, cooldown 2, dmg 50`, rules
+        // `[jab, slam(+interrupt fields)]`, weight 5, EV.
+        // ==============================================================
+
+        /// The fixture's `jab`, verbatim.
+        const JAB: &str =
+            r#"{ "cast_time": "0.25", "cooldown": 2.0, "damage": { "stats": { "dmg": 50 } } }"#;
+
+        /// A simdef with actions `slam` and `jab`, two 0.1 s
+        /// contribution-free buffs `fury` and `blip` to count
+        /// applications of, and `rest` spliced in as further top-level
+        /// fields (each with a trailing comma).
+        fn cancel_simdef(slam_json: &str, jab_json: &str, rest: &str) -> String {
+            format!(
+                r#"{{ {rest}
+                     "actions": {{ "slam": {slam_json}, "jab": {jab_json} }},
+                     "buffs": {{ "fury": {{ "duration": 0.1 }}, "blip": {{ "duration": 0.1 }} }},
+                     "damage_objective": "hit" }}"#
+            )
+        }
+
+        /// Run `simdef_json` under the rotation `rules_json` (a JSON
+        /// array of rules) — `ROT`'s sibling for the two-action fixtures.
+        fn cancel_run(
+            simdef_json: &str,
+            rules_json: &str,
+            weight: f64,
+            mode: Mode,
+        ) -> Result<SimReport, PlanError> {
+            let plan = seg_plan();
+            let simdef: SimDef = serde_json::from_str(simdef_json).unwrap();
+            let rotation: Rotation =
+                serde_json::from_str(&format!(r#"{{ "rules": {rules_json} }}"#)).unwrap();
+            let sim_plan = sim_compile(&plan, &simdef, &rotation).unwrap();
+            run(&plan, &sim_plan, &seg_build(0.0), &fight(weight), mode)
+        }
+
+        fn cancel_ev(simdef_json: &str, rules_json: &str, weight: f64) -> SimReport {
+            cancel_run(simdef_json, rules_json, weight, Mode::Expected).unwrap()
+        }
+
+        /// `[jab, slam + slam_rule_extra]` — `slam_rule_extra` is spliced
+        /// into slam's rule object (each field with a trailing comma).
+        fn jab_over_slam(slam_rule_extra: &str) -> String {
+            format!(r#"[ {{ "action": "jab" }}, {{ {slam_rule_extra} "action": "slam" }} ]"#)
+        }
+
+        fn assert_total(r: &SimReport, want: f64, what: &str) {
+            assert!(
+                close(r.total.total_damage, want),
+                "{what}: got {} (want {want})",
+                r.total.total_damage
+            );
+        }
+
+        // --------------------------------------------------------------
+        // With `interrupt: true`:
+        //   jab 0–0.25 (ready 2);
+        //   slam 0.25: lands 0.75 (jab not ready), 1.5;
+        //   slam 1.5: lands 2.0, jab ready → CANCELLED; jab 2.0–2.25
+        //     (ready 4);
+        //   slam 2.25: lands 2.75, 3.5;
+        //   slam 3.5: lands 4.0 → CANCELLED; jab 4.0–4.25;
+        //   slam 4.25: lands 4.75; segment 1 (5.5) is past the horizon.
+        //   jab 3 × 50 = 150; slam seg 0 × 5 = 500, seg 1 × 2 = 600
+        //   → 1250, slam casts 5, cancelled 2, jab casts 3.
+        // Without (the contrast): jab 0–0.25; slam 0.75/1.5, 2.0/2.75;
+        //   jab 2.75–3.0 (ready 5); slam 3.5/4.25, 4.75
+        //   → jab 100 + slam 4 × 100 + 3 × 300 = 1400, cancelled 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_higher_rule_cancels_at_a_boundary() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let r = cancel_ev(&def, &jab_over_slam(r#""interrupt": true,"#), 5.0);
+            assert_total(&r, 1250.0, "interrupt");
+            assert_eq!(r.actions["slam"].casts, 5);
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            assert_eq!(r.actions["jab"].casts, 3);
+            assert_eq!(r.actions["jab"].cancelled, 0);
+
+            let r = cancel_ev(&def, &jab_over_slam(""), 5.0);
+            assert_total(&r, 1400.0, "no interrupt");
+            assert_eq!(r.actions["slam"].cancelled, 0);
+            assert_eq!(r.actions["jab"].casts, 2);
+        }
+
+        // `interrupt_if` gates the check: at the fixture's only non-last
+        // boundary `segments_done` = 1, so `>= 1` is the 1250 timeline
+        // and `>= 2` never cancels → 1400.
+        #[test]
+        fn interrupt_if_gates_the_cancel() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let r = cancel_ev(
+                &def,
+                &jab_over_slam(r#""interrupt_if": "segments_done >= 1","#),
+                5.0,
+            );
+            assert_total(&r, 1250.0, ">= 1");
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            let r = cancel_ev(
+                &def,
+                &jab_over_slam(r#""interrupt_if": "segments_done >= 2","#),
+                5.0,
+            );
+            assert_total(&r, 1400.0, ">= 2");
+            assert_eq!(r.actions["slam"].cancelled, 0);
+        }
+
+        // Rules `[slam(interrupt), jab]`: no rule ranks above slam, and
+        // slam itself (same rule) never cancels. Back-to-back slams at
+        // 0, 1.25, 2.5, 3.75 → 4 × 400 = 1600 (the
+        // `a_segmented_cast_credits_each_landed_segment` timeline),
+        // cancelled 0, jab never cast.
+        #[test]
+        fn a_lower_or_same_rule_never_cancels() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let r = cancel_ev(
+                &def,
+                r#"[ { "action": "slam", "interrupt": true }, { "action": "jab" } ]"#,
+                5.0,
+            );
+            assert_total(&r, 1600.0, "slam on top");
+            assert_eq!(r.actions["slam"].casts, 4);
+            assert_eq!(r.actions["slam"].cancelled, 0);
+            assert_eq!(r.actions["jab"].casts, 0);
+        }
+
+        // jab `when: "0"` is never eligible, so it never cancels: slam
+        // runs back-to-back → 1600, cancelled 0 (contrast: the eligible
+        // jab of `a_higher_rule_cancels_at_a_boundary` → 1250, 2).
+        #[test]
+        fn a_higher_rule_that_is_not_eligible_does_not_cancel() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let r = cancel_ev(
+                &def,
+                r#"[ { "action": "jab", "when": "0" },
+                     { "action": "slam", "interrupt": true } ]"#,
+                5.0,
+            );
+            assert_total(&r, 1600.0, "jab ineligible");
+            assert_eq!(r.actions["slam"].cancelled, 0);
+            assert_eq!(r.actions["jab"].casts, 0);
+        }
+
+        // --------------------------------------------------------------
+        // A 3-segment slam `[0.5 → 100, 0.5 → 200, 0.5 → 300]`, the
+        // fixture's jab, weight 5.
+        // `interrupt_if: "segments_done == 2"` (second boundary only):
+        //   jab 0–0.25 (ready 2);
+        //   A 0.25: 0.75, 1.25 (jab not ready), 1.75        → 600;
+        //   B 1.75: 2.25 (sd 1: no check), 2.75 → CANCELLED → 300;
+        //   jab 2.75–3.0 (ready 4.75);
+        //   C 3.0: 3.5, 4.0 (jab not ready), 4.5            → 600;
+        //   D 4.5: 5.0 (the horizon), rest cut               → 100.
+        //   jab 2 × 50 + 1600 = 1700; slam casts 4, cancelled 1.
+        // `== 1` (first boundary only):
+        //   jab 0–0.25; A 0.25: 0.75 (not ready), 1.25, 1.75 → 600;
+        //   B 1.75: 2.25 → CANCELLED → 100; jab 2.25–2.5 (ready 4.25);
+        //   C 2.5: 3.0, 3.5, 4.0 → 600;
+        //   D 4.0: 4.5 (ready 4.25) → CANCELLED → 100; jab 4.5–4.75;
+        //   E 4.75: segment 0 (5.25) never lands — not counted.
+        //   jab 3 × 50 + 1400 = 1550; slam casts 4, cancelled 2.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_cancel_at_segment_0_vs_later() {
+            let slam3 = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 100 } } },
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 200 } } },
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 300 } } } ] }"#;
+            let def = cancel_simdef(slam3, JAB, "");
+            let r = cancel_ev(
+                &def,
+                &jab_over_slam(r#""interrupt_if": "segments_done == 2","#),
+                5.0,
+            );
+            assert_total(&r, 1700.0, "== 2");
+            assert_eq!(r.actions["slam"].casts, 4);
+            assert_eq!(r.actions["slam"].cancelled, 1);
+            assert_eq!(r.actions["jab"].casts, 2);
+
+            let r = cancel_ev(
+                &def,
+                &jab_over_slam(r#""interrupt_if": "segments_done == 1","#),
+                5.0,
+            );
+            assert_total(&r, 1550.0, "== 1");
+            assert_eq!(r.actions["slam"].casts, 4);
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            assert_eq!(r.actions["jab"].casts, 3);
+        }
+
+        // --------------------------------------------------------------
+        // The fixture timeline (slams A..E begin 0.25, 1.5, 2.25, 3.5,
+        // 4.25; B and D cancelled; E cut by the horizon), with slam
+        // costing 10 `rage` and gaining 10 (last landing only), an
+        // action-level `effects` apply of `blip` (last landing only),
+        // and segment 0 applying `fury`. `rage`: max 100, regen 0,
+        // starts full. jab dmg = `50 + rage`, measured at its
+        // completion:
+        //   jab 0.25 (before A pays)              → 50 + 100 = 150;
+        //   A pays → 90, completes → 100; B pays → 90, CANCELLED (no
+        //     gain); jab 2.25                     → 50 + 90  = 140;
+        //   C pays → 80, completes → 90; D pays → 80, CANCELLED;
+        //     jab 4.25                            → 50 + 80  = 130.
+        //   jab damage 420. Mutation (gain on cancel): 150 × 3 = 450.
+        // blip: completed slams only (A, C) → 2 (4 if a cancel ran the
+        //   action-level effects). fury: once per landed segment 0
+        //   (A..E) → 5.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_cancelled_cast_keeps_landed_segments_only() {
+            let slam = r#"{ "cost": { "rage": 10 }, "gain": { "rage": 10 },
+                 "effects": [ { "apply_buff": "blip" } ],
+                 "segments": [
+                   { "duration": 0.5, "damage": { "stats": { "dmg": 100 } },
+                     "effects": [ { "apply_buff": "fury" } ] },
+                   { "duration": 0.75, "damage": { "stats": { "dmg": 300 } } } ] }"#;
+            let jab = r#"{ "cast_time": "0.25", "cooldown": 2.0,
+                           "damage": { "stats": { "dmg": "50 + rage" } } }"#;
+            let res = r#""resources": { "rage": { "max": "100", "regen_per_sec": "0" } },"#;
+            let r = cancel_ev(
+                &cancel_simdef(slam, jab, res),
+                &jab_over_slam(r#""interrupt": true,"#),
+                5.0,
+            );
+            assert_eq!(r.actions["slam"].casts, 5);
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            assert_eq!(r.actions["jab"].casts, 3);
+            assert!(
+                close(r.actions["jab"].damage, 420.0),
+                "jab damage (reads rage): got {}",
+                r.actions["jab"].damage
+            );
+            assert!(
+                close(r.actions["slam"].damage, 1100.0),
+                "slam damage: got {}",
+                r.actions["slam"].damage
+            );
+            assert_eq!(r.buffs["blip"].applications, 2, "action-level effects");
+            assert_eq!(r.buffs["fury"].applications, 5, "segment 0 effects");
+        }
+
+        // --------------------------------------------------------------
+        // A cancel into an INSTANT winner: jab `cast_time 0, cooldown
+        // 1.75, dmg 50`, slam = SLAM, weight 5:
+        //   t=0 jab (ready 1.75), then slam A 0: 0.5, 1.25;
+        //   B 1.25: 1.75 → CANCELLED; jab completes AT 1.75 (ready 3.5)
+        //     and the rotation re-decides at once: C 1.75: 2.25, 3.0;
+        //   D 3.0: 3.5 → CANCELLED; jab 3.5 (ready 5.25);
+        //   E 3.5: 4.0, 4.75; F 4.75: segment 0 (5.25) never lands.
+        //   jab 3 × 50 + seg 0 × 5 (A..E) 500 + seg 1 × 3 (A, C, E) 900
+        //   → 1550, slam casts 5, cancelled 2.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_cancel_into_an_instant_action_redecides_at_once() {
+            let jab0 =
+                r#"{ "cast_time": "0", "cooldown": 1.75, "damage": { "stats": { "dmg": 50 } } }"#;
+            let r = cancel_ev(
+                &cancel_simdef(&slam_with(""), jab0, ""),
+                &jab_over_slam(r#""interrupt": true,"#),
+                5.0,
+            );
+            assert_total(&r, 1550.0, "instant winner");
+            assert_eq!(r.actions["slam"].casts, 5);
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            assert_eq!(r.actions["jab"].casts, 3);
+        }
+
+        // --------------------------------------------------------------
+        // 3 segments `[0.5 → 100, 0 → 200, 0.75 → 300]` (segment 1 is
+        // instant, landing synchronously in `land_segment`'s loop), the
+        // fixture's jab, `interrupt_if: "segments_done == 2"` — true
+        // only right after the INSTANT segment lands. Weight 5:
+        //   jab 0–0.25; A 0.25: 0.75, 0.75 (jab not ready), 1.5 → 600;
+        //   B 1.5: 2.0, 2.0 → CANCELLED → 300; jab 2.0–2.25 (ready 4);
+        //   C 2.25: 2.75, 2.75, 3.5 → 600;
+        //   D 3.5: 4.0, 4.0 → CANCELLED → 300; jab 4.0–4.25;
+        //   E 4.25: 4.75, 4.75 (not ready), 5.5 cut → 300.
+        //   jab 150 + slam 2100 → 2250, cancelled 2.
+        // Contrast (no interrupt): jab 0–0.25; slams 0.25, 1.5; jab
+        //   2.75–3.0 (ready 5); slams 3.0, 4.25 (cut after 300)
+        //   → jab 100 + slam 3 × 600 + 300 → 2200, cancelled 0 — also
+        //   what a check skipped after synchronous segments would give.
+        // --------------------------------------------------------------
+        #[test]
+        fn a_cancel_runs_between_synchronous_instant_segments() {
+            let slam3 = r#"{ "segments": [
+                 { "duration": 0.5, "damage": { "stats": { "dmg": 100 } } },
+                 { "duration": 0, "damage": { "stats": { "dmg": 200 } } },
+                 { "duration": 0.75, "damage": { "stats": { "dmg": 300 } } } ] }"#;
+            let def = cancel_simdef(slam3, JAB, "");
+            let r = cancel_ev(
+                &def,
+                &jab_over_slam(r#""interrupt_if": "segments_done == 2","#),
+                5.0,
+            );
+            assert_total(&r, 2250.0, "after the instant segment");
+            assert_eq!(r.actions["slam"].casts, 5);
+            assert_eq!(r.actions["slam"].cancelled, 2);
+            assert_eq!(r.actions["jab"].casts, 3);
+
+            let r = cancel_ev(&def, &jab_over_slam(""), 5.0);
+            assert_total(&r, 2200.0, "no interrupt");
+            assert_eq!(r.actions["slam"].cancelled, 0);
+        }
+
+        // Cancels are deterministic: the fixture under MC (crit-free,
+        // 20 iterations) gives EV's 1250 and a pooled `cancelled` of
+        // exactly 2.
+        #[test]
+        fn cancels_are_identical_in_mc() {
+            let def = cancel_simdef(&slam_with(""), JAB, "");
+            let rules = jab_over_slam(r#""interrupt": true,"#);
+            let ev = cancel_ev(&def, &rules, 5.0);
+            let mc = cancel_run(
+                &def,
+                &rules,
+                5.0,
+                Mode::MonteCarlo {
+                    iterations: 20,
+                    seed: 7,
+                },
+            )
+            .unwrap();
+            assert_total(&mc, 1250.0, "MC");
+            for name in ["slam", "jab"] {
+                assert_eq!(mc.actions[name].casts, ev.actions[name].casts, "{name}");
+                assert_eq!(
+                    mc.actions[name].cancelled, ev.actions[name].cancelled,
+                    "{name}"
+                );
+            }
+            assert_eq!(mc.actions["slam"].cancelled, 2);
+        }
+
+        // --------------------------------------------------------------
+        // A boundary AT the horizon does not cancel (the replacement
+        // could not begin there).
+        // Instant jab `cast_time 0, cooldown 1.75`, weight 1.75:
+        //   jab 0 (50); A 0: 0.5, 1.25 (400); B 1.25: segment 0 lands
+        //   AT 1.75 = the horizon (100), jab ready — but no cancel:
+        //   550, jab casts 1, cancelled 0. (Cancelling there would cast
+        //   the instant jab at the horizon → 600, jab casts 2,
+        //   cancelled 1.)
+        // Timed jab (the fixture's), weight 2: B's segment 0 lands at
+        //   2.0 = the horizon → 50 + 400 + 100 = 550, cancelled 0.
+        // --------------------------------------------------------------
+        #[test]
+        fn no_cancel_begins_a_cast_at_the_horizon() {
+            let jab0 =
+                r#"{ "cast_time": "0", "cooldown": 1.75, "damage": { "stats": { "dmg": 50 } } }"#;
+            let rules = jab_over_slam(r#""interrupt": true,"#);
+            let r = cancel_ev(&cancel_simdef(&slam_with(""), jab0, ""), &rules, 1.75);
+            assert_total(&r, 550.0, "instant jab");
+            assert_eq!(r.actions["jab"].casts, 1);
+            assert_eq!(r.actions["slam"].cancelled, 0);
+
+            let r = cancel_ev(&cancel_simdef(&slam_with(""), JAB, ""), &rules, 2.0);
+            assert_total(&r, 550.0, "timed jab");
+            assert_eq!(r.actions["slam"].casts, 2);
+            assert_eq!(r.actions["slam"].cancelled, 0);
         }
     }
 
