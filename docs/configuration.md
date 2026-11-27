@@ -33,6 +33,9 @@ A timeline simulation adds two documents:
    as action damage.
 5. **Rotation** is an ordered priority list. The first eligible rule runs;
    resource costs and cooldown readiness are automatic hard gates.
+   Effects lists apply buffs (`apply_buff`), free-cast actions from procs
+   (`cast_action`), and end buffs (`remove_buff`), such as a spender that
+   consumes its proc.
 
 Run an expected-value timeline with `rtce simulate` and add
 `--mode monte-carlo --iterations N --seed S` for reproducible sampled fights.

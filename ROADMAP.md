@@ -503,6 +503,16 @@ their shape. Three groups:
       and ships candidate sets as JSON. Give them the P8a treatment
       (stored `extra` + walk, or parse-time mirror) when that happens.
 
+## `remove_buff` (Unreleased) — open debt
+- **Removing an `ev_uptime: expected` buff** is rejected. An action
+  removal (q = 1) would clear the roll log exactly; a proc removal needs
+  a joint model with the applications. Design it when a config needs one.
+- **No `removals` count in `BuffReport`.** A WoW-style report wants
+  "consumed N times"; today only uptime and applications are reported.
+- **Proc-driven removal in EV is gated by READS only.** A proc removal of
+  a buff nothing reads runs on EV's averaged schedule (the same
+  approximation proc applications already make). It is not flagged.
+
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;
   the timeline executor has no notion of more than one target.

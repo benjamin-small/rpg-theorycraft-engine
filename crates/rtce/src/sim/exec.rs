@@ -486,6 +486,9 @@ pub fn run(
 
     match mode {
         Mode::Expected => {
+            if let Some(why) = &sim_plan.ev_inexact_removal {
+                return Err(PlanError { what: why.clone() });
+            }
             let scratch = SimScratch::new(plan, sim_plan);
             let mut sim = Sim::new(plan, sim_plan, build, scenario, duration, scratch, None)?;
             sim.run_loop()?;
@@ -2284,6 +2287,7 @@ impl<'a> Sim<'a> {
         for effect in effects {
             match *effect {
                 CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, Some(world))?,
+                CompiledEffect::RemoveBuff(bi) => self.remove_buff(bi)?,
                 // `sim::compile` rejects a `cast_action` effect on an
                 // action (an action free-casting an action reopens the
                 // A→B→A recursion the free-cast guard closed), so no
@@ -2295,6 +2299,35 @@ impl<'a> Sim<'a> {
             }
         }
         Ok(())
+    }
+
+    /// End every live instance of `bi` now — the
+    /// [`crate::simdef::EffectDef::RemoveBuff`] effect. A no-op when the
+    /// buff is not up. Otherwise ONE state change, through the same
+    /// transaction an expiry uses (`flush_before_change` → mutate →
+    /// `refresh_after_change`), so uptime, stacks, conditions and a live
+    /// `tick_objective` all close here. The generation bump stales the
+    /// pending `BuffExpire` of the removed window, which is what keeps
+    /// the one-live-expiry invariant: nothing is left to schedule.
+    ///
+    /// `sim::compile` rejects removing an `ev_uptime: expected` buff, so
+    /// `bi` is always a discrete (instance-list) buff here.
+    fn remove_buff(&mut self, bi: usize) -> Result<(), PlanError> {
+        debug_assert!(
+            !self.ev_expected[bi],
+            "sim::compile rejects removing an `ev_uptime: expected` buff"
+        );
+        if self.buffs[bi].instances.is_empty() {
+            return Ok(());
+        }
+        let now = self.time;
+        self.flush_before_change();
+        self.flush_stacks(bi);
+        self.buffs[bi].instances.clear();
+        self.buffs[bi].active_seconds += now - self.buffs[bi].activated_at;
+        self.buffs[bi].generation += 1;
+        self.active_buff_set.retain(|&x| x != bi);
+        self.refresh_after_change()
     }
 
     /// The scheduled expiry sweep for `bi`: drop every instance whose
@@ -4212,6 +4245,7 @@ impl<'a> Sim<'a> {
                 CompiledEffect::ApplyBuff(bi) if self.ev_expected[bi] => {}
                 CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
                 CompiledEffect::CastAction(ai) => self.free_cast(ai)?,
+                CompiledEffect::RemoveBuff(bi) => self.remove_buff(bi)?,
             }
         }
         Ok(())

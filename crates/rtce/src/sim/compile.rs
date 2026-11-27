@@ -143,6 +143,7 @@ fn compile_sim(
         read: Cell::new(false),
         unknown: RefCell::new(None),
         forbidden: RefCell::new(None),
+        watched: RefCell::new(None),
     };
     match compile_expr(src, &probe) {
         Ok(program) => {
@@ -182,6 +183,19 @@ fn compile_sim(
                     ),
                 });
             }
+            if let Some((read, buff, via)) = probe.watched.borrow().as_ref() {
+                let mut hit = syms.ev_removal_hit.borrow_mut();
+                if hit.is_none() {
+                    *hit = Some(format!(
+                        "this config cannot run in expected-value mode: {} reads `{read}`, \
+                         and buff `{buff}` is removed by {via}. EV fires procs on an \
+                         averaged schedule, so a rotation reading a proc-removed buff \
+                         would branch on a state one deterministic timeline cannot \
+                         represent. Run it in Monte Carlo mode, which is exact here",
+                        what()
+                    ));
+                }
+            }
             Ok(SimProgram {
                 program,
                 reads_objectives,
@@ -214,11 +228,20 @@ struct ObjectiveProbe<'a, 'b> {
     /// The first read of a name an `ev_uptime: expected` buff forbids:
     /// (name read, the buff).
     forbidden: RefCell<Option<(String, String)>>,
+    /// The first read of a name in [`SimSymbols::ev_removal_watch`]:
+    /// (name read, the buff, how a proc removes it).
+    watched: RefCell<Option<(String, String, String)>>,
 }
 
 impl Symbols for ObjectiveProbe<'_, '_> {
     fn slot(&self, name: &str) -> Option<u16> {
         let slot = self.inner.slot(name);
+        if let Some(w) = self.inner.ev_removal_watch.get(name) {
+            let mut r = self.watched.borrow_mut();
+            if r.is_none() {
+                *r = Some((name.to_string(), w.0.clone(), w.1.clone()));
+            }
+        }
         if let Some(buff) = self.inner.forbidden.get(name) {
             let mut f = self.forbidden.borrow_mut();
             if f.is_none() {
@@ -321,8 +344,9 @@ pub struct CompiledAction {
     /// completion instant they land and what a repeat means). Both the
     /// deprecated `apply_buff` sugar and an explicit `effects` list
     /// desugar HERE, so the executor has one path. Only
-    /// [`CompiledEffect::ApplyBuff`] can appear — [`compile`] rejects a
-    /// `cast_action` effect on an action (recursion; see that error).
+    /// [`CompiledEffect::ApplyBuff`] and [`CompiledEffect::RemoveBuff`]
+    /// can appear — [`compile`] rejects a `cast_action` effect on an
+    /// action (recursion; see that error).
     pub effects: Vec<CompiledEffect>,
     /// The RESOLVED measurement instant for this action's casts (P8c):
     /// [`crate::simdef::ActionDef::measure`] where the config named one,
@@ -355,7 +379,8 @@ pub struct CompiledSegment {
     /// instant; `None` is a wind-up segment with no hits.
     pub damage: Option<std::collections::BTreeMap<String, CompiledValue>>,
     /// Effects executed at this segment's landing, in list order. Only
-    /// [`CompiledEffect::ApplyBuff`] can appear.
+    /// [`CompiledEffect::ApplyBuff`] and [`CompiledEffect::RemoveBuff`]
+    /// can appear.
     pub effects: Vec<CompiledEffect>,
     /// The RESOLVED measurement instant for this segment.
     pub measure: Measure,
@@ -434,6 +459,9 @@ pub enum CompiledEffect {
     ApplyBuff(usize),
     /// Cast the action at this index in `SimPlan::actions`.
     CastAction(usize),
+    /// End every live instance of the buff at this index in
+    /// `SimPlan::buffs` (see [`crate::simdef::EffectDef::RemoveBuff`]).
+    RemoveBuff(usize),
 }
 
 /// One compiled [`crate::simdef::ProcDef`].
@@ -506,6 +534,11 @@ pub struct CompiledRule {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SimPlan {
+    /// `Some(message)` when this plan cannot run in `Mode::Expected`: a
+    /// sim expression reads a buff that a proc removes (see
+    /// [`crate::simdef::EffectDef::RemoveBuff`]). [`crate::sim::run`]
+    /// returns the message as its error in EV; Monte Carlo ignores it.
+    pub ev_inexact_removal: Option<String>,
     /// The slot offset where the sim-state segment begins — equal to the
     /// underlying `Plan`'s own unified slot width
     /// (`[stats | conditions | buckets | stages | event_factors]`). Sim
@@ -587,6 +620,15 @@ struct SimSymbols<'a> {
     /// buff, its `buff.`/`buff_remaining.`/`stacks.` words and every
     /// condition it drives, each mapped to that buff's name.
     forbidden: BTreeMap<String, String>,
+    /// Names whose read makes EV inexact: for each buff a PROC removes
+    /// (directly, or via the free cast its `cast_action` runs), its
+    /// `buff.`/`buff_remaining.`/`stacks.` words and every condition it
+    /// drives, each mapped to `(buff, "proc `p`" or "proc `p`'s free cast
+    /// `a`")`.
+    ev_removal_watch: BTreeMap<String, (String, String)>,
+    /// The first watched read [`compile_sim`] saw, as the full error
+    /// message [`crate::sim::run`] returns in EV.
+    ev_removal_hit: RefCell<Option<String>>,
 }
 
 impl<'a> SimSymbols<'a> {
@@ -615,7 +657,48 @@ impl<'a> SimSymbols<'a> {
                 }
             }
         }
+        let mut ev_removal_watch = BTreeMap::new();
+        let removes = |effects: &[EffectDef], b: &str| {
+            effects
+                .iter()
+                .any(|e| matches!(e, EffectDef::RemoveBuff(x) if x == b))
+        };
+        for (pname, p) in &simdef.procs {
+            for (bname, b) in &simdef.buffs {
+                let mut via = removes(&p.effects, bname).then(|| format!("proc `{pname}`"));
+                if via.is_none() {
+                    via = p
+                        .cast_action
+                        .iter()
+                        .chain(p.effects.iter().filter_map(|e| match e {
+                            EffectDef::CastAction(a) => Some(a),
+                            _ => None,
+                        }))
+                        .find(|a| {
+                            simdef
+                                .actions
+                                .get(*a)
+                                .is_some_and(|d| removes(&d.effects, bname))
+                        })
+                        .map(|a| format!("proc `{pname}`'s free cast `{a}`"));
+                }
+                if let Some(via) = via {
+                    for prefix in ["buff.", "buff_remaining.", "stacks."] {
+                        ev_removal_watch
+                            .entry(format!("{prefix}{bname}"))
+                            .or_insert_with(|| (bname.clone(), via.clone()));
+                    }
+                    for c in b.conditions.keys() {
+                        ev_removal_watch
+                            .entry(c.clone())
+                            .or_insert_with(|| (bname.clone(), via.clone()));
+                    }
+                }
+            }
+        }
         SimSymbols {
+            ev_removal_watch,
+            ev_removal_hit: RefCell::new(None),
             forbidden,
             plan,
             time_slot: base,
@@ -947,7 +1030,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                             ),
                         });
                     }
-                    EffectDef::ApplyBuff(b) => {
+                    EffectDef::ApplyBuff(b) | EffectDef::RemoveBuff(b) => {
                         if !simdef.buffs.contains_key(b) {
                             return Err(PlanError {
                                 what: format!(
@@ -1000,7 +1083,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                         ),
                     });
                 }
-                EffectDef::ApplyBuff(b) => {
+                EffectDef::ApplyBuff(b) | EffectDef::RemoveBuff(b) => {
                     if !simdef.buffs.contains_key(b) {
                         return Err(PlanError {
                             what: format!("action `{name}`: unknown buff `{b}` in effects"),
@@ -1154,7 +1237,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
         for effect in &p.effects {
             match effect {
-                EffectDef::ApplyBuff(b) => {
+                EffectDef::ApplyBuff(b) | EffectDef::RemoveBuff(b) => {
                     if !simdef.buffs.contains_key(b) {
                         return Err(PlanError {
                             what: format!("proc `{name}`: unknown buff `{b}` in effects"),
@@ -1257,6 +1340,34 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                     });
                 }
             }
+        }
+        let removed_by = |effects: &[EffectDef]| {
+            effects
+                .iter()
+                .any(|e| matches!(e, EffectDef::RemoveBuff(x) if x == name))
+        };
+        let remover = simdef
+            .actions
+            .iter()
+            .find(|(_, d)| {
+                removed_by(&d.effects) || d.segments.iter().any(|sg| removed_by(&sg.effects))
+            })
+            .map(|(a, _)| format!("action `{a}`"))
+            .or_else(|| {
+                simdef
+                    .procs
+                    .iter()
+                    .find(|(_, p)| removed_by(&p.effects))
+                    .map(|(p, _)| format!("proc `{p}`"))
+            });
+        if let Some(remover) = remover {
+            return Err(PlanError {
+                what: format!(
+                    "buff `{name}`: `ev_uptime: expected` cannot be the target of a \
+                     `remove_buff` effect ({remover} removes it) — a removal has no \
+                     defined meaning on the expected-uptime roll log yet"
+                ),
+            });
         }
         for (pname, p) in &simdef.procs {
             let applies = |b: &str| {
@@ -1382,6 +1493,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .iter()
                 .map(|e| match e {
                     EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
+                    EffectDef::RemoveBuff(b) => CompiledEffect::RemoveBuff(buff_index(b)),
                     EffectDef::CastAction(_) => {
                         unreachable!("`cast_action` on a segment rejected above")
                     }
@@ -1428,6 +1540,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .iter()
                 .map(|e| match e {
                     EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
+                    EffectDef::RemoveBuff(b) => CompiledEffect::RemoveBuff(buff_index(b)),
                     EffectDef::CastAction(_) => {
                         unreachable!("`cast_action` on an action rejected above")
                     }
@@ -1504,6 +1617,7 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
                 .map(|e| match e {
                     EffectDef::ApplyBuff(b) => CompiledEffect::ApplyBuff(buff_index(b)),
                     EffectDef::CastAction(a) => CompiledEffect::CastAction(action_index(a)),
+                    EffectDef::RemoveBuff(b) => CompiledEffect::RemoveBuff(buff_index(b)),
                 })
                 .collect()
         };
@@ -1570,7 +1684,9 @@ pub fn compile(plan: &Plan, simdef: &SimDef, rotation: &Rotation) -> Result<SimP
         }
     }
 
+    let ev_inexact_removal = syms.ev_removal_hit.borrow().clone();
     Ok(SimPlan {
+        ev_inexact_removal,
         condition_expected,
         sim_base: syms.sim_base(),
         segments_done_slot: syms.segments_done_slot,

@@ -7,6 +7,25 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **`remove_buff` effect.** `{ "remove_buff": "<buff>" }` in an action's,
+  segment's or proc's effects list ends every live instance of the buff
+  at that instant (a no-op when it is not up). It runs after the landing
+  is measured, so a spender still benefits from what it consumes, and it
+  closes uptime, stacks, conditions and live ticks as one state change.
+  Action and segment removals are deterministic, so EV and Monte Carlo
+  agree exactly. When a PROC removes a buff (directly or through its free
+  cast) and any sim expression reads that buff or a condition it drives,
+  `sim::run` fails closed in `Mode::Expected` and names Monte Carlo:
+  EV's averaged proc schedule cannot represent the branch. Removing an
+  `ev_uptime: expected` buff is a compile error. `SimPlan` gains
+  `ev_inexact_removal`. Pinned by `tests/remove_buff.rs` (11 tests), and
+  the lexicon gains a `remove_buff` entry.
+
+### Upgrade notes
+- `EffectDef` and `CompiledEffect` gain a `RemoveBuff` variant (both are
+  `#[non_exhaustive]`, so downstream matches already carry a wildcard).
+
 ## [0.10.0] — 2026-11-27
 
 **Player cancels.** Version 0.10.0 lets a rotation rule allow a
