@@ -7,6 +7,14 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-28
+
+**Global cooldown and buff consumption.** Rotations can model a shared
+cooldown with off-GCD actions, and action, segment, and proc effects can
+consume an active buff. Existing JSON configs retain their behavior.
+Rust callers constructing actions or simulation defaults gain an optional
+field.
+
 ### Added
 - **`remove_buff` effect.** `{ "remove_buff": "<buff>" }` in an action's,
   segment's or proc's effects list ends every live instance of the buff
@@ -21,10 +29,6 @@ until then, per semver's "anything goes" pre-1.0 clause).
   `ev_uptime: expected` buff is a compile error. `SimPlan` gains
   `ev_inexact_removal`. Pinned by `tests/remove_buff.rs` (11 tests), and
   the lexicon gains a `remove_buff` entry.
-
-### Upgrade notes
-- `EffectDef` and `CompiledEffect` gain a `RemoveBuff` variant (both are
-  `#[non_exhaustive]`, so downstream matches already carry a wildcard).
 - **Global cooldown.** `SimDefaults::gcd` and `ActionDef::gcd` (both
   optional `NumOrExpr`, evaluated at cast start in the pre-payment world)
   add a GCD lock: a GCD-bound action may not begin while the lock is held
@@ -40,6 +44,8 @@ until then, per semver's "anything goes" pre-1.0 clause).
   free-cast contrasts); the lexicon gains a `gcd` entry.
 
 ### Upgrade notes
+- `EffectDef` and `CompiledEffect` gain a `RemoveBuff` variant (both are
+  `#[non_exhaustive]`, so downstream matches already carry a wildcard).
 - `ActionDef` and `SimDefaults` gain a public `gcd` field, so Rust
   struct literals need `gcd: None`. JSON configs are unaffected: absent
   everywhere means no GCD, and every pre-existing number is unchanged.

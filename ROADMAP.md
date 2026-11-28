@@ -503,7 +503,7 @@ their shape. Three groups:
       and ships candidate sets as JSON. Give them the P8a treatment
       (stored `extra` + walk, or parse-time mirror) when that happens.
 
-## `remove_buff` (Unreleased) — open debt
+## `remove_buff` (0.11.0) — open debt
 - **Removing an `ev_uptime: expected` buff** is rejected. An action
   removal (q = 1) would clear the roll log exactly; a proc removal needs
   a joint model with the applications. Design it when a config needs one.
@@ -512,7 +512,7 @@ their shape. Three groups:
 - **Proc-driven removal in EV is gated by READS only.** A proc removal of
   a buff nothing reads runs on EV's averaged schedule (the same
   approximation proc applications already make). It is not flagged.
-## Global cooldown (Unreleased) — open debt
+## Global cooldown (0.11.0) — open debt
 - **No `gcd.remains` / `gcd.max` sim symbols yet.** A rotation `when`
   cannot read the lock; SimC-style APLs that test `gcd.remains` need
   them. Add as engine context words when the first consumer needs one.
