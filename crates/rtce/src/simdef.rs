@@ -1796,7 +1796,8 @@ pub enum Trigger {
 }
 
 /// One effect of an action completing or a proc firing. Externally tagged:
-/// `{ "apply_buff": "shock" }` / `{ "cast_action": "comet" }`.
+/// `{ "apply_buff": "shock" }` / `{ "cast_action": "comet" }` /
+/// `{ "remove_buff": "shock" }`.
 ///
 /// `#[non_exhaustive]`, for [`crate::sim::CompiledEffect`]'s reason: a
 /// later phase adding a third effect kind must land on BOTH enums, so
@@ -1817,6 +1818,44 @@ pub enum EffectDef {
     /// effects; no cost, no cooldown, no proc rolls — the P7d free-cast
     /// rules).
     CastAction(String),
+    /// End every live instance of the named buff NOW — a consumed charge,
+    /// a spent proc (Pyroblast spending Hot Streak), a state a later event
+    /// clears.
+    ///
+    /// # Default
+    ///
+    /// None; an entry names its buff explicitly. Removing a buff that is
+    /// not up is a no-op.
+    ///
+    /// # Evaluation instant
+    ///
+    /// Where the effect sits in its list, like every effect: an action's
+    /// (or segment's) effects run at its landing AFTER the landing is
+    /// measured and its damage credited, so a cast that consumes a buff
+    /// still benefits from it; a proc's effects run when it fires. The
+    /// removal is one state change: uptime, stacks, conditions and a
+    /// live `tick_objective` all close at this instant, and the removed
+    /// window's pending expiry goes stale.
+    ///
+    /// # Interactions
+    ///
+    /// - **`Mode::Expected`** (EV): a removal by an action or a segment is
+    ///   deterministic, so EV and Monte Carlo agree exactly. A removal
+    ///   by a PROC (directly, or through the free cast a proc's
+    ///   `cast_action` runs) fires on EV's averaged proc schedule, the
+    ///   same approximation EV already makes for proc applications. When
+    ///   any sim expression READS that buff (`buff.`, `buff_remaining.`,
+    ///   `stacks.`, or a condition it drives), the rotation would branch
+    ///   on a state one deterministic timeline cannot represent, so
+    ///   [`crate::sim::run`] fails closed in EV and names Monte Carlo as
+    ///   the mode to use. `sim::compile` accepts the config, since
+    ///   Monte Carlo runs it exactly.
+    /// - **`ev_uptime: expected`** buffs cannot be removed (a compile
+    ///   error in both modes): a removal has no defined meaning on the
+    ///   roll log yet. Open debt (ROADMAP).
+    /// - **Snapshot DoTs** end with their instances: the removed
+    ///   instances tick nothing after this instant.
+    RemoveBuff(String),
 }
 
 /// Hand-written (P8a discipline, anticipated by the P8 spec): the derived
@@ -1834,12 +1873,15 @@ impl<'de> Deserialize<'de> for EffectDef {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         /// The two effect keys, in declaration order — the `known` list
         /// for the did-you-mean.
-        const KNOWN: &[&str] = &["apply_buff", "cast_action"];
+        const KNOWN: &[&str] = &["apply_buff", "cast_action", "remove_buff"];
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = EffectDef;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an effect entry: `{ \"apply_buff\": … }` or `{ \"cast_action\": … }`")
+                f.write_str(
+                    "an effect entry: `{ \"apply_buff\": … }`, `{ \"cast_action\": … }` \
+                     or `{ \"remove_buff\": … }`",
+                )
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
@@ -1851,6 +1893,7 @@ impl<'de> Deserialize<'de> for EffectDef {
                     let parsed = match key.as_str() {
                         "apply_buff" => EffectDef::ApplyBuff(map.next_value()?),
                         "cast_action" => EffectDef::CastAction(map.next_value()?),
+                        "remove_buff" => EffectDef::RemoveBuff(map.next_value()?),
                         _ if key.starts_with('_') => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                             continue;
@@ -1865,15 +1908,16 @@ impl<'de> Deserialize<'de> for EffectDef {
                     };
                     if effect.is_some() {
                         return Err(A::Error::custom(
-                            "an effect entry takes exactly one of `apply_buff` or \
-                             `cast_action`, got more than one",
+                            "an effect entry takes exactly one of `apply_buff`, \
+                             `cast_action` or `remove_buff`, got more than one",
                         ));
                     }
                     effect = Some(parsed);
                 }
                 effect.ok_or_else(|| {
                     A::Error::custom(
-                        "an effect entry needs exactly one of `apply_buff` or `cast_action`",
+                        "an effect entry needs exactly one of `apply_buff`, `cast_action` \
+                         or `remove_buff`",
                     )
                 })
             }
@@ -2705,8 +2749,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            e.to_string()
-                .contains("an effect entry needs exactly one of `apply_buff` or `cast_action`"),
+            e.to_string().contains(
+                "an effect entry needs exactly one of `apply_buff`, `cast_action` or `remove_buff`"
+            ),
             "got: {e}"
         );
         let e = serde_json::from_str::<SimDef>(
@@ -2720,7 +2765,7 @@ mod tests {
         .unwrap_err();
         assert!(
             e.to_string()
-                .contains("an effect entry takes exactly one of `apply_buff` or `cast_action`, got more than one"),
+                .contains("an effect entry takes exactly one of `apply_buff`, `cast_action` or `remove_buff`, got more than one"),
             "got: {e}"
         );
     }
