@@ -7,6 +7,26 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **Global cooldown.** `SimDefaults::gcd` and `ActionDef::gcd` (both
+  optional `NumOrExpr`, evaluated at cast start in the pre-payment world)
+  add a GCD lock: a GCD-bound action may not begin while the lock is held
+  and arms it to `now + gcd` when it begins. The lock runs concurrently
+  with the cast, so a cast longer than the GCD is paced by its cast time
+  and an instant waits the lock out. The action's value overrides the
+  defaults block; the literal `0` puts an action OFF the GCD (it neither
+  waits nor arms, so it weaves inside another action's GCD), while an
+  expression evaluating to `0` stays GCD-bound. A blocked rule is
+  skipped like one on cooldown, a cancel's replacement is gated too, and
+  proc free casts ignore the lock. Pinned by `tests/gcd.rs` (15 tests,
+  every resolution cell plus haste-expression, segment, cancel and
+  free-cast contrasts); the lexicon gains a `gcd` entry.
+
+### Upgrade notes
+- `ActionDef` and `SimDefaults` gain a public `gcd` field, so Rust
+  struct literals need `gcd: None`. JSON configs are unaffected: absent
+  everywhere means no GCD, and every pre-existing number is unchanged.
+
 ## [0.10.0] — 2026-11-27
 
 **Player cancels.** Version 0.10.0 lets a rotation rule allow a
