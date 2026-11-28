@@ -11,7 +11,9 @@ until then, per semver's "anything goes" pre-1.0 clause).
 - **Simulation event stream.** `sim::run_with_events` streams the resolved
   events of one expected-value timeline or one selected Monte Carlo iteration.
   The CLI's `simulate --events` flag streams JSON Lines, and the Wasm bindings
-  return the same records as a versioned JSON array alongside the report.
+  can deliver one event per callback or return a JSON array alongside the
+  report. The browser Worker example exposes individual events as an
+  asynchronous `ReadableStream`.
 
 ## [0.11.0] — 2026-11-28
 

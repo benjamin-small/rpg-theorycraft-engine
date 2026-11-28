@@ -245,17 +245,7 @@ pub fn simulate_events_jsonl(
     iteration: u32,
     mut output: impl Write,
 ) -> Result<(), RunnerError> {
-    #[derive(serde::Serialize)]
-    struct StartRecord<'a> {
-        schema_version: u32,
-        mode: &'static str,
-        iteration: u32,
-        seed: Option<&'a str>,
-        #[serde(flatten)]
-        event: sim::SimEvent<'a>,
-    }
-
-    let seed = mode.seed();
+    let stream = StreamInfo::new(mode, iteration);
     let mut written = Ok(());
     let result = run_simulation(
         gamedef,
@@ -266,27 +256,89 @@ pub fn simulate_events_jsonl(
         mode,
         Some((iteration, &mut |event: sim::SimEvent<'_>| {
             if written.is_ok() {
-                written = match event.kind {
-                    sim::SimEventKind::SimulationStarted { .. } => serde_json::to_writer(
-                        &mut output,
-                        &StartRecord {
-                            schema_version: sim::EVENT_SCHEMA_VERSION,
-                            mode: mode.name(),
-                            iteration,
-                            seed: seed.as_deref(),
-                            event,
-                        },
-                    ),
-                    _ => serde_json::to_writer(&mut output, &event),
-                }
-                .map_err(std::io::Error::from)
-                .and_then(|()| output.write_all(b"\n"))
-                .and_then(|()| output.flush());
+                written = serde_json::to_writer(&mut output, &stream.record(event))
+                    .map_err(std::io::Error::from)
+                    .and_then(|()| output.write_all(b"\n"))
+                    .and_then(|()| output.flush());
             }
         })),
     );
     written.map_err(|error| RunnerError::new(format!("could not write event stream: {error}")))?;
     result.map(|_| ())
+}
+
+/// Deliver one JSON event per callback and return the usual report envelope.
+///
+/// Callbacks run synchronously while the selected iteration executes. The
+/// first event includes the same stream metadata as the JSON Lines output.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_simulation_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    iteration: u32,
+    mut on_event: impl FnMut(&str),
+) -> Result<Value, RunnerError> {
+    let stream = StreamInfo::new(mode, iteration);
+    let mut encoding_error = None;
+    let report = run_simulation(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        Some((iteration, &mut |event| {
+            if encoding_error.is_none() {
+                match serde_json::to_string(&stream.record(event)) {
+                    Ok(json) => on_event(&json),
+                    Err(error) => encoding_error = Some(error),
+                }
+            }
+        })),
+    );
+    if let Some(error) = encoding_error {
+        return Err(RunnerError::new(format!("could not encode event: {error}")));
+    }
+    Ok(simulation_response(mode, report?))
+}
+
+#[derive(serde::Serialize)]
+struct StreamInfo {
+    schema_version: u32,
+    mode: &'static str,
+    iteration: u32,
+    seed: Option<String>,
+}
+
+impl StreamInfo {
+    fn new(mode: SimulationMode, iteration: u32) -> Self {
+        Self {
+            schema_version: sim::EVENT_SCHEMA_VERSION,
+            mode: mode.name(),
+            iteration,
+            seed: mode.seed(),
+        }
+    }
+
+    fn record<'a>(&'a self, event: sim::SimEvent<'a>) -> StreamEvent<'a> {
+        StreamEvent {
+            stream: matches!(event.kind, sim::SimEventKind::SimulationStarted { .. })
+                .then_some(self),
+            event,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StreamEvent<'a> {
+    #[serde(flatten)]
+    stream: Option<&'a StreamInfo>,
+    #[serde(flatten)]
+    event: sim::SimEvent<'a>,
 }
 
 fn simulate_internal(
@@ -303,12 +355,7 @@ fn simulate_internal(
     let trace = event_iteration.map(|iteration| (iteration, &mut collect as EventSink<'_>));
     let report = run_simulation(gamedef, build, scenario, simdef, rotation, mode, trace)?;
 
-    let mut response = json!({
-        "schema_version": SCHEMA_VERSION,
-        "kind": "simulation",
-        "mode": mode.name(),
-        "report": report,
-    });
+    let mut response = simulation_response(mode, report);
     if let Some(iteration) = event_iteration {
         response["event_stream"] = json!({
             "schema_version": sim::EVENT_SCHEMA_VERSION,
@@ -318,6 +365,15 @@ fn simulate_internal(
         });
     }
     Ok(response)
+}
+
+fn simulation_response(mode: SimulationMode, report: sim::SimReport) -> Value {
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "simulation",
+        "mode": mode.name(),
+        "report": report,
+    })
 }
 
 type EventSink<'a> = &'a mut dyn FnMut(sim::SimEvent<'_>);

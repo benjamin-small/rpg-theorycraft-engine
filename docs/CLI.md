@@ -129,6 +129,51 @@ same arguments as the existing bindings, plus a zero-based iteration after
 the seed for Monte Carlo. These bindings return the event array and simulation
 report in a single JSON envelope.
 
+### Stream events into a JavaScript UI
+
+Use `streamSimulation` to run the engine in a Web Worker. It exposes a
+`ReadableStream` of event objects and a Promise for the final report. The
+Worker posts one message per event as it occurs, in simulation order.
+
+```js
+import { streamSimulation } from './timeline';
+
+const { events, result } = streamSimulation(config, {
+  kind: 'monte_carlo',
+  iterations: 1000,
+  seed: 42n,
+  eventIteration: 0,
+});
+
+for await (const event of events) {
+  appendToTimeline(event);
+}
+
+const { report } = await result;
+```
+
+The first event carries the same metadata as the first JSON Lines record.
+In Monte Carlo, `simulation_ended` marks the end of the selected timeline.
+The report resolves after all iterations finish. A failure rejects both the
+stream and the report Promise. Breaking out of the loop cancels the stream
+and terminates its Worker. The Worker pushes events as the engine produces
+them, so a slow consumer can accumulate unread events.
+
+The underlying Wasm exports are `simulate_expected_stream` and
+`simulate_monte_carlo_stream`. Each takes the same arguments as the
+corresponding `_with_events` export, plus a final `onEvent(eventJson)`
+callback. The callback receives one JSON record synchronously per event and
+the Wasm function returns the final report JSON. A Promise around a call on
+the main thread still leaves the computation on the main thread. The Worker
+lets the UI paint while the simulation is running.
+
+Run `npm run dev --prefix web` and open
+`/examples/streaming-timeline.html` on the Vite server to try the archer
+simulation. The example uses the Worker and stream helper directly.
+[Worker example](../web/src/timeline.worker.ts) · [Stream helper](../web/src/timeline.ts)
+
+### Inspect the config vocabulary
+
 To inspect the expression vocabulary without opening a config, run:
 
 ```sh

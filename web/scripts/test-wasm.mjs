@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   evaluate,
   initSync,
+  simulate_expected_stream,
   simulate_expected_with_events,
+  simulate_monte_carlo_stream,
   simulate_monte_carlo_with_events,
 } from "../src/wasm/rtce_wasm.js";
 
@@ -139,3 +141,31 @@ assert.equal(sampled.event_stream.iteration, 1);
 assert.equal(sampled.event_stream.seed, "7");
 assert.equal(sampled.report.distribution.iterations, 2);
 console.log("Wasm simulation event stream passed in expected and sampled modes.");
+
+for (const [run, buffered] of [
+  [(onEvent) => simulate_expected_stream(...eventInputs, onEvent), expected],
+  [(onEvent) => simulate_monte_carlo_stream(...eventInputs, 2, 7n, 1, onEvent), sampled],
+]) {
+  const events = [];
+  const result = JSON.parse(run((json) => {
+    const event = JSON.parse(json);
+    assert.equal(typeof event.type, "string");
+    events.push(event);
+  }));
+  const { schema_version, iteration, seed, mode, ...start } = events[0];
+  assert.equal(schema_version, 1);
+  assert.equal(mode, buffered.mode);
+  assert.equal(iteration, buffered.event_stream.iteration);
+  assert.equal(seed, buffered.event_stream.seed);
+  assert.deepEqual([start, ...events.slice(1)], buffered.event_stream.events);
+  assert.deepEqual(result.report, buffered.report);
+}
+
+const callbackError = new Error("event callback failed");
+let callbacks = 0;
+assert.throws(() => simulate_expected_stream(...eventInputs, () => {
+  callbacks += 1;
+  throw callbackError;
+}), (error) => error === callbackError);
+assert.equal(callbacks, 1);
+console.log("Wasm streamed each event in order and propagated callback errors.");
