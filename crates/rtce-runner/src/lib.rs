@@ -12,6 +12,7 @@ use rtce::sim::{self, Mode};
 use rtce::simdef::{Rotation, SimDef};
 use serde_json::{json, Map, Value};
 use std::fmt::{Display, Formatter};
+use std::io::Write;
 
 /// Version of the JSON response envelope produced by this crate.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -115,6 +116,29 @@ pub enum SimulationMode {
     },
 }
 
+impl SimulationMode {
+    fn engine_mode(self) -> Mode {
+        match self {
+            Self::Expected => Mode::Expected,
+            Self::MonteCarlo { iterations, seed } => Mode::MonteCarlo { iterations, seed },
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Expected => "expected",
+            Self::MonteCarlo { .. } => "monte_carlo",
+        }
+    }
+
+    fn seed(self) -> Option<String> {
+        match self {
+            Self::Expected => None,
+            Self::MonteCarlo { seed, .. } => Some(seed.to_string()),
+        }
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(kind: &str, source: &str) -> Result<T, RunnerError> {
     serde_json::from_str(source)
         .map_err(|error| RunnerError::new(format!("invalid {kind} JSON: {error}")))
@@ -182,6 +206,187 @@ pub fn simulate(
     rotation: &str,
     mode: SimulationMode,
 ) -> Result<Value, RunnerError> {
+    simulate_internal(gamedef, build, scenario, simdef, rotation, mode, None)
+}
+
+/// Compile and run a simulation with JSON events for one zero-based iteration.
+pub fn simulate_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    iteration: u32,
+) -> Result<Value, RunnerError> {
+    simulate_internal(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        Some(iteration),
+    )
+}
+
+/// Write the resolved events of one iteration as newline-delimited JSON.
+///
+/// The first event also identifies the stream version, mode, iteration and
+/// seed. Output can contain a partial timeline if the simulation fails.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_events_jsonl(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    iteration: u32,
+    mut output: impl Write,
+) -> Result<(), RunnerError> {
+    let stream = StreamInfo::new(mode, iteration);
+    let mut written = Ok(());
+    let result = run_simulation(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        Some((iteration, &mut |event: sim::SimEvent<'_>| {
+            if written.is_ok() {
+                written = serde_json::to_writer(&mut output, &stream.record(event))
+                    .map_err(std::io::Error::from)
+                    .and_then(|()| output.write_all(b"\n"))
+                    .and_then(|()| output.flush());
+            }
+        })),
+    );
+    written.map_err(|error| RunnerError::new(format!("could not write event stream: {error}")))?;
+    result.map(|_| ())
+}
+
+/// Deliver one JSON event per callback and return the usual report envelope.
+///
+/// Callbacks run synchronously while the selected iteration executes. The
+/// first event includes the same stream metadata as the JSON Lines output.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_simulation_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    iteration: u32,
+    mut on_event: impl FnMut(&str),
+) -> Result<Value, RunnerError> {
+    let stream = StreamInfo::new(mode, iteration);
+    let mut encoding_error = None;
+    let report = run_simulation(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        Some((iteration, &mut |event| {
+            if encoding_error.is_none() {
+                match serde_json::to_string(&stream.record(event)) {
+                    Ok(json) => on_event(&json),
+                    Err(error) => encoding_error = Some(error),
+                }
+            }
+        })),
+    );
+    if let Some(error) = encoding_error {
+        return Err(RunnerError::new(format!("could not encode event: {error}")));
+    }
+    Ok(simulation_response(mode, report?))
+}
+
+#[derive(serde::Serialize)]
+struct StreamInfo {
+    schema_version: u32,
+    mode: &'static str,
+    iteration: u32,
+    seed: Option<String>,
+}
+
+impl StreamInfo {
+    fn new(mode: SimulationMode, iteration: u32) -> Self {
+        Self {
+            schema_version: sim::EVENT_SCHEMA_VERSION,
+            mode: mode.name(),
+            iteration,
+            seed: mode.seed(),
+        }
+    }
+
+    fn record<'a>(&'a self, event: sim::SimEvent<'a>) -> StreamEvent<'a> {
+        StreamEvent {
+            stream: matches!(event.kind, sim::SimEventKind::SimulationStarted { .. })
+                .then_some(self),
+            event,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StreamEvent<'a> {
+    #[serde(flatten)]
+    stream: Option<&'a StreamInfo>,
+    #[serde(flatten)]
+    event: sim::SimEvent<'a>,
+}
+
+fn simulate_internal(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    event_iteration: Option<u32>,
+) -> Result<Value, RunnerError> {
+    let mut events = Vec::new();
+    let mut collect = |event: sim::SimEvent<'_>| events.push(json!(event));
+    let trace = event_iteration.map(|iteration| (iteration, &mut collect as EventSink<'_>));
+    let report = run_simulation(gamedef, build, scenario, simdef, rotation, mode, trace)?;
+
+    let mut response = simulation_response(mode, report);
+    if let Some(iteration) = event_iteration {
+        response["event_stream"] = json!({
+            "schema_version": sim::EVENT_SCHEMA_VERSION,
+            "iteration": iteration,
+            "seed": mode.seed(),
+            "events": events,
+        });
+    }
+    Ok(response)
+}
+
+fn simulation_response(mode: SimulationMode, report: sim::SimReport) -> Value {
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "simulation",
+        "mode": mode.name(),
+        "report": report,
+    })
+}
+
+type EventSink<'a> = &'a mut dyn FnMut(sim::SimEvent<'_>);
+
+fn run_simulation(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    trace: Option<(u32, EventSink<'_>)>,
+) -> Result<sim::SimReport, RunnerError> {
     let (gamedef, build, scenario) = inputs(gamedef, build, scenario)?;
     let simdef: SimDef = parse("simdef", simdef)?;
     let rotation: Rotation = parse("rotation", rotation)?;
@@ -189,21 +394,14 @@ pub fn simulate(
         .map_err(|error| RunnerError::new(format!("gamedef did not compile: {error}")))?;
     let sim_plan = sim::compile(&plan, &simdef, &rotation)
         .map_err(|error| RunnerError::new(format!("simulation config did not compile: {error}")))?;
-    let (engine_mode, mode_name) = match mode {
-        SimulationMode::Expected => (Mode::Expected, "expected"),
-        SimulationMode::MonteCarlo { iterations, seed } => {
-            (Mode::MonteCarlo { iterations, seed }, "monte_carlo")
+    let mode = mode.engine_mode();
+    match trace {
+        Some((iteration, sink)) => {
+            sim::run_with_events(&plan, &sim_plan, &build, &scenario, mode, iteration, sink)
         }
-    };
-    let report = sim::run(&plan, &sim_plan, &build, &scenario, engine_mode)
-        .map_err(|error| RunnerError::new(format!("simulation failed: {error}")))?;
-
-    Ok(json!({
-        "schema_version": SCHEMA_VERSION,
-        "kind": "simulation",
-        "mode": mode_name,
-        "report": report,
-    }))
+        None => sim::run(&plan, &sim_plan, &build, &scenario, mode),
+    }
+    .map_err(|error| RunnerError::new(format!("simulation failed: {error}")))
 }
 
 #[cfg(test)]

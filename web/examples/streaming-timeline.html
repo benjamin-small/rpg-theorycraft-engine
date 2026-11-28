@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTCE streaming timeline example</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui; }
+    main { max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }
+    pre { border: 1px solid GrayText; padding: 1rem; max-height: 60vh; overflow: auto; }
+    button { font: inherit; }
+  </style>
+  <main>
+    <h1>Streaming timeline</h1>
+    <button id="run" type="button">Run archer simulation</button>
+    <p id="status" role="status"></p>
+    <pre id="timeline" aria-label="Simulation event log"></pre>
+  </main>
+  <script type="module" src="/src/timeline-demo.ts"></script>
+</html>

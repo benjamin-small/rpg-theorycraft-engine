@@ -5,8 +5,7 @@ The `rtce` library now has two thin interfaces over the same JSON runner:
 - a native `rtce` command for scripts, CI, and local experiments;
 - a TypeScript client backed by WebAssembly for the interactive tutorial.
 
-Both produce the same versioned JSON envelopes. Neither reimplements engine
-math outside the `rtce` crate.
+Both use the same engine and produce versioned JSON reports.
 
 ## Start with Docker
 
@@ -95,6 +94,85 @@ docker run --rm \
 
 Run `docker run --rm rtce --help` or append `--help` to a subcommand for the
 complete flag reference.
+
+### Dump a simulation timeline
+
+Add `--events` to `simulate` to stream the resolved events of iteration zero
+to stdout as JSON Lines. For Monte Carlo, `--events=7` selects the eighth
+iteration and requires at least eight iterations. Omit `--events` to get
+the usual simulation report.
+
+This native example writes the bundled archer fight to `timeline.jsonl`:
+
+```sh
+fixture=crates/rtce/tests/fixtures/guide
+cargo run -p rtce-cli -- simulate \
+  --game "$fixture/07-gamedef.json" \
+  --build "$fixture/07-build.json" \
+  --scenario "$fixture/07-scenario.json" \
+  --sim "$fixture/07-simdef.json" \
+  --rotation "$fixture/07-rotation.json" \
+  --events > timeline.jsonl
+```
+
+Every line is one JSON event. The first line is `simulation_started` and
+also carries `schema_version`, `mode`, `iteration`, and `seed`. The seed is
+a decimal string for Monte Carlo and null in expected mode. A successful
+timeline ends with `simulation_ended`. A failed run can leave a partial
+stream and writes its diagnostic to stderr.
+
+The Rust API, `rtce::sim::run_with_events`, calls a sink for each record as
+it happens. The sink can serialize JSON Lines directly or accumulate typed
+records while the simulation inputs are in scope. Wasm consumers can call
+`simulate_expected_with_events` or `simulate_monte_carlo_with_events` with the
+same arguments as the existing bindings, plus a zero-based iteration after
+the seed for Monte Carlo. These bindings return the event array and simulation
+report in a single JSON envelope.
+
+### Stream events into a JavaScript UI
+
+Use `streamSimulation` to run the engine in a Web Worker. It exposes a
+`ReadableStream` of event objects and a Promise for the final report. The
+Worker posts one message per event as it occurs, in simulation order.
+
+```js
+import { streamSimulation } from './timeline';
+
+const { events, result } = streamSimulation(config, {
+  kind: 'monte_carlo',
+  iterations: 1000,
+  seed: 42n,
+  eventIteration: 0,
+});
+
+for await (const event of events) {
+  appendToTimeline(event);
+}
+
+const { report } = await result;
+```
+
+The first event carries the same metadata as the first JSON Lines record.
+In Monte Carlo, `simulation_ended` marks the end of the selected timeline.
+The report resolves after all iterations finish. A failure rejects both the
+stream and the report Promise. Breaking out of the loop cancels the stream
+and terminates its Worker. The Worker pushes events as the engine produces
+them, so a slow consumer can accumulate unread events.
+
+The underlying Wasm exports are `simulate_expected_stream` and
+`simulate_monte_carlo_stream`. Each takes the same arguments as the
+corresponding `_with_events` export, plus a final `onEvent(eventJson)`
+callback. The callback receives one JSON record synchronously per event and
+the Wasm function returns the final report JSON. A Promise around a call on
+the main thread still leaves the computation on the main thread. The Worker
+lets the UI paint while the simulation is running.
+
+Run `npm run dev --prefix web` and open
+`/examples/streaming-timeline.html` on the Vite server to try the archer
+simulation. The example uses the Worker and stream helper directly.
+[Worker example](../web/src/timeline.worker.ts) · [Stream helper](../web/src/timeline.ts)
+
+### Inspect the config vocabulary
 
 To inspect the expression vocabulary without opening a config, run:
 
@@ -234,7 +312,7 @@ and every fail-closed config rule remain on the Rust side of the boundary.
 
 ## JSON response contract
 
-Every successful response contains:
+Every successful JSON envelope contains:
 
 ```json
 {
@@ -247,6 +325,32 @@ Every successful response contains:
 are keyed by name. Explanations add the engine's trace. Simulations add `mode`
 and the complete `SimReport`. New report fields may be added compatibly; a
 breaking envelope change requires a new `schema_version`.
+
+When tracing is enabled in Wasm, the envelope also contains `event_stream`
+with its own `schema_version`, the zero-based `iteration`, the master `seed`
+as a decimal string (null in expected mode), and an ordered `events` array.
+The CLI writes the same event records directly under `--events`.
+Each record has a `type` and a `time` in seconds. Array order breaks ties
+when records share a timestamp. Cast IDs are local to the selected timeline
+and join cast starts, segment starts, landings, cancels, and effects.
+
+| Record | Use |
+| --- | --- |
+| `simulation_started`, `simulation_ended` | Fight duration and total damage for the traced iteration. |
+| `phase_entered` | Scenario phase name and zero-based index. |
+| `cast_started`, `segment_started` | Action or segment start, the configured rule or triggering proc, and cooldown timing when applicable. |
+| `cast_landed`, `cast_cancelled` | Per-landing damage, hit and crit information, and player-driven cancels. A cast still in flight at the horizon has no final landing. |
+| `proc_fired` | Proc name, the originating cast, and when its internal cooldown ends. |
+| `buff_changed`, `expected_buff_changed` | Discrete applications, expiries and removals, or expected-uptime roll and age-out records. |
+| `buff_damage` | Continuous damage credited over the interval from `since` to `time`. |
+| `resource_changed` | Resource amount, cap, and regen after initialization, costs, gains, or limit changes. |
+
+Landings summarize hits resolved together. Expected mode reports crit
+probability, Monte Carlo reports the sampled outcome or count, and free
+casts carry branch-blended damage with a null crit field. Continuous damage
+and regeneration follow the engine's integration intervals. The stream
+covers resolved operations. Rotation candidate checks and failed proc
+rolls are outside this record set.
 
 Invalid files, unknown keys, unresolved symbols, and runtime simulation errors
 produce a non-zero native exit or a rejected browser call with the same

@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rtce_runner::SimulationMode;
-use serde_json::Value;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const DEMO_GAME: &str = include_str!("../../rtce/tests/fixtures/guide/07-gamedef.json");
@@ -17,7 +17,7 @@ const DEMO_ROTATION: &str = include_str!("../../rtce/tests/fixtures/guide/07-rot
     about = "Run config-driven RPG stat-sheet calculations and timeline simulations"
 )]
 struct Cli {
-    /// Emit one-line JSON instead of indented JSON.
+    /// Emit compact JSON for report output.
     #[arg(long, global = true)]
     compact: bool,
     #[command(subcommand)]
@@ -73,6 +73,9 @@ struct SimFiles {
     /// Reproducible Monte Carlo master seed.
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Stream JSON Lines for one zero-based iteration (defaults to 0 when present).
+    #[arg(long, value_name = "ITERATION", num_args = 0..=1, default_missing_value = "0", require_equals = true)]
+    events: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -101,8 +104,8 @@ fn read_calc(files: &CalcFiles) -> Result<(String, String, String), String> {
     ))
 }
 
-fn run(cli: &Cli) -> Result<Value, String> {
-    match &cli.command {
+fn run(cli: &Cli, mut output: impl Write) -> Result<(), String> {
+    let value = match &cli.command {
         Command::Evaluate(files) => {
             let (game, build, scenario) = read_calc(files)?;
             rtce_runner::evaluate(&game, &build, &scenario).map_err(|error| error.to_string())
@@ -122,6 +125,12 @@ fn run(cli: &Cli) -> Result<Value, String> {
                     seed: files.seed,
                 },
             };
+            if let Some(iteration) = files.events {
+                return rtce_runner::simulate_events_jsonl(
+                    &game, &build, &scenario, &sim, &rotation, mode, iteration, output,
+                )
+                .map_err(|error| error.to_string());
+            }
             rtce_runner::simulate(&game, &build, &scenario, &sim, &rotation, mode)
                 .map_err(|error| error.to_string())
         }
@@ -149,24 +158,24 @@ fn run(cli: &Cli) -> Result<Value, String> {
         }
         .map_err(|error| error.to_string()),
         Command::Lexicon => Ok(rtce_runner::lexicon()),
+    }?;
+
+    if cli.compact {
+        serde_json::to_writer(&mut output, &value)
+    } else {
+        serde_json::to_writer_pretty(&mut output, &value)
     }
+    .map_err(|error| format!("could not write JSON output: {error}"))?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|error| format!("could not write JSON output: {error}"))
 }
 
 fn main() {
     let cli = Cli::parse();
-    match run(&cli) {
-        Ok(value) => {
-            let rendered = if cli.compact {
-                serde_json::to_string(&value)
-            } else {
-                serde_json::to_string_pretty(&value)
-            }
-            .expect("runner output is JSON serializable");
-            println!("{rendered}");
-        }
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    if let Err(error) = run(&cli, io::stdout().lock()) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
     }
 }

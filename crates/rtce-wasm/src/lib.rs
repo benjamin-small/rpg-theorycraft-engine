@@ -67,3 +67,141 @@ pub fn simulate_monte_carlo(
         SimulationMode::MonteCarlo { iterations, seed },
     ))
 }
+
+/// Run a deterministic timeline and include its resolved events.
+#[wasm_bindgen]
+pub fn simulate_expected_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+) -> Result<String, JsValue> {
+    render(rtce_runner::simulate_with_events(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::Expected,
+        0,
+    ))
+}
+
+/// Run sampled timelines and include the events of one zero-based iteration.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_monte_carlo_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    iterations: u32,
+    seed: u64,
+    event_iteration: u32,
+) -> Result<String, JsValue> {
+    render(rtce_runner::simulate_with_events(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::MonteCarlo { iterations, seed },
+        event_iteration,
+    ))
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// A JavaScript callback that receives one JSON event per invocation.
+    #[wasm_bindgen(typescript_type = "(eventJson: string) => void")]
+    pub type EventCallback;
+
+    #[wasm_bindgen(method, catch, js_name = call)]
+    fn call_event(
+        this: &EventCallback,
+        this_arg: &JsValue,
+        event_json: &str,
+    ) -> Result<(), JsValue>;
+}
+
+/// Deliver each expected-value event synchronously and return the report JSON.
+#[wasm_bindgen]
+pub fn simulate_expected_stream(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    on_event: &EventCallback,
+) -> Result<String, JsValue> {
+    simulate_stream(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::Expected,
+        0,
+        on_event,
+    )
+}
+
+/// Deliver each event of one sampled iteration and return the pooled report JSON.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_monte_carlo_stream(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    iterations: u32,
+    seed: u64,
+    event_iteration: u32,
+    on_event: &EventCallback,
+) -> Result<String, JsValue> {
+    simulate_stream(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::MonteCarlo { iterations, seed },
+        event_iteration,
+        on_event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_stream(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    event_iteration: u32,
+    on_event: &EventCallback,
+) -> Result<String, JsValue> {
+    let mut callback_error = None;
+    let result = rtce_runner::stream_simulation_events(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        event_iteration,
+        |event| {
+            if callback_error.is_none() {
+                callback_error = on_event.call_event(&JsValue::UNDEFINED, event).err();
+            }
+        },
+    );
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    render(result)
+}

@@ -1,6 +1,13 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
-import { evaluate, initSync } from "../src/wasm/rtce_wasm.js";
+import {
+  evaluate,
+  initSync,
+  simulate_expected_stream,
+  simulate_expected_with_events,
+  simulate_monte_carlo_stream,
+  simulate_monte_carlo_with_events,
+} from "../src/wasm/rtce_wasm.js";
 
 const module = readFileSync(new URL("../src/wasm/rtce_wasm_bg.wasm", import.meta.url));
 initSync({ module });
@@ -107,3 +114,58 @@ for (const [build, expectedEhp, expectedBlock] of pobCases) {
 }
 
 console.log(`Wasm bounded solve passed: ${root}; recurrence passed: ${fractionalHits}; locals: ${cascade}; batched: ${batchedDrain}`);
+
+const simdef = JSON.stringify({
+  actions: { shot: { cast_time: "1", damage: {} } },
+  damage_objective: "root",
+});
+const rotation = JSON.stringify({ rules: [{ action: "shot" }] });
+const eventInputs = [gamedef, "{}", scenario, simdef, rotation];
+const expected = JSON.parse(simulate_expected_with_events(...eventInputs));
+const sampled = JSON.parse(simulate_monte_carlo_with_events(...eventInputs, 2, 7n, 1));
+for (const output of [expected, sampled]) {
+  const { events } = output.event_stream;
+  assert.deepEqual(events.map(({ type, time }) => [type, time]), [
+    ["simulation_started", 0],
+    ["phase_entered", 0],
+    ["cast_started", 0],
+    ["cast_landed", 1],
+    ["simulation_ended", 1],
+  ]);
+  assert.equal(events[2].cast_id, events[3].cast_id);
+  assert.equal(events[3].damage, root);
+  assert.equal(events[4].total_damage, root);
+}
+assert.equal(expected.event_stream.iteration, 0);
+assert.equal(sampled.event_stream.iteration, 1);
+assert.equal(sampled.event_stream.seed, "7");
+assert.equal(sampled.report.distribution.iterations, 2);
+console.log("Wasm simulation event stream passed in expected and sampled modes.");
+
+for (const [run, buffered] of [
+  [(onEvent) => simulate_expected_stream(...eventInputs, onEvent), expected],
+  [(onEvent) => simulate_monte_carlo_stream(...eventInputs, 2, 7n, 1, onEvent), sampled],
+]) {
+  const events = [];
+  const result = JSON.parse(run((json) => {
+    const event = JSON.parse(json);
+    assert.equal(typeof event.type, "string");
+    events.push(event);
+  }));
+  const { schema_version, iteration, seed, mode, ...start } = events[0];
+  assert.equal(schema_version, 1);
+  assert.equal(mode, buffered.mode);
+  assert.equal(iteration, buffered.event_stream.iteration);
+  assert.equal(seed, buffered.event_stream.seed);
+  assert.deepEqual([start, ...events.slice(1)], buffered.event_stream.events);
+  assert.deepEqual(result.report, buffered.report);
+}
+
+const callbackError = new Error("event callback failed");
+let callbacks = 0;
+assert.throws(() => simulate_expected_stream(...eventInputs, () => {
+  callbacks += 1;
+  throw callbackError;
+}), (error) => error === callbackError);
+assert.equal(callbacks, 1);
+console.log("Wasm streamed each event in order and propagated callback errors.");

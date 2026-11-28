@@ -347,6 +347,7 @@
 //! immediately before a program that reads it.
 
 mod compile;
+mod events;
 mod exec;
 mod expected;
 mod report;
@@ -354,7 +355,10 @@ pub use compile::{
     compile, CompiledAction, CompiledBuff, CompiledEffect, CompiledProc, CompiledResource,
     CompiledRule, CompiledSegment, CompiledTick, CompiledValue, SimPlan, SimProgram,
 };
-pub use exec::{run, Mode};
+pub use events::{
+    BuffChange, ResourceChange, SimCrit, SimEvent, SimEventKind, EVENT_SCHEMA_VERSION,
+};
+pub use exec::{run, run_with_events, Mode};
 pub use report::{
     ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
 };
