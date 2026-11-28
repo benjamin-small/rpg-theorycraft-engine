@@ -67,3 +67,47 @@ pub fn simulate_monte_carlo(
         SimulationMode::MonteCarlo { iterations, seed },
     ))
 }
+
+/// Run a deterministic timeline and include its resolved events.
+#[wasm_bindgen]
+pub fn simulate_expected_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+) -> Result<String, JsValue> {
+    render(rtce_runner::simulate_with_events(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::Expected,
+        0,
+    ))
+}
+
+/// Run sampled timelines and include the events of one zero-based iteration.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_monte_carlo_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    iterations: u32,
+    seed: u64,
+    event_iteration: u32,
+) -> Result<String, JsValue> {
+    render(rtce_runner::simulate_with_events(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        SimulationMode::MonteCarlo { iterations, seed },
+        event_iteration,
+    ))
+}

@@ -238,6 +238,10 @@ produce?
 | `sim::run` EV mode | deterministic timeline | **computed** | ~ms |
 | `sim::run` MC mode | sampled timelines ×N | computed + distributions | ~ms×N |
 
+Use `sim::run_with_events` or the CLI's `simulate --events` flag to inspect a
+single resolved timeline with cast, damage, buff, resource, and proc events.
+See the [event stream format and dump command](docs/CLI.md#dump-a-simulation-timeline).
+
 One config family, three fidelity levels, all built on the same `Plan` —
 where they overlap they're required to agree (`sim::exec`'s keystone test
 reproduces `Plan::evaluate`'s number EXACTLY on a degenerate config with

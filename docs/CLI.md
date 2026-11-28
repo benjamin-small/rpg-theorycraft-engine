@@ -96,6 +96,35 @@ docker run --rm \
 Run `docker run --rm rtce --help` or append `--help` to a subcommand for the
 complete flag reference.
 
+### Dump a simulation timeline
+
+Add `--events` to `simulate` to include the resolved events of iteration zero.
+For Monte Carlo, `--events=7` selects the eighth iteration and requires at
+least eight iterations. The report still pools every requested iteration.
+
+This native example writes the bundled archer fight to `timeline.json`:
+
+```sh
+fixture=crates/rtce/tests/fixtures/guide
+cargo run -p rtce-cli -- simulate \
+  --game "$fixture/07-gamedef.json" \
+  --build "$fixture/07-build.json" \
+  --scenario "$fixture/07-scenario.json" \
+  --sim "$fixture/07-simdef.json" \
+  --rotation "$fixture/07-rotation.json" \
+  --events > timeline.json
+jq -c '.event_stream.events[]' timeline.json
+```
+
+The Rust API, `rtce::sim::run_with_events`, calls a sink for each record as
+it happens. The sink can serialize JSON Lines directly or accumulate typed
+records while the simulation inputs are in scope. An error may leave a
+partial stream without `simulation_ended`. The CLI and Wasm return the
+complete JSON envelope on success. Wasm consumers can call
+`simulate_expected_with_events` or `simulate_monte_carlo_with_events` with the
+same arguments as the existing bindings, plus a zero-based iteration after
+the seed for Monte Carlo.
+
 To inspect the expression vocabulary without opening a config, run:
 
 ```sh
@@ -247,6 +276,31 @@ Every successful response contains:
 are keyed by name. Explanations add the engine's trace. Simulations add `mode`
 and the complete `SimReport`. New report fields may be added compatibly; a
 breaking envelope change requires a new `schema_version`.
+
+When tracing is enabled, a simulation also contains `event_stream` with its own
+`schema_version`, the zero-based `iteration`, the Monte Carlo master `seed`
+as a decimal string (null in expected mode), and an ordered `events` array.
+Each record has a `type` and a `time` in seconds. Array order breaks ties
+when records share a timestamp. Cast IDs are local to the selected timeline
+and join cast starts, segment starts, landings, cancels, and effects.
+
+| Record | Use |
+| --- | --- |
+| `simulation_started`, `simulation_ended` | Fight duration and total damage for the traced iteration. |
+| `phase_entered` | Scenario phase name and zero-based index. |
+| `cast_started`, `segment_started` | Action or segment start, the configured rule or triggering proc, and cooldown timing when applicable. |
+| `cast_landed`, `cast_cancelled` | Per-landing damage, hit and crit information, and player-driven cancels. A cast still in flight at the horizon has no final landing. |
+| `proc_fired` | Proc name, the originating cast, and when its internal cooldown ends. |
+| `buff_changed`, `expected_buff_changed` | Discrete applications, expiries and removals, or expected-uptime roll and age-out records. |
+| `buff_damage` | Continuous damage credited over the interval from `since` to `time`. |
+| `resource_changed` | Resource amount, cap, and regen after initialization, costs, gains, or limit changes. |
+
+Landings summarize hits resolved together. Expected mode reports crit
+probability, Monte Carlo reports the sampled outcome or count, and free
+casts carry branch-blended damage with a null crit field. Continuous damage
+and regeneration follow the engine's integration intervals. The stream
+covers resolved operations. Rotation candidate checks and failed proc
+rolls are outside this record set.
 
 Invalid files, unknown keys, unresolved symbols, and runtime simulation errors
 produce a non-zero native exit or a rejected browser call with the same

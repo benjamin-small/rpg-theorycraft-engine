@@ -7,6 +7,12 @@ until then, per semver's "anything goes" pre-1.0 clause).
 
 ## [Unreleased]
 
+### Added
+- **Simulation event stream.** `sim::run_with_events` streams the resolved
+  events of one expected-value timeline or one selected Monte Carlo iteration.
+  The CLI's `simulate --events` flag and the Wasm bindings return the same
+  records as versioned JSON alongside the simulation report.
+
 ## [0.11.0] — 2026-11-28
 
 **Global cooldown and buff consumption.** Rotations can model a shared

@@ -73,6 +73,9 @@ struct SimFiles {
     /// Reproducible Monte Carlo master seed.
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Include JSON events for one zero-based iteration (defaults to 0 when present).
+    #[arg(long, value_name = "ITERATION", num_args = 0..=1, default_missing_value = "0", require_equals = true)]
+    events: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -122,8 +125,13 @@ fn run(cli: &Cli) -> Result<Value, String> {
                     seed: files.seed,
                 },
             };
-            rtce_runner::simulate(&game, &build, &scenario, &sim, &rotation, mode)
-                .map_err(|error| error.to_string())
+            match files.events {
+                Some(iteration) => rtce_runner::simulate_with_events(
+                    &game, &build, &scenario, &sim, &rotation, mode, iteration,
+                ),
+                None => rtce_runner::simulate(&game, &build, &scenario, &sim, &rotation, mode),
+            }
+            .map_err(|error| error.to_string())
         }
         Command::Demo { kind } => match kind {
             DemoKind::Calc => rtce_runner::evaluate(DEMO_GAME, DEMO_BUILD, DEMO_SCENARIO),

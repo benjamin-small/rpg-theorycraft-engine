@@ -182,6 +182,39 @@ pub fn simulate(
     rotation: &str,
     mode: SimulationMode,
 ) -> Result<Value, RunnerError> {
+    simulate_internal(gamedef, build, scenario, simdef, rotation, mode, None)
+}
+
+/// Compile and run a simulation with JSON events for one zero-based iteration.
+pub fn simulate_with_events(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    iteration: u32,
+) -> Result<Value, RunnerError> {
+    simulate_internal(
+        gamedef,
+        build,
+        scenario,
+        simdef,
+        rotation,
+        mode,
+        Some(iteration),
+    )
+}
+
+fn simulate_internal(
+    gamedef: &str,
+    build: &str,
+    scenario: &str,
+    simdef: &str,
+    rotation: &str,
+    mode: SimulationMode,
+    event_iteration: Option<u32>,
+) -> Result<Value, RunnerError> {
     let (gamedef, build, scenario) = inputs(gamedef, build, scenario)?;
     let simdef: SimDef = parse("simdef", simdef)?;
     let rotation: Rotation = parse("rotation", rotation)?;
@@ -195,15 +228,40 @@ pub fn simulate(
             (Mode::MonteCarlo { iterations, seed }, "monte_carlo")
         }
     };
-    let report = sim::run(&plan, &sim_plan, &build, &scenario, engine_mode)
-        .map_err(|error| RunnerError::new(format!("simulation failed: {error}")))?;
+    let mut events = Vec::new();
+    let report = match event_iteration {
+        Some(iteration) => sim::run_with_events(
+            &plan,
+            &sim_plan,
+            &build,
+            &scenario,
+            engine_mode,
+            iteration,
+            |event| events.push(json!(event)),
+        ),
+        None => sim::run(&plan, &sim_plan, &build, &scenario, engine_mode),
+    }
+    .map_err(|error| RunnerError::new(format!("simulation failed: {error}")))?;
 
-    Ok(json!({
+    let mut response = json!({
         "schema_version": SCHEMA_VERSION,
         "kind": "simulation",
         "mode": mode_name,
         "report": report,
-    }))
+    });
+    if let Some(iteration) = event_iteration {
+        let seed = match mode {
+            SimulationMode::Expected => None,
+            SimulationMode::MonteCarlo { seed, .. } => Some(seed.to_string()),
+        };
+        response["event_stream"] = json!({
+            "schema_version": sim::EVENT_SCHEMA_VERSION,
+            "iteration": iteration,
+            "seed": seed,
+            "events": events,
+        });
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

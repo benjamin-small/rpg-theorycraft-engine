@@ -249,6 +249,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use super::compile::{CompiledEffect, CompiledValue, SimPlan};
+use super::events::{BuffChange, ResourceChange, SimCrit, SimEvent, SimEventKind};
 use super::expected::{q_of, CritModel, NoFire, RollLog};
 use super::report::{
     ActionReport, BuffReport, Distribution, PhaseReport, ResourceReport, SimReport, Totals,
@@ -452,6 +453,59 @@ pub fn run(
     scenario: &Scenario,
     mode: Mode,
 ) -> Result<SimReport, PlanError> {
+    run_internal(plan, sim_plan, build, scenario, mode, None)
+}
+
+type EventSink<'config, 'sink> = &'sink mut dyn FnMut(SimEvent<'config>);
+
+/// Run the simulation and emit resolved events for one zero-based iteration.
+///
+/// Expected mode has only iteration zero. Monte Carlo runs all requested
+/// iterations and returns the usual pooled report. The selected iteration uses
+/// its normal RNG stream. The callback receives records synchronously in
+/// execution order, so it can write or aggregate them without storing a log.
+/// A simulation error may leave a partial stream without a simulation end.
+///
+/// ```
+/// # use rtce::{build::BuildState, plan::{Plan, PlanError}, scenario::Scenario, sim};
+/// # fn collect(plan: &Plan, sim_plan: &sim::SimPlan, build: &BuildState,
+/// #            scenario: &Scenario) -> Result<(), PlanError> {
+/// let mut events = Vec::new();
+/// let report = sim::run_with_events(
+///     plan, sim_plan, build, scenario, sim::Mode::Expected, 0,
+///     |event| events.push(event),
+/// )?;
+/// assert_eq!(events.last().unwrap().time, report.total.duration);
+/// # Ok(())
+/// # }
+/// ```
+pub fn run_with_events<'a>(
+    plan: &'a Plan,
+    sim_plan: &'a SimPlan,
+    build: &'a BuildState,
+    scenario: &'a Scenario,
+    mode: Mode,
+    iteration: u32,
+    mut sink: impl FnMut(SimEvent<'a>),
+) -> Result<SimReport, PlanError> {
+    run_internal(
+        plan,
+        sim_plan,
+        build,
+        scenario,
+        mode,
+        Some((iteration, &mut sink)),
+    )
+}
+
+fn run_internal<'a>(
+    plan: &'a Plan,
+    sim_plan: &'a SimPlan,
+    build: &'a BuildState,
+    scenario: &'a Scenario,
+    mode: Mode,
+    trace: Option<(u32, EventSink<'a, '_>)>,
+) -> Result<SimReport, PlanError> {
     if scenario.phases.is_empty() {
         return Err(PlanError {
             what: "scenario has no phases".into(),
@@ -484,6 +538,22 @@ pub fn run(
         });
     }
 
+    let iterations = match mode {
+        Mode::Expected => 1,
+        Mode::MonteCarlo { iterations, .. } => iterations,
+    };
+    if iterations == 0 {
+        return Err(PlanError {
+            what: "Mode::MonteCarlo requires iterations > 0".into(),
+        });
+    }
+    if let Some((iteration, _)) = &trace {
+        if *iteration >= iterations {
+            return Err(PlanError {
+                what: format!("event iteration {iteration} is out of range (0..{iterations})"),
+            });
+        }
+    }
     match mode {
         Mode::Expected => {
             if let Some(why) = &sim_plan.ev_inexact_removal {
@@ -491,32 +561,31 @@ pub fn run(
             }
             let scratch = SimScratch::new(plan, sim_plan);
             let mut sim = Sim::new(plan, sim_plan, build, scenario, duration, scratch, None)?;
+            if let Some((_, sink)) = trace {
+                sim.trace = Some(Trace::new(sink));
+            }
             sim.run_loop()?;
             Ok(sim.into_report())
         }
-        Mode::MonteCarlo { iterations, seed } => {
-            run_monte_carlo(plan, sim_plan, build, scenario, duration, iterations, seed)
-        }
+        Mode::MonteCarlo { iterations, seed } => run_monte_carlo(
+            plan, sim_plan, build, scenario, duration, iterations, seed, trace,
+        ),
     }
 }
 
 /// `Mode::MonteCarlo`'s own loop — see [`run`]'s doc comment for the
 /// pooling contract this builds.
 #[allow(clippy::too_many_arguments)]
-fn run_monte_carlo(
-    plan: &Plan,
-    sim_plan: &SimPlan,
-    build: &BuildState,
-    scenario: &Scenario,
+fn run_monte_carlo<'a>(
+    plan: &'a Plan,
+    sim_plan: &'a SimPlan,
+    build: &'a BuildState,
+    scenario: &'a Scenario,
     duration: f64,
     iterations: u32,
     seed: u64,
+    mut trace: Option<(u32, EventSink<'a, '_>)>,
 ) -> Result<SimReport, PlanError> {
-    if iterations == 0 {
-        return Err(PlanError {
-            what: "Mode::MonteCarlo requires iterations > 0".into(),
-        });
-    }
     let n = f64::from(iterations);
 
     let mut dps_samples: Vec<f64> = Vec::with_capacity(iterations as usize);
@@ -547,6 +616,11 @@ fn run_monte_carlo(
             scratch,
             Some(rng),
         )?;
+        if let Some((iteration, sink)) = &mut trace {
+            if i == *iteration {
+                sim.trace = Some(Trace::new(&mut **sink));
+            }
+        }
         sim.run_loop()?;
         let report = sim.into_report();
 
@@ -1121,13 +1195,25 @@ enum ObjectiveWorld {
     Part(usize, Part),
 }
 
-/// All executor state for one `run` call. Holds `&'a` references to its
-/// immutable inputs (`plan`/`sim_plan`/`build`/`scenario` are all
-/// `Copy`-able reference fields — reading one out, e.g. `let sim_plan =
-/// self.sim_plan;`, decouples it from `self`'s own borrow, which is how
-/// this module avoids fighting the borrow checker over `&mut self`
-/// methods that also need to iterate the compiled config).
-struct Sim<'a> {
+struct Trace<'config, 'sink> {
+    sink: EventSink<'config, 'sink>,
+    last_cast_id: u64,
+    cast_id: Option<u64>,
+}
+
+impl<'config, 'sink> Trace<'config, 'sink> {
+    fn new(sink: EventSink<'config, 'sink>) -> Self {
+        Self {
+            sink,
+            last_cast_id: 0,
+            cast_id: None,
+        }
+    }
+}
+
+/// Executor state for one timeline. Read a shared input reference out
+/// of `self` before iterating it alongside mutable executor operations.
+struct Sim<'a, 'sink> {
     plan: &'a Plan,
     sim_plan: &'a SimPlan,
     build: &'a BuildState,
@@ -1137,6 +1223,7 @@ struct Sim<'a> {
     duration: f64,
     seq: u64,
     heap: BinaryHeap<QueueItem>,
+    trace: Option<Trace<'a, 'sink>>,
     mid_cast: bool,
     /// When the global cooldown lock releases: a GCD-bound action may
     /// begin only at or after this instant (see
@@ -1233,7 +1320,7 @@ struct Sim<'a> {
     age_outs_handled: u32,
 }
 
-impl<'a> Sim<'a> {
+impl<'a> Sim<'a, '_> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         plan: &'a Plan,
@@ -1277,6 +1364,7 @@ impl<'a> Sim<'a> {
             duration,
             seq: 0,
             heap: BinaryHeap::new(),
+            trace: None,
             mid_cast: false,
             gcd_ready_at: 0.0,
             segments_total: 0,
@@ -1385,6 +1473,54 @@ impl<'a> Sim<'a> {
         }
 
         Ok(sim)
+    }
+
+    fn emit(&mut self, kind: SimEventKind<'a>) {
+        if let Some(trace) = &mut self.trace {
+            (trace.sink)(SimEvent {
+                time: self.time,
+                kind,
+            });
+        }
+    }
+
+    fn traced_cast_id(&self) -> Option<u64> {
+        self.trace.as_ref().and_then(|trace| trace.cast_id)
+    }
+
+    fn trace_cast_start(
+        &mut self,
+        action: usize,
+        cooldown_ready_at: Option<f64>,
+        gcd_ready_at: Option<f64>,
+        proc: Option<usize>,
+    ) {
+        if let Some(trace) = &mut self.trace {
+            trace.last_cast_id += 1;
+            let cast_id = trace.last_cast_id;
+            trace.cast_id = Some(cast_id);
+            self.emit(SimEventKind::CastStarted {
+                action: &self.sim_plan.actions[action].name,
+                cast_id,
+                rule: if proc.is_none() { self.cast_rule } else { None },
+                triggered_by: proc.map(|pi| self.sim_plan.procs[pi].name.as_str()),
+                cooldown_ready_at,
+                gcd_ready_at,
+            });
+        }
+    }
+
+    fn trace_resource(&mut self, ri: usize, change: ResourceChange, cast_id: Option<u64>) {
+        if self.trace.is_some() {
+            self.emit(SimEventKind::ResourceChanged {
+                resource: &self.sim_plan.resources[ri].name,
+                change,
+                amount: self.resource_amount_now(ri, self.time),
+                max: self.resource_max[ri],
+                regen_per_second: self.resource_regen[ri],
+                cast_id,
+            });
+        }
     }
 
     /// Push `event` at `time`, validating finiteness fail-closed (cast
@@ -1534,8 +1670,15 @@ impl<'a> Sim<'a> {
             self.settle_resource(ri, now);
         }
         for (ri, r) in self.sim_plan.resources.iter().enumerate() {
-            self.resource_max[ri] = r.max.eval(&self.scratch.slots);
-            self.resource_regen[ri] = r.regen_per_sec.eval(&self.scratch.slots);
+            let max = r.max.eval(&self.scratch.slots);
+            let regen = r.regen_per_sec.eval(&self.scratch.slots);
+            let limits_changed = self.trace.is_some()
+                && (self.resource_max[ri] != max || self.resource_regen[ri] != regen);
+            self.resource_max[ri] = max;
+            self.resource_regen[ri] = regen;
+            if limits_changed {
+                self.trace_resource(ri, ResourceChange::Limits, None);
+            }
         }
 
         let mut contributions = self.build.contributions.clone();
@@ -1625,12 +1768,20 @@ impl<'a> Sim<'a> {
             };
             if self.sim_plan.buffs[bi].tick_objective.is_some() {
                 let b = &mut self.buffs[bi];
-                let elapsed = now - b.tick_last_eval;
+                let since = b.tick_last_eval;
+                let elapsed = now - since;
                 let dmg = elapsed * b.tick_rate;
                 b.tick_last_eval = now;
                 b.damage += dmg;
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
+                if self.trace.is_some() && dmg != 0.0 {
+                    self.emit(SimEventKind::BuffDamage {
+                        buff: &self.sim_plan.buffs[bi].name,
+                        since,
+                        damage: dmg,
+                    });
+                }
             }
         }
     }
@@ -2051,6 +2202,19 @@ impl<'a> Sim<'a> {
             self.active_buff_set.push(bi);
             self.active_buff_set.sort_unstable();
         }
+        // One pending expiry per buff, at the EARLIEST live expiry — the
+        // generation bumped above cancels whatever was pending before.
+        let (_, next) = self
+            .earliest_expiry(bi)
+            .expect("an application always leaves at least one instance");
+        if self.trace.is_some() {
+            let change = if policy == ReapplyPolicy::Strongest && !strongest_wins {
+                BuffChange::ApplicationIgnored
+            } else {
+                BuffChange::Applied
+            };
+            self.trace_buff(bi, change, Some(next), self.traced_cast_id());
+        }
         if transaction {
             // The instances are committed BEFORE the refold, so anything
             // the refold evaluates (a resource `max`/`regen_per_sec`,
@@ -2059,11 +2223,6 @@ impl<'a> Sim<'a> {
             // than a half-applied window.
             self.refresh_after_change()?;
         }
-        // One pending expiry per buff, at the EARLIEST live expiry — the
-        // generation bumped above cancels whatever was pending before.
-        let (_, next) = self
-            .earliest_expiry(bi)
-            .expect("an application always leaves at least one instance");
         self.schedule(
             next,
             Event::BuffExpire {
@@ -2119,7 +2278,7 @@ impl<'a> Sim<'a> {
         let t_end = self.time + duration;
         self.buffs[bi].applications += 1;
         self.buffs[bi].log.push(t_end, q, seq);
-        self.set_expected_p(bi)?;
+        self.set_expected_p(bi, Some((q, t_end)))?;
         #[cfg(test)]
         self.p_after_roll.push((self.time, self.buffs[bi].p));
         self.reschedule_age_out(bi)
@@ -2138,14 +2297,30 @@ impl<'a> Sim<'a> {
     /// `refresh` that moves no count does. (Dropping a zero-weight entry
     /// leaves the sum bit-identical, so q = 1 refreshes stay
     /// transaction-free like their discrete twins.)
-    fn set_expected_p(&mut self, bi: usize) -> Result<(), PlanError> {
+    fn set_expected_p(&mut self, bi: usize, roll: Option<(f64, f64)>) -> Result<(), PlanError> {
         let p = self.buffs[bi].log.live_weight().clamp(0.0, 1.0);
-        if p == self.buffs[bi].p {
-            return Ok(());
+        let changed = p != self.buffs[bi].p;
+        if changed {
+            self.flush_before_change();
+            self.buffs[bi].p = p;
         }
-        self.flush_before_change();
-        self.buffs[bi].p = p;
-        self.refresh_after_change()
+        if self.trace.is_some() {
+            let (roll_chance, roll_expires_at, cast_id) = match roll {
+                Some((chance, end)) => (Some(chance), Some(end), self.traced_cast_id()),
+                None => (None, None, None),
+            };
+            self.emit(SimEventKind::ExpectedBuffChanged {
+                buff: &self.sim_plan.buffs[bi].name,
+                probability: p,
+                roll_chance,
+                roll_expires_at,
+                cast_id,
+            });
+        }
+        if changed {
+            self.refresh_after_change()?;
+        }
+        Ok(())
     }
 
     /// Keep exactly one live [`Event::ExpectedAgeOut`] for `bi`, at its
@@ -2192,7 +2367,7 @@ impl<'a> Sim<'a> {
         self.buffs[bi].age_scheduled = None;
         let now = self.time;
         self.buffs[bi].log.drop_expired(now);
-        self.set_expected_p(bi)?;
+        self.set_expected_p(bi, None)?;
         self.reschedule_age_out(bi)
     }
 
@@ -2333,6 +2508,7 @@ impl<'a> Sim<'a> {
         self.buffs[bi].active_seconds += now - self.buffs[bi].activated_at;
         self.buffs[bi].generation += 1;
         self.active_buff_set.retain(|&x| x != bi);
+        self.trace_buff(bi, BuffChange::Removed, None, self.traced_cast_id());
         self.refresh_after_change()
     }
 
@@ -2375,9 +2551,13 @@ impl<'a> Sim<'a> {
                 self.buffs[bi].active_seconds += now - self.buffs[bi].activated_at;
                 self.active_buff_set.retain(|&x| x != bi);
             }
+        }
+        let next = self.earliest_expiry(bi).map(|(_, next)| next);
+        if expiring > 0 {
+            self.trace_buff(bi, BuffChange::Expired, next, None);
             self.refresh_after_change()?;
         }
-        if let Some((_, next)) = self.earliest_expiry(bi) {
+        if let Some(next) = next {
             self.schedule(
                 next,
                 Event::BuffExpire {
@@ -2387,6 +2567,22 @@ impl<'a> Sim<'a> {
             )?;
         }
         Ok(())
+    }
+
+    fn trace_buff(
+        &mut self,
+        bi: usize,
+        change: BuffChange,
+        next_expiry: Option<f64>,
+        cast_id: Option<u64>,
+    ) {
+        self.emit(SimEventKind::BuffChanged {
+            buff: &self.sim_plan.buffs[bi].name,
+            change,
+            stacks: self.buffs[bi].instances.len(),
+            next_expiry,
+            cast_id,
+        });
     }
 
     /// Absorb `bi`'s elapsed span into `∫ stacks dt` at the CURRENT stack
@@ -2662,6 +2858,7 @@ impl<'a> Sim<'a> {
             self.settle_resource(ri, now);
             self.resources[ri].amount -= amt;
             self.clear_starved(ri, now);
+            self.trace_resource(ri, ResourceChange::Cost, self.traced_cast_id());
         }
     }
 
@@ -2680,6 +2877,7 @@ impl<'a> Sim<'a> {
             self.settle_resource(ri, now);
             let max = self.resource_max[ri];
             self.resources[ri].amount = (self.resources[ri].amount + amt).min(max);
+            self.trace_resource(ri, ResourceChange::Gain, self.traced_cast_id());
         }
         Ok(())
     }
@@ -3048,6 +3246,13 @@ impl<'a> Sim<'a> {
                 continue;
             };
             if gates_pass_now(cd_ready, afford, now) {
+                if let Some(cast_id) = self.traced_cast_id() {
+                    self.emit(SimEventKind::CastCancelled {
+                        cast_id,
+                        segments_landed: self.segments_done,
+                        replacement: &sim_plan.actions[winner.action].name,
+                    });
+                }
                 self.mid_cast = false;
                 self.segments_done = 0;
                 self.segments_total = 0;
@@ -3096,6 +3301,12 @@ impl<'a> Sim<'a> {
             })?),
             None => None,
         };
+        self.trace_cast_start(
+            action,
+            Some(now + cooldown),
+            gcd.map(|seconds| now + seconds),
+            None,
+        );
         self.pay_cost(&costs, now);
         self.actions[action].cooldown_ready_at = now + cooldown;
         if let Some(gcd) = gcd {
@@ -3187,6 +3398,13 @@ impl<'a> Sim<'a> {
                 self.sim_plan.actions[action].name
             )
         })?;
+        if let Some(cast_id) = self.traced_cast_id() {
+            self.emit(SimEventKind::SegmentStarted {
+                cast_id,
+                segment,
+                duration: d,
+            });
+        }
         if d == 0.0 {
             return Ok(false);
         }
@@ -3295,6 +3513,7 @@ impl<'a> Sim<'a> {
             // before this part's effects and proc rolls.
             None => self.capture_world(action, part, true, complete)?,
         };
+        let mut damage = None;
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = if self.rng.is_some() {
@@ -3339,11 +3558,36 @@ impl<'a> Sim<'a> {
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
                 self.actions[action].damage += dmg;
+                damage = Some(dmg);
             }
         }
 
         if last {
             self.mid_cast = false;
+        }
+        let damage_measure = snap.as_ref().and_then(|s| s.damage.as_ref());
+        if let Some(cast_id) = self.traced_cast_id() {
+            let crit = damage_measure.map(|d| match d.crit_chance {
+                Some(probability) => SimCrit::Expected { probability },
+                None => match crit {
+                    CritOutcome::Shared(critical) => SimCrit::Shared { critical },
+                    CritOutcome::Counted { crit_hits, hits } => SimCrit::Counted {
+                        critical_hits: crit_hits,
+                        sampled_hits: hits,
+                    },
+                },
+            });
+            self.emit(SimEventKind::CastLanded {
+                cast_id,
+                segment: match part {
+                    Part::Whole => None,
+                    Part::Segment(segment) => Some(segment),
+                },
+                completes_cast: last,
+                damage,
+                hits: damage_measure.map(|d| d.hits),
+                crit,
+            });
         }
         // The part's OWN effects, before anything this landing merely
         // triggers — see `Sim::apply_action_buffs` for the ordering and
@@ -3356,7 +3600,6 @@ impl<'a> Sim<'a> {
         // ONE spelling of "was this cast damaging": the measurement's own
         // damage half (a damaging action always has a snapshot, so `snap`
         // being `None` — a utility action without effects — answers no).
-        let damage_measure = snap.as_ref().and_then(|s| s.damage.as_ref());
         // `hits` rides along to the roll paths for `ProcRolls::PerHit`
         // procs (P8e) — the MEASURED count, from the same snapshot the
         // damage was multiplied by. `None` for the `OnCast` roll (a cast
@@ -3438,6 +3681,9 @@ impl<'a> Sim<'a> {
             // statements regardless.
             self.segments_done = 0;
             self.segments_total = 0;
+            if let Some(trace) = &mut self.trace {
+                trace.cast_id = None;
+            }
         }
         Ok(())
     }
@@ -4261,6 +4507,13 @@ impl<'a> Sim<'a> {
         // `sim_plan` is a `&'a` field — reading it out decouples the
         // iteration from `self`'s own borrow (see `Sim`'s docs).
         let sim_plan = self.sim_plan;
+        if let Some(cast_id) = self.traced_cast_id() {
+            self.emit(SimEventKind::ProcFired {
+                proc: &sim_plan.procs[pi].name,
+                cast_id,
+                icd_ready_at: self.procs[pi].icd_ready_at,
+            });
+        }
         for effect in &sim_plan.procs[pi].effects {
             match *effect {
                 // The PROC path keeps `None` — a proc-applied snapshot
@@ -4274,7 +4527,7 @@ impl<'a> Sim<'a> {
                 // still fire here, discretely.
                 CompiledEffect::ApplyBuff(bi) if self.ev_expected[bi] => {}
                 CompiledEffect::ApplyBuff(bi) => self.apply_buff(bi, None)?,
-                CompiledEffect::CastAction(ai) => self.free_cast(ai)?,
+                CompiledEffect::CastAction(ai) => self.free_cast(ai, pi)?,
                 CompiledEffect::RemoveBuff(bi) => self.remove_buff(bi)?,
             }
         }
@@ -4299,8 +4552,10 @@ impl<'a> Sim<'a> {
     /// so sampling its damage (and feeding ITS crit back into further
     /// `on_crit` procs) is future work once a config actually needs it —
     /// tightening this later is additive, not a breaking change.
-    fn free_cast(&mut self, action: usize) -> Result<(), PlanError> {
+    fn free_cast(&mut self, action: usize, proc: usize) -> Result<(), PlanError> {
         let now = self.time;
+        let parent_cast_id = self.traced_cast_id();
+        self.trace_cast_start(action, None, None, Some(proc));
         self.apply_gain(action, now)?;
         self.actions[action].casts += 1;
         // Same instants as a normal completion — a free cast BEGINS and
@@ -4317,16 +4572,34 @@ impl<'a> Sim<'a> {
         // the completion position — "at cast complete" is its instant
         // whatever either action's `measure` says.
         let snap = self.capture_world(action, Part::Whole, false, "at cast complete")?;
+        let mut damage = None;
         if let Some(s) = &snap {
             if let Some(d) = &s.damage {
                 let dmg = self.eval_action_damage(&s.build, &s.phase, d.hits)?;
                 self.total_damage += dmg;
                 self.phase_damage[self.current_phase] += dmg;
                 self.actions[action].damage += dmg;
+                damage = Some(dmg);
             }
+        }
+        if let Some(cast_id) = self.traced_cast_id() {
+            self.emit(SimEventKind::CastLanded {
+                cast_id,
+                segment: None,
+                completes_cast: true,
+                damage,
+                hits: snap
+                    .as_ref()
+                    .and_then(|s| s.damage.as_ref())
+                    .map(|d| d.hits),
+                crit: None,
+            });
         }
         // Under THIS free cast's own world — see the doc comment.
         self.apply_action_buffs(action, Part::Whole, snap.as_ref())?;
+        if let Some(trace) = &mut self.trace {
+            trace.cast_id = parent_cast_id;
+        }
         Ok(())
     }
 
@@ -4362,6 +4635,15 @@ impl<'a> Sim<'a> {
     /// naming the looping event — see that constant for why nothing can
     /// reach it today and why it is nonetheless there.
     fn run_loop(&mut self) -> Result<(), PlanError> {
+        if self.trace.is_some() {
+            self.emit(SimEventKind::SimulationStarted {
+                duration: self.duration,
+            });
+            self.trace_phase();
+            for ri in 0..self.resources.len() {
+                self.trace_resource(ri, ResourceChange::Initial, None);
+            }
+        }
         self.attempt_decision()?;
         let mut horizon_events: u32 = 0;
         while let Some(top) = self.heap.peek() {
@@ -4398,6 +4680,7 @@ impl<'a> Sim<'a> {
                 Event::PhaseBoundary { phase } => {
                     self.flush_before_change();
                     self.current_phase = phase;
+                    self.trace_phase();
                     self.refresh_after_change()?;
                 }
                 Event::Wake => {}
@@ -4409,7 +4692,17 @@ impl<'a> Sim<'a> {
             }
         }
         self.finalize();
+        self.emit(SimEventKind::SimulationEnded {
+            total_damage: self.total_damage,
+        });
         Ok(())
+    }
+
+    fn trace_phase(&mut self) {
+        self.emit(SimEventKind::PhaseEntered {
+            phase: &self.scenario.phases[self.current_phase].name,
+            phase_index: self.current_phase,
+        });
     }
 
     /// [`HORIZON_DRAIN_LIMIT`]'s fail-closed error, naming the CONFIG
@@ -17363,7 +17656,7 @@ mod tests {
             sp: &'a SimPlan,
             build: &'a BuildState,
             sc: &'a Scenario,
-        ) -> Sim<'a> {
+        ) -> Sim<'a, 'a> {
             let duration = sc.phases.iter().map(|p| p.weight).sum();
             let scratch = SimScratch::new(plan, sp);
             let mut sim = Sim::new(plan, sp, build, sc, duration, scratch, None).unwrap();
