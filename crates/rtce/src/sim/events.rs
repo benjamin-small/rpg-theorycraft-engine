@@ -12,9 +12,43 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 pub struct SimEvent<'a> {
     /// Simulation time in seconds.
     pub time: f64,
+    /// ID of the actor that caused the event, when the engine can attribute it.
+    pub source_id: Option<&'a str>,
+    /// ID of the actor or opponent directly affected by the event, when known.
+    pub target_id: Option<&'a str>,
     /// The operation that occurred at this instant.
     #[serde(flatten)]
     pub kind: SimEventKind<'a>,
+}
+
+impl<'a> SimEvent<'a> {
+    pub(super) fn new(time: f64, kind: SimEventKind<'a>) -> Self {
+        let player = Some("player");
+        let opponent = Some("target");
+        let (source_id, target_id) = match kind {
+            SimEventKind::CastLanded {
+                damage: Some(_), ..
+            }
+            | SimEventKind::BuffDamage { .. } => (player, opponent),
+            SimEventKind::CastStarted { .. }
+            | SimEventKind::SegmentStarted { .. }
+            | SimEventKind::CastLanded { damage: None, .. }
+            | SimEventKind::CastCancelled { .. }
+            | SimEventKind::ProcFired { .. } => (player, None),
+            SimEventKind::BuffChanged { cast_id, .. }
+            | SimEventKind::ExpectedBuffChanged { cast_id, .. } => (cast_id.and(player), None),
+            SimEventKind::ResourceChanged { cast_id, .. } => (cast_id.and(player), player),
+            SimEventKind::SimulationStarted { .. }
+            | SimEventKind::PhaseEntered { .. }
+            | SimEventKind::SimulationEnded { .. } => (None, None),
+        };
+        Self {
+            time,
+            source_id,
+            target_id,
+            kind,
+        }
+    }
 }
 
 /// An operation in the resolved timeline. JSON uses a flat `type` tag.

@@ -97,12 +97,44 @@ fn events_follow_the_executor_through_a_cancel_and_buff_removal() {
             (4.0, "simulation_ended"),
         ]
     );
+    let participants: Vec<_> = events
+        .iter()
+        .map(|event| (event["source_id"].as_str(), event["target_id"].as_str()))
+        .collect();
+    let player = Some("player");
+    let target = Some("target");
+    assert_eq!(
+        participants,
+        [
+            (None, None),     // Start.
+            (None, None),     // Initial phase.
+            (None, player),   // Initial resource.
+            (player, None),   // Cast start.
+            (player, player), // Cost.
+            (player, player), // Gain.
+            (player, None),   // Utility landing.
+            (player, None),   // Buff application.
+            (player, None),   // Next cast.
+            (player, None),   // Segment start.
+            (player, target), // Buff damage.
+            (None, None),     // Phase boundary.
+            (player, target), // Segment damage.
+            (player, None),   // Cancel.
+            (player, None),   // Replacement cast.
+            (player, target), // Replacement damage.
+            (player, None),   // Buff removal.
+            (None, None),     // End.
+        ]
+    );
     assert_eq!(events[3]["gcd_ready_at"], 1.0);
     assert_eq!(events[4]["amount"], 8.0);
     assert_eq!(events[5]["amount"], 9.0);
     assert_eq!(
         events[10],
-        json!({"type":"buff_damage","time":2.0,"buff":"mark","since":1.0,"damage":3.0})
+        json!({
+            "type": "buff_damage", "time": 2.0, "source_id": "player", "target_id": "target",
+            "buff": "mark", "since": 1.0, "damage": 3.0
+        })
     );
     assert_eq!(events[12]["cast_id"], 2);
     assert_eq!(events[12]["segment"], 0);

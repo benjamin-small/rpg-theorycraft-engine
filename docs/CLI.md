@@ -159,6 +159,21 @@ stream and the report Promise. Breaking out of the loop cancels the stream
 and terminates its Worker. The Worker pushes events as the engine produces
 them, so a slow consumer can accumulate unread events.
 
+The TypeScript `SimulationEvent<Details>` type combines shared timeline
+fields with a simulator's tagged event variants. Omitting `Details` uses
+RTCE's variants. A different producer can type its own variants and report
+with `TimelineStream`, then supply a stream of those events to its UI.
+
+```ts
+import type { SimulationEvent, TimelineStream } from './timeline';
+
+type CombatEvent = SimulationEvent<
+  | { type: 'damage_applied'; amount: number }
+  | { type: 'charge_restored'; action: string; charges: number }
+>;
+type CombatTimeline = TimelineStream<CombatEvent, { total_damage: number }>;
+```
+
 The underlying Wasm exports are `simulate_expected_stream` and
 `simulate_monte_carlo_stream`. Each takes the same arguments as the
 corresponding `_with_events` export, plus a final `onEvent(eventJson)`
@@ -328,9 +343,14 @@ When tracing is enabled in Wasm, the envelope also contains `event_stream`
 with its own `schema_version`, the zero-based `iteration`, the master `seed`
 as a decimal string (null in expected mode), and an ordered `events` array.
 The CLI writes the same event records directly under `--events`.
-Each record has a `type` and a `time` in seconds. Array order breaks ties
-when records share a timestamp. Cast IDs are local to the selected timeline
-and join cast starts, segment starts, landings, cancels, and effects.
+Each record has a `type`, a `time` in seconds, and nullable `source_id` and
+`target_id` fields. RTCE uses `"player"` for its actor and `"target"` for its
+opponent. Damage records name both. Resource records target the player,
+and cast-linked changes identify the player as their source. Lifecycle
+records and any event without an attributable participant use null for
+that field. Array order breaks ties when records share a timestamp. Cast
+IDs are local to the selected timeline and join cast starts, segment
+starts, landings, cancels, and effects.
 
 | Record | Use |
 | --- | --- |

@@ -124,6 +124,14 @@ fn simulate_streams_one_sampled_timeline_as_jsonl() {
     assert_eq!(start["seed"], "18446744073709551615");
     assert_eq!(start["type"], "simulation_started");
     assert_eq!(start["time"], 0.0);
+    assert_eq!(start.get("source_id"), Some(&Value::Null));
+    assert_eq!(start.get("target_id"), Some(&Value::Null));
+    let hit = events
+        .iter()
+        .find(|event| event["damage"].is_number())
+        .unwrap();
+    assert_eq!(hit["source_id"], "player");
+    assert_eq!(hit["target_id"], "target");
     assert_eq!(events.last().unwrap()["type"], "simulation_ended");
     assert!(events.iter().all(|event| event["time"].is_number()));
     let compact = command.arg("--compact").output().unwrap();

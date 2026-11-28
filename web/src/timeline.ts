@@ -11,7 +11,14 @@ type Crit =
   | { type: 'shared'; critical: boolean }
   | { type: 'counted'; critical_hits: number; sampled_hits: number };
 
-export type SimulationEvent = { time: number } & (
+/** Shared timeline fields plus the event variants supplied by a simulator. */
+export type SimulationEvent<Details extends { type: string } = RtceEventDetails> = {
+  time: number;
+  source_id: string | null;
+  target_id: string | null;
+} & Details;
+
+type RtceEventDetails =
   | {
       type: 'simulation_started'; duration: number; schema_version: 1;
       mode: TimelineMode['kind']; iteration: number; seed: string | null;
@@ -42,8 +49,7 @@ export type SimulationEvent = { time: number } & (
       type: 'resource_changed'; resource: string; change: 'initial' | 'cost' | 'gain' | 'limits';
       amount: number; max: number; regen_per_second: number; cast_id: number | null;
     }
-  | { type: 'simulation_ended'; total_damage: number }
-);
+  | { type: 'simulation_ended'; total_damage: number };
 
 export interface TimelineRequest {
   config: ConfigSet;
@@ -51,14 +57,14 @@ export interface TimelineRequest {
   wasm: string | BufferSource;
 }
 
-export type TimelineMessage =
-  | { type: 'event'; event: SimulationEvent }
-  | { type: 'result'; result: SimulationResult }
+export type TimelineMessage<Event = SimulationEvent, Report = SimulationResult> =
+  | { type: 'event'; event: Event }
+  | { type: 'result'; result: Report }
   | { type: 'error'; message: string };
 
-export interface TimelineStream {
-  events: ReadableStream<SimulationEvent>;
-  result: Promise<SimulationResult>;
+export interface TimelineStream<Event = SimulationEvent, Report = SimulationResult> {
+  events: ReadableStream<Event>;
+  result: Promise<Report>;
 }
 
 /** Run a simulation in a dedicated Worker and deliver its events individually. */
