@@ -1,4 +1,6 @@
 import type { ConfigSet, SimulationResult } from './rtce';
+import TimelineWorker from './timeline.worker?worker&inline';
+import wasmUrl from './wasm/rtce_wasm_bg.wasm?url';
 
 export type TimelineMode =
   | { kind: 'expected' }
@@ -46,6 +48,7 @@ export type SimulationEvent = { time: number } & (
 export interface TimelineRequest {
   config: ConfigSet;
   mode: TimelineMode;
+  wasm: string | BufferSource;
 }
 
 export type TimelineMessage =
@@ -62,9 +65,12 @@ export interface TimelineStream {
 export function streamSimulation(
   config: ConfigSet,
   mode: TimelineMode = { kind: 'expected' },
+  signal?: AbortSignal,
 ): TimelineStream {
-  const worker = new Worker(new URL('./timeline.worker.ts', import.meta.url), { type: 'module' });
+  const worker = new TimelineWorker();
+  let onAbort: (() => void) | undefined;
   const stopWorker = () => {
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
     worker.onmessage = null;
     worker.onmessageerror = null;
     worker.onerror = null;
@@ -81,11 +87,20 @@ export function streamSimulation(
 
   const events = new ReadableStream<SimulationEvent>({
     start(controller) {
-      const fail = (error: Error) => {
+      const fail = (error: unknown) => {
         stopWorker();
         controller.error(error);
         rejectResult(error);
       };
+
+      if (signal) {
+        onAbort = () => fail(signal.reason);
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       worker.onmessage = ({ data }: MessageEvent<TimelineMessage>) => {
         switch (data.type) {
@@ -109,7 +124,10 @@ export function streamSimulation(
       worker.onmessageerror = () => fail(new Error('Could not read the simulation Worker message'));
 
       try {
-        worker.postMessage({ config, mode } satisfies TimelineRequest);
+        // The standalone tutorial supplies its embedded Wasm to the inline Worker.
+        const embedded = (globalThis as { __RTCE_WASM__?: BufferSource }).__RTCE_WASM__;
+        const wasm = embedded ?? new URL(wasmUrl, document.baseURI).href;
+        worker.postMessage({ config, mode, wasm } satisfies TimelineRequest);
       } catch (error) {
         fail(error instanceof Error ? error : new Error(String(error)));
       }

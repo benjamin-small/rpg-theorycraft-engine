@@ -11,6 +11,7 @@ import {
   type RtceResult,
   type SimulationResult,
 } from './rtce';
+import { streamSimulation, type SimulationEvent, type TimelineMode } from './timeline';
 import './style.css';
 
 type ConfigKey = keyof ConfigSet;
@@ -444,39 +445,64 @@ function evaluationPlayback(result: RtceResult, config: ConfigSet): string[] {
   return lines;
 }
 
-function simulationPlayback(result: SimulationResult, config: ConfigSet): string[] {
-  const { report } = result;
-  const lines = [
-    `[compile] Plan + SimDef + Rotation ready`,
-    ...gearContributionLines(config),
-    `[timeline] ${report.total.duration.toFixed(1)}s · ${result.mode.replace('_', ' ')}`,
-    '[playback] report-derived stream; cast counts and damage totals are exact',
-  ];
-  const events: Array<{ time: number; text: string }> = [];
-
-  for (const [name, action] of Object.entries(report.actions)) {
-    const damagePerCast = action.casts === 0 ? 0 : action.damage / action.casts;
-    for (let index = 0; index < action.casts; index += 1) {
-      const time = ((index + 1) * report.total.duration) / Math.max(action.casts, 1);
-      events.push({
-        time,
-        text:
-          damagePerCast > 0
-            ? `[hit] ${name} → ${damagePerCast.toFixed(2)} damage`
-            : `[cast] ${name}`,
-      });
+function simulationEventLine(event: SimulationEvent, casts: Map<number, string>): string {
+  const castName = (id: number) => casts.get(id) ?? `cast #${id}`;
+  switch (event.type) {
+    case 'simulation_started': {
+      const mode = event.mode === 'expected'
+        ? 'expected'
+        : `Monte Carlo iteration ${event.iteration} · seed ${event.seed}`;
+      return `[timeline] ${event.duration}s · ${mode}`;
     }
+    case 'phase_entered':
+      return `[phase] ${event.phase}`;
+    case 'cast_started':
+      casts.set(event.cast_id, event.action);
+      return `[cast] start ${event.action} #${event.cast_id}${event.triggered_by ? ` · triggered by ${event.triggered_by}` : ''}`;
+    case 'segment_started':
+      return `[segment] ${castName(event.cast_id)} · start segment ${event.segment + 1} · ${event.duration}s`;
+    case 'cast_landed': {
+      const action = castName(event.cast_id);
+      if (event.completes_cast) casts.delete(event.cast_id);
+      const segment = event.segment === null ? '' : ` · segment ${event.segment + 1}`;
+      if (event.damage === null) return `[land] ${action}${segment}`;
+      let crit = '';
+      if (event.crit?.type === 'shared' && event.crit.critical) crit = ' · crit';
+      if (event.crit?.type === 'counted') {
+        crit = ` · ${event.crit.critical_hits}/${event.crit.sampled_hits} crits`;
+      }
+      if (event.crit?.type === 'expected' && event.crit.probability > 0) {
+        crit = ` · ${formatPercent(event.crit.probability)} crit chance`;
+      }
+      return `[hit] ${action}${segment} → ${event.damage.toFixed(2)} damage${crit}`;
+    }
+    case 'cast_cancelled': {
+      const action = castName(event.cast_id);
+      casts.delete(event.cast_id);
+      return `[cancel] ${action} → ${event.replacement}`;
+    }
+    case 'proc_fired':
+      return `[proc] ${event.proc}`;
+    case 'buff_changed':
+      return `[buff] ${event.buff} · ${event.change.replaceAll('_', ' ')} · ${event.stacks} stacks`;
+    case 'expected_buff_changed':
+      return `[buff] ${event.buff} · ${formatPercent(event.probability)} chance active`;
+    case 'buff_damage':
+      return `[dot] ${event.buff} → ${event.damage.toFixed(2)} damage since t=${event.since}s`;
+    case 'resource_changed':
+      return `[resource] ${event.resource} · ${event.change} · ${event.amount.toFixed(2)}/${event.max}`;
+    case 'simulation_ended':
+      return `[timeline] ended · ${event.total_damage.toFixed(2)} damage`;
   }
+}
 
-  events.sort((left, right) => left.time - right.time || left.text.localeCompare(right.text));
-  for (const event of events.slice(0, 120)) {
-    lines.push(`t=${event.time.toFixed(2).padStart(6)}s  ${event.text}`);
-  }
-  if (events.length > 120) lines.push(`[playback] ${events.length - 120} additional events omitted`);
+function simulationSummaryLines(result: SimulationResult): string[] {
+  const { report } = result;
+  const lines: string[] = [];
 
   for (const [name, buff] of Object.entries(report.buffs)) {
     lines.push(
-      `[buff] ${name} · ${(buff.uptime * 100).toFixed(1)}% uptime · ${buff.avg_stacks.toFixed(2)} avg stacks`,
+      `[uptime] ${name} · ${(buff.uptime * 100).toFixed(1)}% uptime · ${buff.avg_stacks.toFixed(2)} avg stacks`,
     );
   }
   if (report.distribution) {
@@ -640,14 +666,30 @@ terminal.registerCommand(
       if (mode !== 'expected' && mode !== 'monte-carlo') {
         throw new Error("invalid value for --mode; use 'expected' or 'monte-carlo'");
       }
-      const iterations = Number(flags.iterations ?? 1000);
-      const seed = Number(flags.seed ?? 42);
-      const result = showResult(
-        mode === 'monte-carlo'
-          ? client.simulateMonteCarlo(config, iterations, seed)
-          : client.simulateExpected(config),
-      );
-      await streamLines(ctx, simulationPlayback(result, config), 10);
+      const timelineMode: TimelineMode = mode === 'monte-carlo'
+        ? {
+            kind: 'monte_carlo',
+            iterations: Number(flags.iterations ?? 1000),
+            seed: BigInt(String(flags.seed ?? 42)),
+            eventIteration: 0,
+          }
+        : { kind: 'expected' };
+      const timeline = streamSimulation(config, timelineMode, ctx.signal);
+      const casts = new Map<number, string>();
+      const timeFormat = new Intl.NumberFormat('en-US', {
+        minimumFractionDigits: 2, maximumFractionDigits: 6, useGrouping: false,
+      });
+      resultBadge.textContent = 'Running';
+      ctx.log('[compile] Plan + SimDef + Rotation');
+      for await (const event of timeline.events) {
+        if (event.type === 'simulation_started') {
+          for (const line of gearContributionLines(config)) ctx.log(line);
+        }
+        const time = timeFormat.format(event.time);
+        ctx.log(`t=${time.padStart(6)}s  ${simulationEventLine(event, casts)}`);
+      }
+      const result = showResult(await timeline.result);
+      for (const line of simulationSummaryLines(result)) ctx.log(line);
       return result;
     } catch (error) { return showError(error); }
   },

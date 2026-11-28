@@ -230,13 +230,11 @@ inspect what is available in the current lesson. In Docker, replace those
 variables with paths such as `/work/gamedef.json`; the rest of the command is
 the same.
 
-The page's **Run current lesson** button uses that same terminal path. It types
-the lesson command at the prompt, executes it, streams compilation and fight
-playback into the terminal, then updates the result cards from the command's
-structured return value. For simulations, the playback timestamps are clearly
-labeled as report-derived: action counts and damage totals are exact engine
-output, while the illustrative timestamps are reconstructed from those totals
-because `SimReport` does not expose the executor's internal event queue.
+The page's **Run CLI demo** button uses that same terminal path. For
+simulation lessons, the terminal shows the engine's events at their simulated
+timestamps as the Worker emits them. In Monte Carlo it shows iteration zero
+and then displays the pooled result from all iterations. The result cards
+and structured shell output use the final report.
 
 All calculation happens in the browser. The nginx container serves static
 HTML, JavaScript, and two Wasm modules; it exposes no calculation API and
