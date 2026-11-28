@@ -240,7 +240,7 @@ produce?
 
 Use `sim::run_with_events` or the CLI's `simulate --events` flag to inspect a
 single resolved timeline with cast, damage, buff, resource, and proc events.
-See the [event stream format and dump command](docs/CLI.md#dump-a-simulation-timeline).
+See the [JSON Lines format and dump command](docs/CLI.md#dump-a-simulation-timeline).
 
 One config family, three fidelity levels, all built on the same `Plan` —
 where they overlap they're required to agree (`sim::exec`'s keystone test

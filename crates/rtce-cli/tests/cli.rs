@@ -70,8 +70,7 @@ fn lexicon_labels_engine_supplied_names() {
         .any(|entry| { entry["term"] == "event_multiplier" && entry["kind"] == "engine" }));
 }
 
-#[test]
-fn simulate_can_dump_one_sampled_timeline() {
+fn simulate_archer() -> Command {
     let mut command = rtce();
     command.arg("simulate");
     for (flag, file) in [
@@ -83,6 +82,12 @@ fn simulate_can_dump_one_sampled_timeline() {
     ] {
         command.arg(flag).arg(fixture(file));
     }
+    command
+}
+
+#[test]
+fn simulate_streams_one_sampled_timeline_as_jsonl() {
+    let mut command = simulate_archer();
     command.args([
         "--mode",
         "monte-carlo",
@@ -98,7 +103,7 @@ fn simulate_can_dump_one_sampled_timeline() {
         String::from_utf8_lossy(&plain.stderr)
     );
     let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
-    assert!(plain.get("event_stream").is_none());
+    assert_eq!(plain["report"]["distribution"]["iterations"], 2);
 
     let traced = command.arg("--events=1").output().unwrap();
     assert!(
@@ -106,13 +111,38 @@ fn simulate_can_dump_one_sampled_timeline() {
         "{}",
         String::from_utf8_lossy(&traced.stderr)
     );
-    let traced: Value = serde_json::from_slice(&traced.stdout).unwrap();
-    assert_eq!(traced["report"], plain["report"]);
-    let stream = &traced["event_stream"];
-    assert_eq!(stream["schema_version"], 1);
-    assert_eq!(stream["iteration"], 1);
-    assert_eq!(stream["seed"], "18446744073709551615");
-    let events = stream["events"].as_array().unwrap();
-    assert_eq!(events[0]["type"], "simulation_started");
+    assert!(traced.stdout.ends_with(b"\n"));
+    let events: Vec<Value> = std::str::from_utf8(&traced.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let start = &events[0];
+    assert_eq!(start["schema_version"], 1);
+    assert_eq!(start["mode"], "monte_carlo");
+    assert_eq!(start["iteration"], 1);
+    assert_eq!(start["seed"], "18446744073709551615");
+    assert_eq!(start["type"], "simulation_started");
+    assert_eq!(start["time"], 0.0);
     assert_eq!(events.last().unwrap()["type"], "simulation_ended");
+    assert!(events.iter().all(|event| event["time"].is_number()));
+    let compact = command.arg("--compact").output().unwrap();
+    assert!(compact.status.success());
+    assert_eq!(traced.stdout, compact.stdout);
+}
+
+#[test]
+fn simulate_events_defaults_to_iteration_zero_and_rejects_an_invalid_iteration() {
+    let traced = simulate_archer().arg("--events").output().unwrap();
+    assert!(traced.status.success());
+    let first_line = traced.stdout.split(|byte| *byte == b'\n').next().unwrap();
+    let start: Value = serde_json::from_slice(first_line).unwrap();
+    assert_eq!(start["mode"], "expected");
+    assert_eq!(start["iteration"], 0);
+    assert_eq!(start["seed"], Value::Null);
+
+    let invalid = simulate_archer().arg("--events=1").output().unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("event iteration 1 is out of range"));
 }

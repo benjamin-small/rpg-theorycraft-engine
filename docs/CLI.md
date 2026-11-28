@@ -5,8 +5,7 @@ The `rtce` library now has two thin interfaces over the same JSON runner:
 - a native `rtce` command for scripts, CI, and local experiments;
 - a TypeScript client backed by WebAssembly for the interactive tutorial.
 
-Both produce the same versioned JSON envelopes. Neither reimplements engine
-math outside the `rtce` crate.
+Both use the same engine and produce versioned JSON reports.
 
 ## Start with Docker
 
@@ -98,11 +97,12 @@ complete flag reference.
 
 ### Dump a simulation timeline
 
-Add `--events` to `simulate` to include the resolved events of iteration zero.
-For Monte Carlo, `--events=7` selects the eighth iteration and requires at
-least eight iterations. The report still pools every requested iteration.
+Add `--events` to `simulate` to stream the resolved events of iteration zero
+to stdout as JSON Lines. For Monte Carlo, `--events=7` selects the eighth
+iteration and requires at least eight iterations. Omit `--events` to get
+the usual simulation report.
 
-This native example writes the bundled archer fight to `timeline.json`:
+This native example writes the bundled archer fight to `timeline.jsonl`:
 
 ```sh
 fixture=crates/rtce/tests/fixtures/guide
@@ -112,18 +112,22 @@ cargo run -p rtce-cli -- simulate \
   --scenario "$fixture/07-scenario.json" \
   --sim "$fixture/07-simdef.json" \
   --rotation "$fixture/07-rotation.json" \
-  --events > timeline.json
-jq -c '.event_stream.events[]' timeline.json
+  --events > timeline.jsonl
 ```
+
+Every line is one JSON event. The first line is `simulation_started` and
+also carries `schema_version`, `mode`, `iteration`, and `seed`. The seed is
+a decimal string for Monte Carlo and null in expected mode. A successful
+timeline ends with `simulation_ended`. A failed run can leave a partial
+stream and writes its diagnostic to stderr.
 
 The Rust API, `rtce::sim::run_with_events`, calls a sink for each record as
 it happens. The sink can serialize JSON Lines directly or accumulate typed
-records while the simulation inputs are in scope. An error may leave a
-partial stream without `simulation_ended`. The CLI and Wasm return the
-complete JSON envelope on success. Wasm consumers can call
+records while the simulation inputs are in scope. Wasm consumers can call
 `simulate_expected_with_events` or `simulate_monte_carlo_with_events` with the
 same arguments as the existing bindings, plus a zero-based iteration after
-the seed for Monte Carlo.
+the seed for Monte Carlo. These bindings return the event array and simulation
+report in a single JSON envelope.
 
 To inspect the expression vocabulary without opening a config, run:
 
@@ -263,7 +267,7 @@ and every fail-closed config rule remain on the Rust side of the boundary.
 
 ## JSON response contract
 
-Every successful response contains:
+Every successful JSON envelope contains:
 
 ```json
 {
@@ -277,9 +281,10 @@ are keyed by name. Explanations add the engine's trace. Simulations add `mode`
 and the complete `SimReport`. New report fields may be added compatibly; a
 breaking envelope change requires a new `schema_version`.
 
-When tracing is enabled, a simulation also contains `event_stream` with its own
-`schema_version`, the zero-based `iteration`, the Monte Carlo master `seed`
+When tracing is enabled in Wasm, the envelope also contains `event_stream`
+with its own `schema_version`, the zero-based `iteration`, the master `seed`
 as a decimal string (null in expected mode), and an ordered `events` array.
+The CLI writes the same event records directly under `--events`.
 Each record has a `type` and a `time` in seconds. Array order breaks ties
 when records share a timestamp. Cast IDs are local to the selected timeline
 and join cast starts, segment starts, landings, cancels, and effects.
