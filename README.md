@@ -32,6 +32,45 @@ Published crates: `rtce` (engine), `rtce-testkit` (fixture harness,
 dev-dependency). The workspace also contains private `rtce-runner`,
 `rtce-cli`, and `rtce-wasm` interface crates.
 
+## How it fits together
+
+```mermaid
+flowchart TD
+    GameDef["<b>GameDef</b><br/>the game's algorithm"]
+    SimDef["<b>SimDef + Rotation</b><br/>timeline rules"]
+    Plan["<b>Plan</b><br/>plan::compile, once"]
+    Inputs["<b>BuildState + Scenario</b><br/>changes per query"]
+    Sim["<b>Compiled sim</b><br/>sim::compile, once"]
+    Evaluate["<b>Plan::evaluate</b><br/>closed-form average"]
+    Run["<b>sim::run</b><br/>Expected or MonteCarlo timelines"]
+    Search["<b>search</b><br/>rank candidate batches"]
+    Report["<b>SimReport</b><br/>computed uptimes, DPS distribution"]
+
+    GameDef --> Plan
+    SimDef --> Sim
+    Plan --> Sim
+    Plan --> Evaluate
+    Inputs --> Evaluate
+    Inputs --> Run
+    Sim --> Run
+    Evaluate --> Search
+    Run --> Report
+
+    classDef authored fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef query fill:#E1F5EE,stroke:#0F6E56,color:#085041
+    classDef engine fill:#F1EFE8,stroke:#5F5E5A,color:#444441
+    class GameDef,SimDef authored
+    class Inputs query
+    class Plan,Sim,Evaluate,Run,Search,Report engine
+```
+
+Purple is configuration written once per game, teal is the only input that
+changes per query, and gray is the engine. `Plan::evaluate` prices a build
+as a closed-form average; `sim::run` plays the fight as a timeline on the same
+compiled `Plan`, in expected-value or seeded Monte Carlo mode, and computes
+the buff uptimes that `evaluate` takes as inputs. Where the two overlap they
+must agree exactly — see the crate docs' "Three fidelity levels".
+
 ## Supported runtimes
 
 - Rust 1.88 or newer for native and Wasm builds. CI also tests the current
