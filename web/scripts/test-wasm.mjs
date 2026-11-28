@@ -135,6 +135,13 @@ for (const output of [expected, sampled]) {
   assert.equal(events[2].cast_id, events[3].cast_id);
   assert.equal(events[3].damage, root);
   assert.equal(events[4].total_damage, root);
+  assert.deepEqual(events.map(({ source_id, target_id }) => [source_id, target_id]), [
+    [null, null],
+    [null, null],
+    ["player", null],
+    ["player", "target"],
+    [null, null],
+  ]);
 }
 assert.equal(expected.event_stream.iteration, 0);
 assert.equal(sampled.event_stream.iteration, 1);

@@ -13,7 +13,11 @@ until then, per semver's "anything goes" pre-1.0 clause).
   The CLI's `simulate --events` flag streams JSON Lines, and the Wasm bindings
   can deliver one event per callback or return a JSON array alongside the
   report. The browser Worker example exposes individual events as an
-  asynchronous `ReadableStream`.
+  asynchronous `ReadableStream`. Records include source and target IDs
+  where attributable, and the TypeScript event and stream types accept
+  implementation-specific schemas.
+- The browser tutorial shows the engine's actual events and timestamps in
+  the terminal for simulation lessons, including in the standalone build.
 
 ## [0.11.0] — 2026-11-28
 

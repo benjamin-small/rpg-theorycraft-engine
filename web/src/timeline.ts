@@ -1,4 +1,6 @@
 import type { ConfigSet, SimulationResult } from './rtce';
+import TimelineWorker from './timeline.worker?worker&inline';
+import wasmUrl from './wasm/rtce_wasm_bg.wasm?url';
 
 export type TimelineMode =
   | { kind: 'expected' }
@@ -9,7 +11,14 @@ type Crit =
   | { type: 'shared'; critical: boolean }
   | { type: 'counted'; critical_hits: number; sampled_hits: number };
 
-export type SimulationEvent = { time: number } & (
+/** Shared timeline fields plus the event variants supplied by a simulator. */
+export type SimulationEvent<Details extends { type: string } = RtceEventDetails> = {
+  time: number;
+  source_id: string | null;
+  target_id: string | null;
+} & Details;
+
+type RtceEventDetails =
   | {
       type: 'simulation_started'; duration: number; schema_version: 1;
       mode: TimelineMode['kind']; iteration: number; seed: string | null;
@@ -40,31 +49,34 @@ export type SimulationEvent = { time: number } & (
       type: 'resource_changed'; resource: string; change: 'initial' | 'cost' | 'gain' | 'limits';
       amount: number; max: number; regen_per_second: number; cast_id: number | null;
     }
-  | { type: 'simulation_ended'; total_damage: number }
-);
+  | { type: 'simulation_ended'; total_damage: number };
 
 export interface TimelineRequest {
   config: ConfigSet;
   mode: TimelineMode;
+  wasm: string | BufferSource;
 }
 
-export type TimelineMessage =
-  | { type: 'event'; event: SimulationEvent }
-  | { type: 'result'; result: SimulationResult }
+export type TimelineMessage<Event = SimulationEvent, Report = SimulationResult> =
+  | { type: 'event'; event: Event }
+  | { type: 'result'; result: Report }
   | { type: 'error'; message: string };
 
-export interface TimelineStream {
-  events: ReadableStream<SimulationEvent>;
-  result: Promise<SimulationResult>;
+export interface TimelineStream<Event = SimulationEvent, Report = SimulationResult> {
+  events: ReadableStream<Event>;
+  result: Promise<Report>;
 }
 
 /** Run a simulation in a dedicated Worker and deliver its events individually. */
 export function streamSimulation(
   config: ConfigSet,
   mode: TimelineMode = { kind: 'expected' },
+  signal?: AbortSignal,
 ): TimelineStream {
-  const worker = new Worker(new URL('./timeline.worker.ts', import.meta.url), { type: 'module' });
+  const worker = new TimelineWorker();
+  let onAbort: (() => void) | undefined;
   const stopWorker = () => {
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
     worker.onmessage = null;
     worker.onmessageerror = null;
     worker.onerror = null;
@@ -81,11 +93,20 @@ export function streamSimulation(
 
   const events = new ReadableStream<SimulationEvent>({
     start(controller) {
-      const fail = (error: Error) => {
+      const fail = (error: unknown) => {
         stopWorker();
         controller.error(error);
         rejectResult(error);
       };
+
+      if (signal) {
+        onAbort = () => fail(signal.reason);
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       worker.onmessage = ({ data }: MessageEvent<TimelineMessage>) => {
         switch (data.type) {
@@ -109,7 +130,10 @@ export function streamSimulation(
       worker.onmessageerror = () => fail(new Error('Could not read the simulation Worker message'));
 
       try {
-        worker.postMessage({ config, mode } satisfies TimelineRequest);
+        // The standalone tutorial supplies its embedded Wasm to the inline Worker.
+        const embedded = (globalThis as { __RTCE_WASM__?: BufferSource }).__RTCE_WASM__;
+        const wasm = embedded ?? new URL(wasmUrl, document.baseURI).href;
+        worker.postMessage({ config, mode, wasm } satisfies TimelineRequest);
       } catch (error) {
         fail(error instanceof Error ? error : new Error(String(error)));
       }

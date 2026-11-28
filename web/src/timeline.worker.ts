@@ -6,7 +6,7 @@ import type { SimulationResult } from './rtce';
 import type { SimulationEvent, TimelineMessage, TimelineRequest } from './timeline';
 
 self.addEventListener('message', async ({ data }: MessageEvent<TimelineRequest>) => {
-  const { config, mode } = data;
+  const { config, mode, wasm } = data;
   const { gamedef, build, scenario, simdef, rotation } = config;
 
   try {
@@ -14,7 +14,7 @@ self.addEventListener('message', async ({ data }: MessageEvent<TimelineRequest>)
       throw new Error('A simulation requires SimDef and Rotation documents');
     }
 
-    await initWasm();
+    await initWasm({ module_or_path: wasm });
     const onEvent = (json: string) => {
       const event = JSON.parse(json) as SimulationEvent;
       self.postMessage({ type: 'event', event } satisfies TimelineMessage);

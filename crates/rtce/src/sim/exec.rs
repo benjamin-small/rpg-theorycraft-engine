@@ -1477,10 +1477,7 @@ impl<'a> Sim<'a, '_> {
 
     fn emit(&mut self, kind: SimEventKind<'a>) {
         if let Some(trace) = &mut self.trace {
-            (trace.sink)(SimEvent {
-                time: self.time,
-                kind,
-            });
+            (trace.sink)(SimEvent::new(self.time, kind));
         }
     }
 
