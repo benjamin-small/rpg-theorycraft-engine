@@ -32,7 +32,9 @@ A timeline simulation adds two documents:
 4. **SimDef** declares resources, actions, buffs, procs, and the objective used
    as action damage.
 5. **Rotation** is an ordered priority list. The first eligible rule runs;
-   resource costs and cooldown readiness are automatic hard gates.
+   resource costs and cooldown readiness are automatic hard gates. A
+   `gcd` (in `defaults`, or per action) adds a global cooldown: while it runs,
+   no other GCD-bound action may begin; `"gcd": 0` puts an action off the GCD.
    Effects lists apply buffs (`apply_buff`), free-cast actions from procs
    (`cast_action`), and end buffs (`remove_buff`), such as a spender that
    consumes its proc.

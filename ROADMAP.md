@@ -512,6 +512,12 @@ their shape. Three groups:
 - **Proc-driven removal in EV is gated by READS only.** A proc removal of
   a buff nothing reads runs on EV's averaged schedule (the same
   approximation proc applications already make). It is not flagged.
+## Global cooldown (Unreleased) — open debt
+- **No `gcd.remains` / `gcd.max` sim symbols yet.** A rotation `when`
+  cannot read the lock; SimC-style APLs that test `gcd.remains` need
+  them. Add as engine context words when the first consumer needs one.
+- **The lock is not reported.** `SimReport` has no time-idle-on-GCD
+  figure; WoW-style reports want one.
 
 ## Deferred out of P6 (v1 sequencing scope)
 - **Multi-target/AoE.** Packs stay approximated by target-profile stats;
